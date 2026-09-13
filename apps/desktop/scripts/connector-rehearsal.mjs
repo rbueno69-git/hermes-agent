@@ -11,6 +11,8 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import net from 'node:net'
 
+import { resolveElectronCommand } from './resolve-electron-command.mjs'
+
 const desktop = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const root = path.resolve(desktop, '../..')
 const sandbox = process.argv[2] ? path.resolve(process.argv[2]) : fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-connectors-'))
@@ -55,8 +57,8 @@ try {
     if (Date.now() > deadline) throw new Error('Renderer did not become ready')
     await new Promise(resolve => setTimeout(resolve, 250))
   }
-  const binary = path.join(desktop, 'node_modules/electron/dist', process.platform === 'darwin' ? 'Electron.app/Contents/MacOS/Electron' : process.platform === 'win32' ? 'electron.exe' : 'electron')
-  electron = spawn(binary, [entry], { cwd: desktop, env, stdio: 'inherit' })
+  const command = resolveElectronCommand(import.meta.url, entry)
+  electron = spawn(command.executable, command.args, { cwd: desktop, env, stdio: 'inherit' })
   console.log(`Connector rehearsal: ${sandbox}\nRenderer: ${url}\nReal service; OAuth requires your approval. Reuse the sandbox path to reopen this identity.`)
   electron.on('exit', stop)
 } catch (error) { stop(); throw error }
