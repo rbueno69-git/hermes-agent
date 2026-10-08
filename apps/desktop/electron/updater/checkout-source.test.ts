@@ -397,9 +397,21 @@ urllib.request.build_opener = local_build
     vi.spyOn(updaterProcess, 'spawnUpdaterProcess').mockImplementation(
       (command: string, args: string[], options: SpawnOptions): updaterProcess.UpdaterChild => {
         spawned.push({ command, args, options })
-        // C2: a hand-off has started only once the script takes the Desktop's
-        // bridge marker in its own (live, foreign) name — do that here.
-        fs.writeFileSync(markerPath(home), `${process.ppid}\n${Math.floor(Date.now() / 1000)}\n`)
+        // Force the fake script across a wall-clock second after Desktop has
+        // captured HERMES_UPDATE_STARTED_AT, reproducing the CI rollover race.
+        const inheritedStartedAt: number = Number(options.env?.HERMES_UPDATE_STARTED_AT)
+        const scriptClock: ReturnType<typeof vi.spyOn> = vi
+          .spyOn(Date, 'now')
+          .mockReturnValue((inheritedStartedAt + 1) * 1000)
+
+        try {
+          expect(Math.floor(Date.now() / 1000)).toBe(inheritedStartedAt + 1)
+          // C2: a hand-off has started only once the script takes the Desktop's
+          // bridge marker in its own (live, foreign) name — do that here.
+          fs.writeFileSync(markerPath(home), `${process.ppid}\n${options.env?.HERMES_UPDATE_STARTED_AT}\n`)
+        } finally {
+          scriptClock.mockRestore()
+        }
 
         return { unref: (): void => {} }
       }
