@@ -32,6 +32,7 @@ import { _electron } from '@playwright/test';
 import { prepareWindowForInput } from './window-input.cjs';
 import { assertStagedBranch, pickAppWindow, openAbout, readManualUpdateCommand, waitForUpdate } from './update-ui.cjs';
 import { installSourceBranchProbe, prepareSourceBranchEnvironment } from './source-branch-probe.cjs';
+import { dismissMacOSLocalNetworkSheet } from './macos-local-network.mjs';
 import { observeSourceUpdate } from './source-update-observer.mjs';
 import { runUpdateWindowChat } from './update-window-chat.mjs';
 import { isolateUpdateWindowEnvironment, isolatedElectronArgs, updateWindowEnvironment } from './smoke-env.mjs';
@@ -109,6 +110,21 @@ function phase(p) {
   currentPhase = p;
 }
 
+/**
+ * Native privacy sheets sit above Chromium and can swallow every Playwright
+ * click. Bind handling to this exact Electron process and fail closed unless
+ * consecutive native probes prove the Local Network sheet is gone.
+ * @param {import('@playwright/test').ElectronApplication} app
+ * @param {(options: {pid: number}) => Promise<{dismissed: boolean, clearProbes: number}>} dismiss
+ */
+export async function clearNativePermissionSheet(app, dismiss = dismissMacOSLocalNetworkSheet) {
+  const pid = app.process().pid;
+  if (!pid) throw new Error('Electron process has no pid for native sheet handling');
+  const result = await dismiss({ pid });
+  if (result.dismissed) log(`dismissed macOS Local Network sheet with Don’t Allow; ${result.clearProbes} clear probes`);
+  return result;
+}
+
 async function main() {
   // SIGKILLed Electron leaves Playwright connections and inherited pipes
   // holding node's event loop open, so the driver can outlive its own
@@ -164,6 +180,8 @@ async function main() {
   });
   if (!values['no-update']) await installSourceBranchProbe(app);
   const window = await pickAppWindow(app, log);
+  phase('native-permission-sheet');
+  await clearNativePermissionSheet(app);
   await window.screenshot({ path: `${values.spec}.window.png` }).catch(() => {});
 
   await prepareWindowForInput(app, window);

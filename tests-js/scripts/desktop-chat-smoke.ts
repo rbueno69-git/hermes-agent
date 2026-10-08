@@ -10,6 +10,11 @@ import { MOCK_REPLY } from './mock-server.ts'
 
 export type ChatPhase = 'old' | 'new' | 'installed'
 
+/** Keep the full random witness below the 64-character composer limit in v2026.6.5. */
+export function createCheckpointPrompt(phase: ChatPhase): string {
+  return `Desktop smoke ${phase} ${randomUUID()}`
+}
+
 export interface DesktopChatSmokeOptions {
   mockUrl: string
   phase: ChatPhase
@@ -222,7 +227,7 @@ export async function runDesktopChatSmoke(page: Page, options: DesktopChatSmokeO
   const receiptPath = path.join(outDir, `desktop-chat-${phase}.json`)
   const evidencePath = path.join(outDir, `desktop-chat-${phase}-renderer.log`)
   const screenshot = path.join(outDir, `desktop-chat-${phase}.png`)
-  const prompt = `Hello, can you hear me? Desktop smoke ${phase} ${randomUUID()}`
+  const prompt = createCheckpointPrompt(phase)
   const observe = options.observePrompts ?? ((): Promise<string[]> => readMockPrompts(options.mockUrl))
   // A send the app swallows and a send the app never made look identical from
   // the mock's side; the renderer's own console is the only witness to which.
@@ -276,7 +281,7 @@ export async function runDesktopChatSmoke(page: Page, options: DesktopChatSmokeO
     let receivedPrompt = ''
     await expect.poll(async (): Promise<boolean> => {
       const prompts = await observe()
-      witnessIndex = prompts.findIndex((text: string, index: number): boolean => index >= before && text.includes(prompt))
+      witnessIndex = prompts.findIndex((text: string, index: number): boolean => index >= before && text === prompt)
       receivedPrompt = prompts[witnessIndex] ?? ''
 
       return witnessIndex >= before

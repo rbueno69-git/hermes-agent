@@ -10,10 +10,21 @@ import { candidateSmokeHermesHomes, predictSmokeHermesHome, resolveSmokeLaunch, 
 import { sourceRuntimeSettleCommand } from '../../tests/install/e2e-assets/source-runtime-settle.mjs'
 import { assertUpdateWindowBackendOrigin, assertUpdateWindowProcess } from '../../tests/install/e2e-assets/update-window-chat.mjs'
 
-import { assertChatCommit, newCompletedPair, readMockPrompts, type TranscriptMessage } from './desktop-chat-smoke.ts'
+import { assertChatCommit, createCheckpointPrompt, newCompletedPair, readMockPrompts, type TranscriptMessage } from './desktop-chat-smoke.ts'
 import { assertBackendOrigin, localBackendProcess, readBundledBundleEnv, readInstallationCommit } from './desktop-smoke-process.ts'
 import { writeEnvFile, writeMockProviderConfig } from './mock-provider-config.ts'
 import { MOCK_REPLY, startMockServer } from './mock-server.ts'
+
+test('checkpoint prompts retain a unique full-token witness within the historical 64-character limit', (): void => {
+  const prompts = (['old', 'new', 'installed'] as const).map((phase) => createCheckpointPrompt(phase))
+
+  expect(new Set(prompts).size).toBe(prompts.length)
+
+  for (const prompt of prompts) {
+    expect(prompt.length).toBeLessThanOrEqual(64)
+    expect(prompt).toMatch(/^Desktop smoke (?:old|new|installed) [0-9a-f-]{36}$/)
+  }
+})
 
 test('one server owns inference and a fresh, per-server prompt witness', async (): Promise<void> => {
   const first = await startMockServer()

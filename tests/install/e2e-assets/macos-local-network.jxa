@@ -1,0 +1,71 @@
+ObjC.import('stdlib')
+
+function textOf(element) {
+  const values = []
+  for (const property of ['name', 'description', 'value']) {
+    try {
+      const value = element[property]()
+      if (value !== undefined && value !== null) values.push(String(value).trim())
+    } catch (_) {}
+  }
+  return values.filter(Boolean)
+}
+
+function walk(element, collected, depth) {
+  if (depth > 12 || collected.nodes > 2000) {
+    collected.truncated = true
+    return
+  }
+  collected.nodes += 1
+  const texts = textOf(element)
+  for (const text of texts) {
+    collected.texts.push(text)
+  }
+  let role = ''
+  try { role = String(element.role()) } catch (_) {}
+  if (role === 'AXButton') {
+    const label = texts.find((text) => text === 'Don’t Allow' || text === "Don't Allow")
+    if (label) collected.deny.push(element)
+  }
+  const children = element.uiElements()
+  for (const child of children) walk(child, collected, depth + 1)
+}
+
+function run(argv) {
+  if (argv.length !== 1 || !/^\d+$/.test(argv[0])) throw new Error('usage: macos-local-network.jxa <pid>')
+  const pid = Number(argv[0])
+  const systemEvents = Application('System Events')
+  const processes = systemEvents.applicationProcesses.whose({ unixId: pid })()
+  if (processes.length !== 1) throw new Error(`expected one application process for pid ${pid}, found ${processes.length}`)
+
+  let nativeSheets = 0
+  let localNetworkSheets = 0
+  let denyButtons = 0
+  let clickedDeny = false
+  const windows = processes[0].windows()
+  if (windows.length === 0) throw new Error(`application process ${pid} exposes no native window to verify`)
+  const roots = []
+  for (const window of windows) {
+    const sheets = window.sheets()
+    for (const sheet of sheets) roots.push(sheet)
+    let subrole = ''
+    try { subrole = String(window.subrole()) } catch (_) {}
+    if (/dialog/i.test(subrole)) roots.push(window)
+  }
+  nativeSheets = roots.length
+  for (const root of roots) {
+    const collected = { nodes: 0, texts: [], deny: [], truncated: false }
+    walk(root, collected, 0)
+    if (collected.truncated) throw new Error(`native accessibility tree for pid ${pid} exceeded verification bounds`)
+    const localNetwork = collected.texts.some((text) => /local network/i.test(text))
+    if (!localNetwork) continue
+    localNetworkSheets += 1
+    denyButtons += collected.deny.length
+    if (collected.deny.length === 1) {
+      collected.deny[0].click()
+      clickedDeny = true
+    }
+  }
+
+  return JSON.stringify({ nativeSheets, localNetworkSheets, denyButtons, clickedDeny })
+}

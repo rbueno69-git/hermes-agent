@@ -270,6 +270,22 @@ phase_install() {
   desktop_checkpoint old "$OLD_SHA" desktop-installer@latest
 }
 
+COLLECTED_INSTALL_LOGS=0
+collect_install_side_logs() {
+  [ "$COLLECTED_INSTALL_LOGS" -eq 0 ] || return 0
+  COLLECTED_INSTALL_LOGS=1
+  local ildest="$LOG_DIR/install-logs"
+  mkdir -p "$ildest"
+  cp -R "$HOME_SANDBOX/.hermes/logs" "$ildest/hermes-logs" 2>/dev/null || true
+  local ud="$HOME_SANDBOX/Library/Application Support/Hermes"
+  [ -d "$ud" ] && cp -R "$ud" "$ildest/desktop-userdata" 2>/dev/null || true
+  cp "$HERMES_HOME/.hermes-update-result.json" "$ildest" 2>/dev/null || true
+  ls -la "$HERMES_HOME" > "$ildest/hermes-home-ls.txt" 2>/dev/null || true
+  ls -la "$INSTALL_DIR/venv/bin" > "$ildest/venv-bin-ls.txt" 2>/dev/null || true
+  ls -la "$INSTALL_DIR/venv" > "$ildest/venv-ls.txt" 2>/dev/null || true
+  ok "collected install-side logs to $ildest"
+}
+
 run_playwright_update() {
   # $1: spec file to launch from.
   local spec="$1"
@@ -284,6 +300,7 @@ run_playwright_update() {
     --repo-dir "$INSTALL_DIR" 2>&1 \
     | ts_prefix > "$LOG_DIR/app-update.log") || rc=$?
   log_group "app update (Playwright) transcript" "$LOG_DIR/app-update.log"
+  collect_install_side_logs
   [ "$rc" -eq 0 ] || fail "app-driven update exited $rc; transcript above"
 }
 
@@ -384,27 +401,14 @@ PYEOF
       ;;
   esac
 
+  # Evidence precedes every update assertion. App-driven legs already collected
+  # immediately after their observer returned; the guard makes this a no-op.
+  collect_install_side_logs
+
   local got
   got="$(git -C "$INSTALL_DIR" rev-parse HEAD)"
   [ "$got" = "$TARGET_SHA" ] || fail "checkout is $got, expected $TARGET_LABEL ($TARGET_SHA)"
   ok "checkout landed on $TARGET_LABEL ($TARGET_SHA)"
-
-  # Install-side state BEFORE the post-update smoke: on app-update legs the
-  # updater's own transcript is streamed into the app UI and otherwise lost,
-  # so snapshot every place it also lands (product logs, update hand-off
-  # files, the venv's entry-point dir) while the install is still there to
-  # inspect — the smoke assertion below can `fail` out of the driver, and the
-  # evidence must already be on disk when it does.
-  local ildest="$LOG_DIR/install-logs"
-  mkdir -p "$ildest"
-  cp -R "$HOME_SANDBOX/.hermes/logs" "$ildest/hermes-logs" 2>/dev/null || true
-  local ud="$HOME_SANDBOX/Library/Application Support/Hermes"
-  [ -d "$ud" ] && cp -R "$ud" "$ildest/desktop-userdata" 2>/dev/null || true
-  cp "$HERMES_HOME/.hermes-update-result.json" "$ildest" 2>/dev/null || true
-  ls -la "$HERMES_HOME" > "$ildest/hermes-home-ls.txt" 2>/dev/null || true
-  ls -la "$INSTALL_DIR/venv/bin" > "$ildest/venv-bin-ls.txt" 2>/dev/null || true
-  ls -la "$INSTALL_DIR/venv" > "$ildest/venv-ls.txt" 2>/dev/null || true
-  ok "collected install-side logs to $ildest"
 
   # The update may publish a launcher before its installed dependency inputs
   # are current. The next non-metadata startup then owns source completion,
