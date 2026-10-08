@@ -18,32 +18,26 @@ export function createCheckpointPrompt(phase: ChatPhase): string {
 const firstMessageNotePrefix = `\n\n[System note: This is the user's very first message ever. `
 
 const taskFirstClause = 'If this message is itself a real request or task, DO THE TASK FIRST -- call whatever tools it needs -- and only then, in the closing sentences of that same reply, do what this note asks. Never let this note replace or skip work the user actually asked for. '
+const profileBuildSteps = 'OFFER — do not assume — to build a short profile of them so you can be more useful, and explain they can decline or do it later. If and ONLY IF they accept:\n  1. Ask for whatever they\'re comfortable sharing (name, what they do, how they like you to work). Volunteered facts come first.\n  2. Before ANY external lookup, say what you intend to look up and get explicit consent for that step. Never read their connected accounts (email, calendar, etc.) silently — ask each time.\n  3. With consent, you may use web_search to confirm public details (e.g. employer, public profiles) from the data points they gave.\n  4. Save each confirmed, durable fact with the memory tool using target="user" — keep entries compact and high-signal.\nIf they decline at any point, stop immediately and continue normally. Keep the whole exchange light and conversational, not an interrogation.]'
 
-const firstMessageNoteShapes = [
-  { prefix: 'Briefly introduce yourself and mention that /help shows available commands. ', suffix: 'Keep the introduction concise -- one or two sentences max.]' },
-  { prefix: 'After a one-sentence introduction (mention /help shows commands), ', suffix: 'Keep the whole exchange light and conversational, not an interrogation.]' },
-  { prefix: `${taskFirstClause}What this note asks: briefly introduce yourself and mention that /help shows `, suffix: 'available commands, in one or two sentences.]' },
-  { prefix: `${taskFirstClause}What this note asks: after a one-sentence introduction (mention /help `, suffix: 'Keep the whole exchange light and conversational, not an interrogation.]' },
-  { prefix: `${taskFirstClause}What this note asks: briefly introduce yourself, mention that /help shows available `, suffix: 'when you want it."]' },
-] as const
+const firstMessageNoteBodies = new Set([
+  'Briefly introduce yourself and mention that /help shows available commands. Keep the introduction concise -- one or two sentences max.]',
+  `After a one-sentence introduction (mention /help shows commands), ${profileBuildSteps}`,
+  `${taskFirstClause}What this note asks: briefly introduce yourself and mention that /help shows available commands, in one or two sentences.]`,
+  `${taskFirstClause}What this note asks: after a one-sentence introduction (mention /help shows commands), ${profileBuildSteps}`,
+  ...['/initiate-setup', '/initiate_setup', '/hermes initiate-setup'].map((command): string =>
+    `${taskFirstClause}What this note asks: briefly introduce yourself, mention that /help shows available commands, and end with this one line: "I can run a quick setup so I can help you better. Send ${command} when you want it."]`),
+])
 
-/** Admit the exact checkpoint or one balanced, recognized onboarding note. */
+/** Admit the exact checkpoint or one byte-exact, release-supported onboarding note. */
 export function isCheckpointPromptWitness(received: string, prompt: string): boolean {
   if (received === prompt) {
     return true
   }
 
-  if (!received.startsWith(`${prompt}${firstMessageNotePrefix}`)) {
-    return false
-  }
+  const augmentedPrefix = `${prompt}${firstMessageNotePrefix}`
 
-  const note = received.slice(prompt.length + firstMessageNotePrefix.length)
-
-  if (note.includes('[') || note.slice(0, -1).includes(']')) {
-    return false
-  }
-
-  return firstMessageNoteShapes.some((shape): boolean => note.startsWith(shape.prefix) && note.endsWith(shape.suffix))
+  return received.startsWith(augmentedPrefix) && firstMessageNoteBodies.has(received.slice(augmentedPrefix.length))
 }
 
 export interface DesktopChatSmokeOptions {

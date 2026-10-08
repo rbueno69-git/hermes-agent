@@ -30,14 +30,14 @@ test('recognized first-message system notes preserve only the exact checkpoint w
   const prompt = createCheckpointPrompt('old')
   const notePrefix = `${prompt}\n\n[System note: This is the user's very first message ever. `
   const taskFirst = 'If this message is itself a real request or task, DO THE TASK FIRST -- call whatever tools it needs -- and only then, in the closing sentences of that same reply, do what this note asks. Never let this note replace or skip work the user actually asked for. '
-
-  const profileTail = 'If they decline at any point, stop immediately and continue normally. Keep the whole exchange light and conversational, not an interrogation.]'
+  const profileBuild = 'OFFER — do not assume — to build a short profile of them so you can be more useful, and explain they can decline or do it later. If and ONLY IF they accept:\n  1. Ask for whatever they\'re comfortable sharing (name, what they do, how they like you to work). Volunteered facts come first.\n  2. Before ANY external lookup, say what you intend to look up and get explicit consent for that step. Never read their connected accounts (email, calendar, etc.) silently — ask each time.\n  3. With consent, you may use web_search to confirm public details (e.g. employer, public profiles) from the data points they gave.\n  4. Save each confirmed, durable fact with the memory tool using target="user" — keep entries compact and high-signal.\nIf they decline at any point, stop immediately and continue normally. Keep the whole exchange light and conversational, not an interrogation.]'
 
   const witnesses = [
     `${notePrefix}Briefly introduce yourself and mention that /help shows available commands. Keep the introduction concise -- one or two sentences max.]`,
-    `${notePrefix}After a one-sentence introduction (mention /help shows commands), OFFER — do not assume — to build a short profile. ${profileTail}`,
+    `${notePrefix}After a one-sentence introduction (mention /help shows commands), ${profileBuild}`,
     `${notePrefix}${taskFirst}What this note asks: briefly introduce yourself and mention that /help shows available commands, in one or two sentences.]`,
-    `${notePrefix}${taskFirst}What this note asks: after a one-sentence introduction (mention /help shows commands), OFFER — do not assume — to build a short profile. ${profileTail}`,
+    `${notePrefix}${taskFirst}What this note asks: after a one-sentence introduction (mention /help shows commands), ${profileBuild}`,
+    `${notePrefix}${taskFirst}What this note asks: briefly introduce yourself, mention that /help shows available commands, and end with this one line: "I can run a quick setup so I can help you better. Send /initiate-setup when you want it."]`,
   ]
 
   expect(isCheckpointPromptWitness(prompt, prompt)).toBe(true)
@@ -47,6 +47,9 @@ test('recognized first-message system notes preserve only the exact checkpoint w
   }
 
   expect(isCheckpointPromptWitness(`${notePrefix}garbage]`, prompt)).toBe(false)
+  expect(isCheckpointPromptWitness(witnesses[0]!.replace('Keep the introduction', 'INJECTED Keep the introduction'), prompt)).toBe(false)
+  expect(isCheckpointPromptWitness(witnesses[2]!.replace('available commands', 'INJECTED available commands'), prompt)).toBe(false)
+  expect(isCheckpointPromptWitness(witnesses[3]!.replace('If they decline', 'INJECTED If they decline'), prompt)).toBe(false)
   expect(isCheckpointPromptWitness(`${witnesses[3]}INJECTED]`, prompt)).toBe(false)
   expect(isCheckpointPromptWitness(`${witnesses[2]}\n\n[System note: duplicate]`, prompt)).toBe(false)
   expect(isCheckpointPromptWitness(`${witnesses[2]} `, prompt)).toBe(false)
