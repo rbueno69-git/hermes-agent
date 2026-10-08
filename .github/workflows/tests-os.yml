@@ -185,10 +185,10 @@ jobs:
             -m "platforms and not integration" \
             -v --tb=short
         env:
-          # These files spawn nested PowerShell trees. Keep process-level
-          # concurrency below the four public-runner vCPUs so cold child
-          # startup retains headroom before the fixture's idle deadline.
-          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && '2' || '' }}
+          # These files spawn nested PowerShell trees. A single file at a time
+          # keeps enough CPU for suspended-child publication and its observers
+          # on the standard public Windows runners.
+          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && '1' || '' }}
           HERMES_TEST_SLICE: ${{ matrix.slice || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.

@@ -533,6 +533,17 @@ class Machine:
                                     ignore=shutil.ignore_patterns("*.db", "*.db-*"))
             (dest / "evidence.txt").write_text(self.evidence(), encoding="utf-8", errors="replace")
             (dest / "timings.json").write_text(json.dumps(self.timings, indent=1), encoding="utf-8")
+        for tree in (self.root, self.profile):
+            for attempt in range(6):
+                try:
+                    shutil.rmtree(tree)
+                    break
+                except FileNotFoundError:
+                    break
+                except OSError:
+                    if attempt == 5:
+                        raise
+                    time.sleep(1)
 
 
 def new_machine(tmp_root: Path, base_url: str, *, label: str, person: str = "",

@@ -5,14 +5,38 @@ import os
 from pathlib import Path
 import runpy
 import shutil
+import struct
 import subprocess
 import sys
 import sysconfig
+from typing import Any
 
 import pytest
 
 
 ASSETS = Path(__file__).resolve().parents[1] / "install/e2e-assets"
+
+
+def _write_asar(path: Path, members: dict[str, bytes],
+                overrides: dict[str, dict[str, Any]] | None = None) -> None:
+    files: dict[str, Any] = {}
+    payload: list[bytes] = []
+    offset = 0
+    for name, data in members.items():
+        branch: dict[str, Any] = files
+        parts = name.split("/")
+        for part in parts[:-1]:
+            branch = branch.setdefault(part, {"files": {}})["files"]
+        branch[parts[-1]] = {"size": len(data), "offset": str(offset),
+                             **((overrides or {}).get(name, {}))}
+        payload.append(data)
+        offset += len(data)
+    header = json.dumps({"files": files}, separators=(",", ":")).encode()
+    padded = header + b"\0" * (-len(header) % 4)
+    payload_size = 4 + len(padded)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(struct.pack("<4I", 4, payload_size + 4, payload_size, len(header))
+                     + padded + b"".join(payload))
 
 
 @pytest.mark.platforms("posix")
@@ -137,6 +161,55 @@ def test_observer_preserves_no_desktop_and_refuses_incomplete_app(tmp_path):
     assert (release / "hermes").read_bytes() == b"incomplete fixture"
 
 
+@pytest.mark.parametrize("missing", ["dist/index.html", "dist/assets/index.js"])
+def test_historical_observer_accepts_only_complete_renderer_inside_asar(tmp_path, missing):
+    verify = runpy.run_path(str(ASSETS / "source_driver.py"))["verify_products"]
+    root = tmp_path / "source"
+    release = root / "apps/desktop/release/linux-unpacked"
+    (release / "hermes").parent.mkdir(parents=True)
+    (release / "hermes").write_bytes(b"fixture executable")
+    members = {
+        "package.json": b'{"main":"electron/main.cjs"}',
+        "electron/main.cjs": b'require("electron")',
+        "dist/index.html": b'<script type="module" src="./assets/index.js"></script>',
+        "dist/assets/index.js": b"export {}",
+    }
+    archive = release / "resources/app.asar"
+    _write_asar(archive, members)
+
+    verify(root, "present")
+    with pytest.raises(RuntimeError, match="renderer"):
+        verify(root, "present", Path("unused-node"))
+
+    _write_asar(archive, {name: data for name, data in members.items() if name != missing})
+    with pytest.raises(RuntimeError, match="renderer"):
+        verify(root, "present")
+
+
+@pytest.mark.parametrize(("metadata"), [
+    {"offset": 0.5},
+    {"offset": float("inf")},
+    {"size": True},
+])
+def test_historical_observer_rejects_malformed_asar_member_numbers(tmp_path, metadata):
+    verify = runpy.run_path(str(ASSETS / "source_driver.py"))["verify_products"]
+    root = tmp_path / "source"
+    release = root / "apps/desktop/release/linux-unpacked"
+    (release / "hermes").parent.mkdir(parents=True)
+    (release / "hermes").write_bytes(b"fixture executable")
+    members = {
+        "package.json": b'{"main":"electron/main.cjs"}',
+        "electron/main.cjs": b'require("electron")',
+        "dist/index.html": b'<script type="module" src="./assets/index.js"></script>',
+        "dist/assets/index.js": b"export {}",
+    }
+    _write_asar(release / "resources/app.asar", members,
+                {"dist/assets/index.js": metadata})
+
+    with pytest.raises(RuntimeError, match="renderer"):
+        verify(root, "present")
+
+
 @pytest.mark.platforms("posix")
 @pytest.mark.parametrize("fault,error", [
     ("uv-lock", "dependency generation is not current"),
@@ -214,8 +287,19 @@ for (const [product, out] of [['tui', 'ui-tui/dist'], ['web', 'hermes_cli/web_di
     # The passive query must not write even import caches: -I ignores the
     # environment's bytecode switch, so the published query enforces it.
     def snapshot():
-        return {p: (hashlib.sha256(p.read_bytes()).hexdigest(), p.stat().st_mtime_ns) for tree in (root, home, store)
-                for p in tree.rglob("*") if p.is_file()}
+        result = {}
+        known_links = {store / "node/bin/node", store / "python/bin/python3"}
+        for tree in (root, home, store):
+            for path in tree.rglob("*"):
+                if path in known_links or path.name == "site-packages":
+                    target = subprocess.run(["readlink", str(path)], capture_output=True, text=True,
+                                            check=True, timeout=10).stdout.rstrip("\n")
+                    result[path] = (f"symlink:{target}", 0)
+                elif path.is_symlink():
+                    result[path] = (f"symlink:{os.readlink(path)}", path.lstat().st_mtime_ns)
+                elif path.is_file():
+                    result[path] = (hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_mtime_ns)
+        return result
     before = snapshot()
     result = subprocess.run(command, env=env, cwd=tmp_path, capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stdout + result.stderr

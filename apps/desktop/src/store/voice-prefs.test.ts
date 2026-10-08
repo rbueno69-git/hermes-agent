@@ -20,13 +20,19 @@ import {
   applyVoiceStopPhraseFromConfig
 } from './voice-prefs'
 
+function storageSetItemTarget(): Pick<Storage, 'setItem'> {
+  const storage = window.localStorage
+
+  return Object.hasOwn(storage, 'setItem') ? storage : Storage.prototype
+}
+
 it('keeps the desktop toggle local across config refreshes', async () => {
   for (const fails of [false, true]) {
     for (const enabled of [false, true]) {
       window.localStorage.clear()
       vi.resetModules()
       const prefs = await import('./voice-prefs')
-      const write = vi.spyOn(Storage.prototype, 'setItem')
+      const write = vi.spyOn(storageSetItemTarget(), 'setItem')
 
       if (fails) {
         write.mockImplementation(() => {
@@ -55,7 +61,7 @@ it('migrates the legacy preference once, not on every refresh', async () => {
       window.localStorage.clear()
       vi.resetModules()
       const prefs = await import('./voice-prefs')
-      const write = vi.spyOn(Storage.prototype, 'setItem')
+      const write = vi.spyOn(storageSetItemTarget(), 'setItem')
 
       if (fails) {
         write.mockImplementation(() => {
