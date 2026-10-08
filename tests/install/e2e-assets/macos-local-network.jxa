@@ -1,3 +1,4 @@
+ObjC.import('AppKit')
 ObjC.import('stdlib')
 
 function textOf(element) {
@@ -18,9 +19,7 @@ function walk(element, collected, depth) {
   }
   collected.nodes += 1
   const texts = textOf(element)
-  for (const text of texts) {
-    collected.texts.push(text)
-  }
+  for (const text of texts) collected.texts.push(text)
   let role = ''
   try { role = String(element.role()) } catch (_) {}
   if (role === 'AXButton') {
@@ -31,9 +30,28 @@ function walk(element, collected, depth) {
   for (const child of children) walk(child, collected, depth + 1)
 }
 
-function run(argv) {
-  if (argv.length !== 1 || !/^\d+$/.test(argv[0])) throw new Error('usage: macos-local-network.jxa <pid>')
-  const pid = Number(argv[0])
+function runningIdentity(pid) {
+  const running = $.NSRunningApplication.runningApplicationWithProcessIdentifier(pid)
+  if (!running) throw new Error(`no running application for pid ${pid}`)
+  const executableURL = running.executableURL
+  const launchDate = running.launchDate
+  if (!executableURL || !launchDate) throw new Error(`application process ${pid} has incomplete identity`)
+  const executablePath = ObjC.unwrap(executableURL.path)
+  const launchTime = Number(launchDate.timeIntervalSince1970)
+  if (!executablePath || !Number.isFinite(launchTime)) throw new Error(`application process ${pid} has invalid identity`)
+  return { pid, launchTime, executablePath: String(executablePath) }
+}
+
+function assertIdentity(pid, expectedLaunchTime, expectedExecutablePath) {
+  const observed = runningIdentity(pid)
+  if (observed.launchTime !== expectedLaunchTime || observed.executablePath !== expectedExecutablePath) {
+    throw new Error(`application process ${pid} no longer matches the captured Electron incarnation`)
+  }
+  return observed
+}
+
+function probe(pid, expectedLaunchTime, expectedExecutablePath) {
+  const identity = assertIdentity(pid, expectedLaunchTime, expectedExecutablePath)
   const systemEvents = Application('System Events')
   const processes = systemEvents.applicationProcesses.whose({ unixId: pid })()
   if (processes.length !== 1) throw new Error(`expected one application process for pid ${pid}, found ${processes.length}`)
@@ -62,10 +80,25 @@ function run(argv) {
     localNetworkSheets += 1
     denyButtons += collected.deny.length
     if (collected.deny.length === 1) {
+      assertIdentity(pid, expectedLaunchTime, expectedExecutablePath)
       collected.deny[0].click()
       clickedDeny = true
     }
   }
 
-  return JSON.stringify({ nativeSheets, localNetworkSheets, denyButtons, clickedDeny })
+  return { ...identity, nativeSheets, localNetworkSheets, denyButtons, clickedDeny }
+}
+
+function run(argv) {
+  if (argv.length === 2 && argv[0] === 'identity' && /^\d+$/.test(argv[1])) {
+    return JSON.stringify(runningIdentity(Number(argv[1])))
+  }
+  if (argv.length === 4 && argv[0] === 'probe' && /^\d+$/.test(argv[1])) {
+    const launchTime = Number(argv[2])
+    if (!Number.isFinite(launchTime) || !argv[3]) {
+      throw new Error('probe requires a finite launch time and executable path')
+    }
+    return JSON.stringify(probe(Number(argv[1]), launchTime, argv[3]))
+  }
+  throw new Error('usage: macos-local-network.jxa identity <pid> | probe <pid> <launch-time> <executable>')
 }

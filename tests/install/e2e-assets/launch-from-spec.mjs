@@ -32,7 +32,7 @@ import { _electron } from '@playwright/test';
 import { prepareWindowForInput } from './window-input.cjs';
 import { assertStagedBranch, pickAppWindow, openAbout, readManualUpdateCommand, waitForUpdate } from './update-ui.cjs';
 import { installSourceBranchProbe, prepareSourceBranchEnvironment } from './source-branch-probe.cjs';
-import { dismissMacOSLocalNetworkSheet } from './macos-local-network.mjs';
+import { captureMacOSProcessIdentity, dismissMacOSLocalNetworkSheet } from './macos-local-network.mjs';
 import { observeSourceUpdate } from './source-update-observer.mjs';
 import { runUpdateWindowChat } from './update-window-chat.mjs';
 import { isolateUpdateWindowEnvironment, isolatedElectronArgs, updateWindowEnvironment } from './smoke-env.mjs';
@@ -115,12 +115,24 @@ function phase(p) {
  * click. Bind handling to this exact Electron process and fail closed unless
  * consecutive native probes prove the Local Network sheet is gone.
  * @param {import('@playwright/test').ElectronApplication} app
- * @param {(options: {pid: number}) => Promise<{dismissed: boolean, clearProbes: number}>} dismiss
+ * @param {string} executablePath
+ * @param {(options: {pid: number, executablePath: string}) => Promise<{pid: number, launchTime: number, executablePath: string}>} capture
+ * @param {(options: {processIdentity: {pid: number, launchTime: number, executablePath: string}}) => Promise<{dismissed: boolean, clearProbes: number}>} dismiss
  */
-export async function clearNativePermissionSheet(app, dismiss = dismissMacOSLocalNetworkSheet) {
-  const pid = app.process().pid;
+export async function clearNativePermissionSheet(
+  app,
+  executablePath,
+  capture = captureMacOSProcessIdentity,
+  dismiss = dismissMacOSLocalNetworkSheet,
+) {
+  const child = app.process();
+  const pid = child.pid;
   if (!pid) throw new Error('Electron process has no pid for native sheet handling');
-  const result = await dismiss({ pid });
+  const processIdentity = await capture({ pid, executablePath });
+  if (child.exitCode !== null || child.signalCode !== null) {
+    throw new Error('Electron exited while its native permission identity was captured');
+  }
+  const result = await dismiss({ processIdentity });
   if (result.dismissed) log(`dismissed macOS Local Network sheet with Don’t Allow; ${result.clearProbes} clear probes`);
   return result;
 }
@@ -181,7 +193,7 @@ async function main() {
   if (!values['no-update']) await installSourceBranchProbe(app);
   const window = await pickAppWindow(app, log);
   phase('native-permission-sheet');
-  await clearNativePermissionSheet(app);
+  await clearNativePermissionSheet(app, launch.executablePath);
   await window.screenshot({ path: `${values.spec}.window.png` }).catch(() => {});
 
   await prepareWindowForInput(app, window);

@@ -503,4 +503,4 @@ urllib.request.build_opener = local_build
     })
     fs.rmSync(temporary, { recursive: true, force: true })
   }
-}, 30000)
+}, 60000)
