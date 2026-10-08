@@ -38,7 +38,7 @@ export async function captureMacOSProcessIdentity({ pid, executablePath, probe =
     throw new Error('the Electron executable path is required for native sheet handling')
   }
   const identity = await probe(pid)
-  if (identity?.pid !== pid || !Number.isFinite(identity?.launchTime)
+  if (identity?.pid !== pid || typeof identity?.startToken !== 'string' || identity.startToken.length === 0
       || typeof identity?.executablePath !== 'string') {
     throw new Error('macOS Local Network identity probe returned an invalid shape')
   }
@@ -47,18 +47,18 @@ export async function captureMacOSProcessIdentity({ pid, executablePath, probe =
   if (observedExecutable !== expectedExecutable) {
     throw new Error(`Electron executable identity changed: expected ${expectedExecutable}, observed ${observedExecutable}`)
   }
-  return { pid, launchTime: identity.launchTime, executablePath: observedExecutable }
+  return { pid, startToken: identity.startToken, executablePath: identity.executablePath }
 }
 
 async function nativeProbe(processIdentity) {
   const state = await runJxa([
     'probe',
     String(processIdentity.pid),
-    String(processIdentity.launchTime),
+    processIdentity.startToken,
     processIdentity.executablePath,
   ])
-  if (state?.pid !== processIdentity.pid || state?.launchTime !== processIdentity.launchTime
-      || canonicalExecutable(state?.executablePath ?? '') !== processIdentity.executablePath) {
+  if (state?.pid !== processIdentity.pid || state?.startToken !== processIdentity.startToken
+      || state?.executablePath !== processIdentity.executablePath) {
     throw new Error('macOS Local Network probe observed a different process incarnation')
   }
   return state
@@ -81,7 +81,7 @@ export async function dismissMacOSLocalNetworkSheet({
 }) {
   if (platform !== 'darwin') return { dismissed: false, clearProbes: 0 }
   if (!Number.isInteger(processIdentity?.pid) || processIdentity.pid <= 0
-      || !Number.isFinite(processIdentity?.launchTime)
+      || typeof processIdentity?.startToken !== 'string' || processIdentity.startToken.length === 0
       || typeof processIdentity?.executablePath !== 'string' || processIdentity.executablePath.length === 0) {
     throw new Error('a captured Electron process identity is required for native sheet handling')
   }

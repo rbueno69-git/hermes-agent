@@ -1,6 +1,9 @@
 ObjC.import('AppKit')
 ObjC.import('stdlib')
 
+const currentApplication = Application.currentApplication()
+currentApplication.includeStandardAdditions = true
+
 function textOf(element) {
   const values = []
   for (const property of ['name', 'description', 'value']) {
@@ -34,24 +37,23 @@ function runningIdentity(pid) {
   const running = $.NSRunningApplication.runningApplicationWithProcessIdentifier(pid)
   if (!running) throw new Error(`no running application for pid ${pid}`)
   const executableURL = running.executableURL
-  const launchDate = running.launchDate
-  if (!executableURL || !launchDate) throw new Error(`application process ${pid} has incomplete identity`)
+  if (!executableURL) throw new Error(`application process ${pid} has incomplete identity`)
   const executablePath = ObjC.unwrap(executableURL.path)
-  const launchTime = Number(launchDate.timeIntervalSince1970)
-  if (!executablePath || !Number.isFinite(launchTime)) throw new Error(`application process ${pid} has invalid identity`)
-  return { pid, launchTime, executablePath: String(executablePath) }
+  const startToken = String(currentApplication.doShellScript(`/bin/ps -p ${pid} -o lstart=`)).trim()
+  if (!executablePath || !startToken) throw new Error(`application process ${pid} has invalid identity`)
+  return { pid, startToken, executablePath: String(executablePath) }
 }
 
-function assertIdentity(pid, expectedLaunchTime, expectedExecutablePath) {
+function assertIdentity(pid, expectedStartToken, expectedExecutablePath) {
   const observed = runningIdentity(pid)
-  if (observed.launchTime !== expectedLaunchTime || observed.executablePath !== expectedExecutablePath) {
+  if (observed.startToken !== expectedStartToken || observed.executablePath !== expectedExecutablePath) {
     throw new Error(`application process ${pid} no longer matches the captured Electron incarnation`)
   }
   return observed
 }
 
-function probe(pid, expectedLaunchTime, expectedExecutablePath) {
-  const identity = assertIdentity(pid, expectedLaunchTime, expectedExecutablePath)
+function probe(pid, expectedStartToken, expectedExecutablePath) {
+  const identity = assertIdentity(pid, expectedStartToken, expectedExecutablePath)
   const systemEvents = Application('System Events')
   const processes = systemEvents.applicationProcesses.whose({ unixId: pid })()
   if (processes.length !== 1) throw new Error(`expected one application process for pid ${pid}, found ${processes.length}`)
@@ -80,7 +82,7 @@ function probe(pid, expectedLaunchTime, expectedExecutablePath) {
     localNetworkSheets += 1
     denyButtons += collected.deny.length
     if (collected.deny.length === 1) {
-      assertIdentity(pid, expectedLaunchTime, expectedExecutablePath)
+      assertIdentity(pid, expectedStartToken, expectedExecutablePath)
       collected.deny[0].click()
       clickedDeny = true
     }
@@ -94,11 +96,10 @@ function run(argv) {
     return JSON.stringify(runningIdentity(Number(argv[1])))
   }
   if (argv.length === 4 && argv[0] === 'probe' && /^\d+$/.test(argv[1])) {
-    const launchTime = Number(argv[2])
-    if (!Number.isFinite(launchTime) || !argv[3]) {
-      throw new Error('probe requires a finite launch time and executable path')
+    if (!argv[2] || !argv[3]) {
+      throw new Error('probe requires a process start token and executable path')
     }
-    return JSON.stringify(probe(Number(argv[1]), launchTime, argv[3]))
+    return JSON.stringify(probe(Number(argv[1]), argv[2], argv[3]))
   }
-  throw new Error('usage: macos-local-network.jxa identity <pid> | probe <pid> <launch-time> <executable>')
+  throw new Error('usage: macos-local-network.jxa identity <pid> | probe <pid> <start-token> <executable>')
 }

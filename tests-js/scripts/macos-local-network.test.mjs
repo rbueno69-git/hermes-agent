@@ -8,7 +8,7 @@ import {
 
 const processIdentity = {
   pid: 123,
-  launchTime: 1_791_438_400.125,
+  startToken: 'Thu Oct  8 08:40:00 2026',
   executablePath: '/Applications/Hermes.app/Contents/MacOS/Hermes',
 }
 
@@ -27,8 +27,21 @@ test('update-window launch binds native permission handling to the Electron inca
       seen.push(observed)
       return { dismissed: true, clearProbes: 2 }
     },
+    'darwin',
   )
   expect(seen).toEqual([identity])
+})
+
+test('non-macOS update-window launch never captures a native process identity', async () => {
+  let captures = 0
+  await expect(clearNativePermissionSheet(
+    { process: () => ({ pid: 741, exitCode: null, signalCode: null }) },
+    processIdentity.executablePath,
+    async () => { captures += 1; throw new Error('must not run') },
+    async () => { throw new Error('must not run') },
+    'linux',
+  )).resolves.toEqual({ dismissed: false, clearProbes: 0 })
+  expect(captures).toBe(0)
 })
 
 test('identity capture rejects a reused pid with a different executable', async () => {

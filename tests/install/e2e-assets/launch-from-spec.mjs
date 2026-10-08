@@ -116,15 +116,18 @@ function phase(p) {
  * consecutive native probes prove the Local Network sheet is gone.
  * @param {import('@playwright/test').ElectronApplication} app
  * @param {string} executablePath
- * @param {(options: {pid: number, executablePath: string}) => Promise<{pid: number, launchTime: number, executablePath: string}>} capture
- * @param {(options: {processIdentity: {pid: number, launchTime: number, executablePath: string}}) => Promise<{dismissed: boolean, clearProbes: number}>} dismiss
+ * @param {(options: {pid: number, executablePath: string}) => Promise<{pid: number, startToken: string, executablePath: string}>} capture
+ * @param {(options: {processIdentity: {pid: number, startToken: string, executablePath: string}}) => Promise<{dismissed: boolean, clearProbes: number}>} dismiss
+ * @param {NodeJS.Platform} platform
  */
 export async function clearNativePermissionSheet(
   app,
   executablePath,
   capture = captureMacOSProcessIdentity,
   dismiss = dismissMacOSLocalNetworkSheet,
+  platform = process.platform,
 ) {
+  if (platform !== 'darwin') return { dismissed: false, clearProbes: 0 };
   const child = app.process();
   const pid = child.pid;
   if (!pid) throw new Error('Electron process has no pid for native sheet handling');
