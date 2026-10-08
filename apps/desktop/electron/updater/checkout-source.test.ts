@@ -400,6 +400,7 @@ urllib.request.build_opener = local_build
         // Force the fake script across a wall-clock second after Desktop has
         // captured HERMES_UPDATE_STARTED_AT, reproducing the CI rollover race.
         const inheritedStartedAt: number = Number(options.env?.HERMES_UPDATE_STARTED_AT)
+
         const scriptClock: ReturnType<typeof vi.spyOn> = vi
           .spyOn(Date, 'now')
           .mockReturnValue((inheritedStartedAt + 1) * 1000)
