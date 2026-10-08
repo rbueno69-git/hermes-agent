@@ -19,8 +19,8 @@ def _disable_windows_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(_machine, "_restore_hkcu_path", lambda saved: None)
 
 
-def test_teardown_retries_transient_tree_removal(monkeypatch: pytest.MonkeyPatch,
-                                                   tmp_path: Path) -> None:
+def test_teardown_retries_read_only_tree_removal(monkeypatch: pytest.MonkeyPatch,
+                                                  tmp_path: Path) -> None:
     machine = _new_machine(tmp_path)
     machine.root.mkdir(parents=True)
     machine.profile.mkdir(parents=True)
@@ -30,19 +30,20 @@ def test_teardown_retries_transient_tree_removal(monkeypatch: pytest.MonkeyPatch
     real_rmtree = _machine.shutil.rmtree
     attempts: dict[Path, int] = {}
 
-    def flaky_rmtree(path: Path) -> None:
+    def flaky_rmtree_readonly(path: Path) -> None:
         path = Path(path)
         attempts[path] = attempts.get(path, 0) + 1
         if path == machine.root and attempts[path] == 1:
             raise OSError("transient lock")
         real_rmtree(path)
 
-    monkeypatch.setattr(_machine.shutil, "rmtree", flaky_rmtree)
+    monkeypatch.setattr(_machine, "rmtree_readonly", flaky_rmtree_readonly, raising=False)
     monkeypatch.setattr(_machine.time, "sleep", lambda seconds: None)
 
     machine.teardown()
 
     assert attempts[machine.root] == 2
+    assert attempts[machine.profile] == 1
     assert not machine.root.exists()
     assert not machine.profile.exists()
 

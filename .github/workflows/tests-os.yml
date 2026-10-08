@@ -185,10 +185,13 @@ jobs:
             -m "platforms and not integration" \
             -v --tb=short
         env:
-          # These files spawn nested PowerShell trees. A single file at a time
-          # keeps enough CPU for suspended-child publication and its observers
-          # on the standard public Windows runners.
-          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && '1' || '' }}
+          # These files spawn nested PowerShell trees. Two workers keep the
+          # standard public Windows runners moving while leaving CPU for each
+          # file's suspended-child publication and observers. Slow but
+          # progressing files retain the same bounded 15-minute deadline as
+          # the Windows E2E lane below.
+          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && '2' || '' }}
+          HERMES_TEST_FILE_TIMEOUT: ${{ matrix.marker == 'windows' && '900' || '' }}
           HERMES_TEST_SLICE: ${{ matrix.slice || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.

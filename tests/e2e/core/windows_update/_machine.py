@@ -54,6 +54,8 @@ from typing import Any, Iterable
 
 import pytest
 
+from utils import rmtree_readonly
+
 from tests.e2e.core.windows._helpers import (
     _PASSTHROUGH_ENV,
     _SECRET_SUFFIXES,
@@ -536,7 +538,7 @@ class Machine:
         for tree in (self.root, self.profile):
             for attempt in range(6):
                 try:
-                    shutil.rmtree(tree)
+                    rmtree_readonly(tree)
                     break
                 except FileNotFoundError:
                     break
