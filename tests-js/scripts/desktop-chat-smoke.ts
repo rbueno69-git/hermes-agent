@@ -15,6 +15,37 @@ export function createCheckpointPrompt(phase: ChatPhase): string {
   return `Desktop smoke ${phase} ${randomUUID()}`
 }
 
+const firstMessageNotePrefix = `\n\n[System note: This is the user's very first message ever. `
+
+const taskFirstClause = 'If this message is itself a real request or task, DO THE TASK FIRST -- call whatever tools it needs -- and only then, in the closing sentences of that same reply, do what this note asks. Never let this note replace or skip work the user actually asked for. '
+
+const firstMessageNoteShapes = [
+  { prefix: 'Briefly introduce yourself and mention that /help shows available commands. ', suffix: 'Keep the introduction concise -- one or two sentences max.]' },
+  { prefix: 'After a one-sentence introduction (mention /help shows commands), ', suffix: 'Keep the whole exchange light and conversational, not an interrogation.]' },
+  { prefix: `${taskFirstClause}What this note asks: briefly introduce yourself and mention that /help shows `, suffix: 'available commands, in one or two sentences.]' },
+  { prefix: `${taskFirstClause}What this note asks: after a one-sentence introduction (mention /help `, suffix: 'Keep the whole exchange light and conversational, not an interrogation.]' },
+  { prefix: `${taskFirstClause}What this note asks: briefly introduce yourself, mention that /help shows available `, suffix: 'when you want it."]' },
+] as const
+
+/** Admit the exact checkpoint or one balanced, recognized onboarding note. */
+export function isCheckpointPromptWitness(received: string, prompt: string): boolean {
+  if (received === prompt) {
+    return true
+  }
+
+  if (!received.startsWith(`${prompt}${firstMessageNotePrefix}`)) {
+    return false
+  }
+
+  const note = received.slice(prompt.length + firstMessageNotePrefix.length)
+
+  if (note.includes('[') || note.slice(0, -1).includes(']')) {
+    return false
+  }
+
+  return firstMessageNoteShapes.some((shape): boolean => note.startsWith(shape.prefix) && note.endsWith(shape.suffix))
+}
+
 export interface DesktopChatSmokeOptions {
   mockUrl: string
   phase: ChatPhase
@@ -281,7 +312,7 @@ export async function runDesktopChatSmoke(page: Page, options: DesktopChatSmokeO
     let receivedPrompt = ''
     await expect.poll(async (): Promise<boolean> => {
       const prompts = await observe()
-      witnessIndex = prompts.findIndex((text: string, index: number): boolean => index >= before && text === prompt)
+      witnessIndex = prompts.findIndex((text: string, index: number): boolean => index >= before && isCheckpointPromptWitness(text, prompt))
       receivedPrompt = prompts[witnessIndex] ?? ''
 
       return witnessIndex >= before

@@ -10,7 +10,7 @@ import { candidateSmokeHermesHomes, predictSmokeHermesHome, resolveSmokeLaunch, 
 import { sourceRuntimeSettleCommand } from '../../tests/install/e2e-assets/source-runtime-settle.mjs'
 import { assertUpdateWindowBackendOrigin, assertUpdateWindowProcess } from '../../tests/install/e2e-assets/update-window-chat.mjs'
 
-import { assertChatCommit, createCheckpointPrompt, newCompletedPair, readMockPrompts, type TranscriptMessage } from './desktop-chat-smoke.ts'
+import { assertChatCommit, createCheckpointPrompt, isCheckpointPromptWitness, newCompletedPair, readMockPrompts, type TranscriptMessage } from './desktop-chat-smoke.ts'
 import { assertBackendOrigin, localBackendProcess, readBundledBundleEnv, readInstallationCommit } from './desktop-smoke-process.ts'
 import { writeEnvFile, writeMockProviderConfig } from './mock-provider-config.ts'
 import { MOCK_REPLY, startMockServer } from './mock-server.ts'
@@ -24,6 +24,34 @@ test('checkpoint prompts retain a unique full-token witness within the historica
     expect(prompt.length).toBeLessThanOrEqual(64)
     expect(prompt).toMatch(/^Desktop smoke (?:old|new|installed) [0-9a-f-]{36}$/)
   }
+})
+
+test('recognized first-message system notes preserve only the exact checkpoint witness', (): void => {
+  const prompt = createCheckpointPrompt('old')
+  const notePrefix = `${prompt}\n\n[System note: This is the user's very first message ever. `
+  const taskFirst = 'If this message is itself a real request or task, DO THE TASK FIRST -- call whatever tools it needs -- and only then, in the closing sentences of that same reply, do what this note asks. Never let this note replace or skip work the user actually asked for. '
+
+  const profileTail = 'If they decline at any point, stop immediately and continue normally. Keep the whole exchange light and conversational, not an interrogation.]'
+
+  const witnesses = [
+    `${notePrefix}Briefly introduce yourself and mention that /help shows available commands. Keep the introduction concise -- one or two sentences max.]`,
+    `${notePrefix}After a one-sentence introduction (mention /help shows commands), OFFER — do not assume — to build a short profile. ${profileTail}`,
+    `${notePrefix}${taskFirst}What this note asks: briefly introduce yourself and mention that /help shows available commands, in one or two sentences.]`,
+    `${notePrefix}${taskFirst}What this note asks: after a one-sentence introduction (mention /help shows commands), OFFER — do not assume — to build a short profile. ${profileTail}`,
+  ]
+
+  expect(isCheckpointPromptWitness(prompt, prompt)).toBe(true)
+
+  for (const witness of witnesses) {
+    expect(isCheckpointPromptWitness(witness, prompt)).toBe(true)
+  }
+
+  expect(isCheckpointPromptWitness(`${notePrefix}garbage]`, prompt)).toBe(false)
+  expect(isCheckpointPromptWitness(`${witnesses[3]}INJECTED]`, prompt)).toBe(false)
+  expect(isCheckpointPromptWitness(`${witnesses[2]}\n\n[System note: duplicate]`, prompt)).toBe(false)
+  expect(isCheckpointPromptWitness(`${witnesses[2]} `, prompt)).toBe(false)
+  expect(isCheckpointPromptWitness(`wrong ${witnesses[2]}`, prompt)).toBe(false)
+  expect(isCheckpointPromptWitness(`${prompt}\n\nunrelated suffix`, prompt)).toBe(false)
 })
 
 test('one server owns inference and a fresh, per-server prompt witness', async (): Promise<void> => {
