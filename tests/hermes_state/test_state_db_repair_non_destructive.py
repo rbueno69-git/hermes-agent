@@ -740,7 +740,13 @@ def test_interrupted_snapshot_rolls_back_destination(tmp_path, monkeypatch):
         conn.commit()
 
     ticks = iter((0.0, hermes_state._REPAIR_LOCK_TIMEOUT_SECONDS + 1.0))
-    monkeypatch.setattr(hermes_state.time, "monotonic", lambda: next(ticks))
+    real_monotonic = time.monotonic
+    monkeypatch.setattr(
+        hermes_state_repair,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(ticks), sleep=time.sleep),
+    )
+    assert time.monotonic is real_monotonic
 
     with pytest.raises(TimeoutError):
         hermes_state_repair._copy_database_snapshot(source, destination)
