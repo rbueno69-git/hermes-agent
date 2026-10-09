@@ -14,9 +14,9 @@ name: Install & Update E2E
 #                     clicked by AutoHotkey, update via the app, Playwright
 #                     clicking "Update now" (install-e2e-windows-run.yml)
 #   Matrix: macos     script installs on the shared OS-agnostic driver,
-#                     plus the real desktop user flow: website
-#                     Hermes-Setup.dmg mounted and run, updates via the
-#                     app under Playwright (install-e2e-macos-run.yml)
+#                     plus the fork-built candidate Hermes-Setup.dmg mounted
+#                     and run, updates via the app under Playwright
+#                     (install-e2e-macos-run.yml)
 #
 # Every combination is dispatched to its OS's run workflow; the run
 # workflow natively skips (grey) what its driver cannot run yet -- an
@@ -242,6 +242,7 @@ jobs:
       linux-legs: ${{ steps.gen.outputs.linux-legs }}
       windows-legs: ${{ steps.gen.outputs.windows-legs }}
       macos-legs: ${{ steps.gen.outputs.macos-legs }}
+      macos-candidate-legs: ${{ steps.gen.outputs.macos-candidate-legs }}
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
         with:
@@ -261,11 +262,156 @@ jobs:
             echo "$key=$(echo "$matrices" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>console.log(JSON.stringify(JSON.parse(d)[process.argv[1]])))' "$key")" >> "$GITHUB_OUTPUT"
             echo "$key-legs=$(echo "$matrices" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>console.log(JSON.parse(d)[process.argv[1]].include.length))' "$key")" >> "$GITHUB_OUTPUT"
           done
+          echo "macos-candidate-legs=$(echo "$matrices" | jq '[.macos.include[] | select(.install_method == "desktop-installer@candidate")] | length')" >> "$GITHUB_OUTPUT"
           # The plan, human-readable: a combination x starting-tag chart on
           # the run's summary page.
           node scripts/sandbox/generate-e2e-matrix.mjs \
             --tags '${{ needs.pick-releases.outputs.tags }}' \
             --format markdown >> "$GITHUB_STEP_SUMMARY"
+
+  # One exact-SHA bootstrap installer is shared by every candidate matrix leg.
+  # It is deliberately ad-hoc signed and packaged in an unbranded CI-only DMG:
+  # release signing identities and production distribution assets never enter
+  # this acceptance path.
+  macos-candidate-installer:
+    name: Build macOS candidate installer
+    if: needs.generate-matrix.outputs.macos-candidate-legs != '0'
+    needs: generate-matrix
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Verify exact source checkout
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          git diff --quiet
+          git diff --cached --quiet
+          test -z "$(git status --porcelain --untracked-files=normal)"
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # 7.0.0
+        with:
+          node-version: 24.11.1
+
+      - name: Use isolated build directories
+        run: |
+          {
+            echo "CARGO_HOME=$RUNNER_TEMP/cargo-home"
+            echo "CARGO_TARGET_DIR=$RUNNER_TEMP/target"
+            echo "npm_config_cache=$RUNNER_TEMP/npm-cache"
+          } >> "$GITHUB_ENV"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Select and record the installed Xcode
+        run: |
+          set -euo pipefail
+          developer_dir="$(xcode-select -p)"
+          test -d "$developer_dir"
+          xcode_version="$(DEVELOPER_DIR="$developer_dir" xcodebuild -version | awk '/^Xcode /{print $2}')"
+          xcode_build="$(DEVELOPER_DIR="$developer_dir" xcodebuild -version | awk '/^Build version /{print $3}')"
+          test -n "$xcode_version" && test -n "$xcode_build"
+          {
+            echo "DEVELOPER_DIR=$developer_dir"
+            echo "HERMES_XCODE_VERSION=$xcode_version"
+            echo "HERMES_XCODE_BUILD=$xcode_build"
+            echo "HERMES_RUST_TOOLCHAIN=1.91.1"
+          } >> "$GITHUB_ENV"
+
+      - name: Build ad-hoc candidate installer
+        env:
+          # The artifact bytes still come from the exact checked-out SHA, but
+          # the bootstrap must follow staged main so one artifact can install
+          # every declared OLD release before the driver advances to HEAD.
+          HERMES_BUILD_PIN_COMMIT: ''
+          HERMES_BUILD_PIN_BRANCH: main
+          APPLE_SIGNING_IDENTITY: '-'
+          # Applies the pin to Cargo subprocesses launched by the Tauri CLI too.
+          RUSTUP_TOOLCHAIN: '1.91.1'
+        run: |
+          set -euo pipefail
+          test "$RUSTUP_TOOLCHAIN" = "$HERMES_RUST_TOOLCHAIN"
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target aarch64-apple-darwin
+          rustc --version
+          cargo --version
+          npm ci --workspace apps/bootstrap-installer --include-workspace-root=false --prefer-online --no-audit --no-fund
+          cargo build --locked --manifest-path apps/bootstrap-installer/src-tauri/Cargo.toml --target aarch64-apple-darwin --release
+          (
+            cd apps/bootstrap-installer
+            npx tauri build --target aarch64-apple-darwin --bundles app -- --locked
+          )
+          bundle="$CARGO_TARGET_DIR/aarch64-apple-darwin/release/bundle/macos"
+          shopt -s nullglob
+          apps=("$bundle"/*.app)
+          test "${#apps[@]}" -eq 1
+          codesign --force --deep --sign - "${apps[0]}"
+          codesign --verify --deep --strict --verbose=2 "${apps[0]}"
+          codesign -dv --verbose=4 "${apps[0]}" 2>&1 | grep -F 'Signature=adhoc'
+          macho_count=0
+          while IFS= read -r -d '' binary; do
+            if file -b "$binary" | grep -q '^Mach-O'; then
+              macho_count=$((macho_count + 1))
+              test "$(lipo -archs "$binary")" = arm64
+              codesign --verify --strict --verbose=2 "$binary"
+              codesign -dv --verbose=4 "$binary" 2>&1 | grep -F 'Signature=adhoc'
+            fi
+          done < <(find "${apps[0]}" -type f -print0)
+          test "$macho_count" -gt 0
+          stage="$RUNNER_TEMP/candidate-dmg-root"
+          out="$RUNNER_TEMP/macos-candidate"
+          mkdir -p "$stage" "$out"
+          ditto "${apps[0]}" "$stage/Hermes.app"
+          ln -s /Applications "$stage/Applications"
+          test "$(find "$stage" -mindepth 1 -maxdepth 1 -exec basename {} \; | LC_ALL=C sort | tr '\n' ' ')" = 'Applications Hermes.app '
+          test "$(readlink "$stage/Applications")" = /Applications
+          hdiutil create -quiet -volname 'Hermes CI Candidate' -srcfolder "$stage" -ov -format UDZO "$out/Hermes-Setup.dmg"
+
+      - name: Verify source checkout remained clean
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          git diff --quiet
+          git diff --cached --quiet
+          test -z "$(git status --porcelain --untracked-files=normal)"
+
+      - name: Write candidate provenance
+        env:
+          CANDIDATE_REPOSITORY: ${{ github.repository }}
+          CANDIDATE_SHA: ${{ github.sha }}
+          RUSTUP_TOOLCHAIN: '1.91.1'
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/macos-candidate"
+          source_sha="$(git rev-parse HEAD)"
+          test "$source_sha" = "$CANDIDATE_SHA"
+          digest="$(shasum -a 256 "$out/Hermes-Setup.dmg" | awk '{print $1}')"
+          package_lock_digest="$(shasum -a 256 package-lock.json | awk '{print $1}')"
+          cargo_lock_digest="$(shasum -a 256 apps/bootstrap-installer/src-tauri/Cargo.lock | awk '{print $1}')"
+          node_version="$(node --version)"
+          npm_version="$(npm --version)"
+          rustc_version="$(rustc --version)"
+          cargo_version="$(cargo --version)"
+          jq -n --arg repository "$CANDIDATE_REPOSITORY" --arg source_sha "$source_sha" --arg digest "$digest" \
+            --arg node_version "$node_version" --arg npm_version "$npm_version" \
+            --arg rustc_version "$rustc_version" --arg rust_toolchain "$HERMES_RUST_TOOLCHAIN" --arg cargo_version "$cargo_version" \
+            --arg developer_dir "$DEVELOPER_DIR" --arg xcode_version "$HERMES_XCODE_VERSION" --arg xcode_build "$HERMES_XCODE_BUILD" \
+            --arg package_lock_digest "$package_lock_digest" --arg cargo_lock_digest "$cargo_lock_digest" \
+            '{schema: 2, repository: $repository, source_sha: $source_sha, arch: "arm64", install_pin: {branch: "main", commit: null}, signing: "adhoc", digest: {algorithm: "sha256", value: $digest}, materials: {node: {version: $node_version}, npm: {version: $npm_version}, rustc: {version: $rustc_version, toolchain: $rust_toolchain}, cargo: {version: $cargo_version}, xcode: {developer_dir: $developer_dir, version: $xcode_version, build: $xcode_build}, package_lock: {algorithm: "sha256", value: $package_lock_digest}, cargo_lock: {algorithm: "sha256", value: $cargo_lock_digest}}}' \
+            > "$out/provenance.json"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: install-e2e-macos-candidate-${{ github.sha }}
+          path: ${{ runner.temp }}/macos-candidate
+          retention-days: 1
+          if-no-files-found: error
 
   bundle-inputs:
     name: Validate pinned bundle transitions
@@ -359,13 +505,21 @@ jobs:
 
   macos:
     name: ${{ matrix.name }}
-    if: needs.generate-matrix.outputs.macos-legs != '0'
-    needs: generate-matrix
+    # A skipped builder is valid only when the selected matrix has no
+    # candidate leg. If candidate bytes were requested, every non-success
+    # result fails closed instead of silently running the published DMG.
+    if: >-
+      always()
+      && needs.generate-matrix.result == 'success'
+      && needs.generate-matrix.outputs.macos-legs != '0'
+      && (needs.generate-matrix.outputs.macos-candidate-legs == '0'
+        || needs.macos-candidate-installer.result == 'success')
+    needs: [generate-matrix, macos-candidate-installer]
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.generate-matrix.outputs.macos) }}
     # Two driver arms: the OS-agnostic script driver (shared with linux)
-    # and the published-dmg GUI driver; the run workflow routes.
+    # and the fork-built candidate-dmg GUI driver; the run workflow routes.
     uses: ./.github/workflows/install-e2e-macos-run.yml
     with:
       install-method: ${{ matrix.install_method }}

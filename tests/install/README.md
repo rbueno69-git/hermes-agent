@@ -140,7 +140,8 @@ A leg can install a release from months back. The driver must not assume that th
   acceptance](BUNDLED_UPDATES.md) for the manifest and proof contracts.
 - `installer-script`: the platform's one-liner (`curl | bash` on linux and macos, `irm | iex` on windows).
 - `installer-script+desktop`: the same one-liner with its desktop stage opted in (`--include-desktop` / `-IncludeDesktop`). The stage builds the desktop app during the install. On windows it also registers Start Menu and Desktop shortcuts. On linux and macos it builds the app inside the checkout and registers no OS entry point.
-- `desktop-installer@latest`: the published GUI installer (`Hermes-Setup.exe` on windows, `Hermes-Setup.dmg` on macos), driven through the real user flow.
+- `desktop-installer@latest`: Windows only in fork acceptance, the published `Hermes-Setup.exe`, driven through the real user flow.
+- `desktop-installer@candidate`: macOS only, an arm64 bootstrap installer built once from the exact workflow SHA, ad-hoc signed, and shared by the same run's candidate legs. Its binary provenance and digest bind those exact candidate bytes, while its install pin follows staged `main` so the same artifact installs every declared OLD release and HEAD. The published Nous macOS asset is upstream release evidence, not part of this fork's required acceptance matrix.
 
 ## The two app-update variants
 
