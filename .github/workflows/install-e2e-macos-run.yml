@@ -267,12 +267,12 @@ jobs:
           echo "name=install-e2e-logs-${{ inputs.leg-id }}" >> "$GITHUB_OUTPUT"
 
       - name: Upload logs
-        if: always()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.artifact.outputs.name }}
           path: ${{ runner.temp }}/e2e-logs
-          retention-days: 14
+          retention-days: 1
           if-no-files-found: ignore
 
   # ---- arm 3: the real signed bundle pair, in-app update ------------------
@@ -355,10 +355,10 @@ jobs:
           echo "name=install-e2e-logs-${{ inputs.leg-id }}-bundle-${{ inputs.bundle-arch }}" >> "$GITHUB_OUTPUT"
 
       - name: Upload logs
-        if: always()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.artifact.outputs.name }}
           path: ${{ runner.temp }}/e2e-logs
-          retention-days: 14
+          retention-days: 1
           if-no-files-found: ignore

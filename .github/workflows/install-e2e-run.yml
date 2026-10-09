@@ -169,12 +169,12 @@ jobs:
       # The installer's own transcripts say far more than the assertion that
       # tripped when a real install breaks.
       - name: Upload installer logs
-        if: always()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           # Unique per leg: a matrix over releases runs this workflow several
           # times per route, and same-named artifacts collide.
           name: ${{ steps.artifact.outputs.name }}-${{ github.sha }}
           path: ${{ runner.temp }}/e2e-logs
-          retention-days: 14
+          retention-days: 1
           if-no-files-found: ignore

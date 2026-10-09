@@ -102,6 +102,34 @@ test('the caller builds one exact-SHA ad-hoc macOS artifact and fails closed whe
   expect(macos.if).toContain("needs.generate-matrix.outputs.macos-candidate-legs == '0'")
 })
 
+test('large install evidence is uploaded only for failed or cancelled legs and expires after one day', () => {
+  const contracts = [
+    ['.github/workflows/install-e2e-run.yml', ['Upload installer logs']],
+    ['.github/workflows/install-e2e-macos-run.yml', ['Upload logs', 'Upload logs']],
+    ['.github/workflows/install-e2e-windows-run.yml', ['Upload native acceptance evidence', 'Upload proof + logs']],
+  ]
+
+  for (const [relative, names] of contracts) {
+    const parsed = workflow(relative)
+    const uploadSteps = Object.values(parsed.jobs).flatMap(job => job.steps ?? [])
+      .filter(step => names.includes(step.name))
+    expect(uploadSteps.map(step => step.name)).toEqual(expect.arrayContaining(names))
+    for (const step of uploadSteps) {
+      expect(step.if).toContain('failure()')
+      expect(step.if).toContain('cancelled()')
+      expect(step.with['retention-days']).toBe(1)
+    }
+  }
+
+  const caller = workflow('.github/workflows/install-e2e.yml')
+  const player = caller.jobs['leg-player'].steps.find(step => step.uses?.startsWith('actions/upload-artifact@'))
+  expect(player.with['retention-days']).toBe(1)
+
+  const windows = workflow('.github/workflows/install-e2e-windows-run.yml')
+  const known = windows.jobs.e2e.steps.find(step => step.name === 'Upload known-failure receipt')
+  expect(known.with['retention-days']).toBe(1)
+})
+
 test('candidate legs consume and verify only the same-run exact provenance before using a file URL', () => {
   const reusable = workflow('.github/workflows/install-e2e-macos-run.yml')
   const gui = reusable.jobs['gui-e2e']
