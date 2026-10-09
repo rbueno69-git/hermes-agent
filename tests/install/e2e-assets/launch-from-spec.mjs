@@ -32,6 +32,7 @@ import { _electron } from '@playwright/test';
 import { prepareWindowForInput } from './window-input.cjs';
 import { assertStagedBranch, pickAppWindow, openAbout, readManualUpdateCommand, waitForUpdate } from './update-ui.cjs';
 import { installSourceBranchProbe, prepareSourceBranchEnvironment } from './source-branch-probe.cjs';
+import { captureMacOSProcessIdentity, dismissMacOSLocalNetworkSheet } from './macos-local-network.mjs';
 import { observeSourceUpdate } from './source-update-observer.mjs';
 import { runUpdateWindowChat } from './update-window-chat.mjs';
 import { isolateUpdateWindowEnvironment, isolatedElectronArgs, updateWindowEnvironment } from './smoke-env.mjs';
@@ -109,6 +110,36 @@ function phase(p) {
   currentPhase = p;
 }
 
+/**
+ * Native privacy sheets sit above Chromium and can swallow every Playwright
+ * click. Bind handling to this exact Electron process and fail closed unless
+ * consecutive native probes prove the Local Network sheet is gone.
+ * @param {import('@playwright/test').ElectronApplication} app
+ * @param {string} executablePath
+ * @param {(options: {pid: number, executablePath: string}) => Promise<{pid: number, startToken: string, executablePath: string}>} capture
+ * @param {(options: {processIdentity: {pid: number, startToken: string, executablePath: string}}) => Promise<{dismissed: boolean, clearProbes: number}>} dismiss
+ * @param {NodeJS.Platform} platform
+ */
+export async function clearNativePermissionSheet(
+  app,
+  executablePath,
+  capture = captureMacOSProcessIdentity,
+  dismiss = dismissMacOSLocalNetworkSheet,
+  platform = process.platform,
+) {
+  if (platform !== 'darwin') return { dismissed: false, clearProbes: 0 };
+  const child = app.process();
+  const pid = child.pid;
+  if (!pid) throw new Error('Electron process has no pid for native sheet handling');
+  const processIdentity = await capture({ pid, executablePath });
+  if (child.exitCode !== null || child.signalCode !== null) {
+    throw new Error('Electron exited while its native permission identity was captured');
+  }
+  const result = await dismiss({ processIdentity });
+  if (result.dismissed) log(`dismissed macOS Local Network sheet with Don’t Allow; ${result.clearProbes} clear probes`);
+  return result;
+}
+
 async function main() {
   // SIGKILLed Electron leaves Playwright connections and inherited pipes
   // holding node's event loop open, so the driver can outlive its own
@@ -164,6 +195,8 @@ async function main() {
   });
   if (!values['no-update']) await installSourceBranchProbe(app);
   const window = await pickAppWindow(app, log);
+  phase('native-permission-sheet');
+  await clearNativePermissionSheet(app, launch.executablePath);
   await window.screenshot({ path: `${values.spec}.window.png` }).catch(() => {});
 
   await prepareWindowForInput(app, window);

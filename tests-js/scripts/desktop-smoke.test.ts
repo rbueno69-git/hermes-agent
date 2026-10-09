@@ -10,10 +10,62 @@ import { candidateSmokeHermesHomes, predictSmokeHermesHome, resolveSmokeLaunch, 
 import { sourceRuntimeSettleCommand } from '../../tests/install/e2e-assets/source-runtime-settle.mjs'
 import { assertUpdateWindowBackendOrigin, assertUpdateWindowProcess } from '../../tests/install/e2e-assets/update-window-chat.mjs'
 
-import { assertChatCommit, newCompletedPair, readMockPrompts, type TranscriptMessage } from './desktop-chat-smoke.ts'
+import { assertChatCommit, createCheckpointPrompt, isCheckpointPromptWitness, newCompletedPair, readMockPrompts, type TranscriptMessage } from './desktop-chat-smoke.ts'
 import { assertBackendOrigin, localBackendProcess, readBundledBundleEnv, readInstallationCommit } from './desktop-smoke-process.ts'
 import { writeEnvFile, writeMockProviderConfig } from './mock-provider-config.ts'
 import { MOCK_REPLY, startMockServer } from './mock-server.ts'
+
+test('checkpoint prompts retain a unique full-token witness within the historical 64-character limit', (): void => {
+  const prompts = (['old', 'new', 'installed'] as const).map((phase) => createCheckpointPrompt(phase))
+
+  expect(new Set(prompts).size).toBe(prompts.length)
+
+  for (const prompt of prompts) {
+    expect(prompt.length).toBeLessThanOrEqual(64)
+    expect(prompt).toMatch(/^Desktop smoke (?:old|new|installed) [0-9a-f-]{36}$/)
+  }
+})
+
+test('recognized first-message system notes preserve only the exact checkpoint witness', (): void => {
+  const prompt = createCheckpointPrompt('old')
+  const notePrefix = `${prompt}\n\n[System note: This is the user's very first message ever. `
+  const taskFirst = 'If this message is itself a real request or task, DO THE TASK FIRST -- call whatever tools it needs -- and only then, in the closing sentences of that same reply, do what this note asks. Never let this note replace or skip work the user actually asked for. '
+  const profileBuild = 'OFFER — do not assume — to build a short profile of them so you can be more useful, and explain they can decline or do it later. If and ONLY IF they accept:\n  1. Ask for whatever they\'re comfortable sharing (name, what they do, how they like you to work). Volunteered facts come first.\n  2. Before ANY external lookup, say what you intend to look up and get explicit consent for that step. Never read their connected accounts (email, calendar, etc.) silently — ask each time.\n  3. With consent, you may use web_search to confirm public details (e.g. employer, public profiles) from the data points they gave.\n  4. Save each confirmed, durable fact with the memory tool using target="user" — keep entries compact and high-signal.\nIf they decline at any point, stop immediately and continue normally. Keep the whole exchange light and conversational, not an interrogation.]'
+
+  const witnesses = [
+    `${notePrefix}Briefly introduce yourself and mention that /help shows available commands. Keep the introduction concise -- one or two sentences max.]`,
+    `${notePrefix}After a one-sentence introduction (mention /help shows commands), ${profileBuild}`,
+    `${notePrefix}${taskFirst}What this note asks: briefly introduce yourself and mention that /help shows available commands, in one or two sentences.]`,
+    `${notePrefix}${taskFirst}What this note asks: after a one-sentence introduction (mention /help shows commands), ${profileBuild}`,
+    `${notePrefix}${taskFirst}What this note asks: briefly introduce yourself, mention that /help shows available commands, and end with this one line: "I can run a quick setup so I can help you better. Send /initiate-setup when you want it."]`,
+  ]
+
+  expect(isCheckpointPromptWitness(prompt, prompt)).toBe(true)
+
+  for (const witness of witnesses) {
+    expect(isCheckpointPromptWitness(witness, prompt)).toBe(true)
+  }
+
+  expect(isCheckpointPromptWitness(`${notePrefix}garbage]`, prompt)).toBe(false)
+  expect(isCheckpointPromptWitness(witnesses[0]!.replace('Keep the introduction', 'INJECTED Keep the introduction'), prompt)).toBe(false)
+  expect(isCheckpointPromptWitness(witnesses[2]!.replace('available commands', 'INJECTED available commands'), prompt)).toBe(false)
+  expect(isCheckpointPromptWitness(witnesses[3]!.replace('If they decline', 'INJECTED If they decline'), prompt)).toBe(false)
+  expect(isCheckpointPromptWitness(`${witnesses[3]}INJECTED]`, prompt)).toBe(false)
+  expect(isCheckpointPromptWitness(`${witnesses[2]}\n\n[System note: duplicate]`, prompt)).toBe(false)
+  expect(isCheckpointPromptWitness(`${witnesses[2]} `, prompt)).toBe(false)
+  expect(isCheckpointPromptWitness(`wrong ${witnesses[2]}`, prompt)).toBe(false)
+  expect(isCheckpointPromptWitness(`${prompt}\n\nunrelated suffix`, prompt)).toBe(false)
+})
+
+test('v2026.6.5 transcript envelope preserves only the exact checkpoint turn', (): void => {
+  const prompt = 'Desktop smoke old 17d937ab-9cd6-4938-99e2-6906d961d2e'
+  const witness = `User: ${prompt}\n\nAssistant: ${MOCK_REPLY}`
+
+  expect(isCheckpointPromptWitness(witness, prompt)).toBe(true)
+  expect(isCheckpointPromptWitness(`${witness}\nINJECTED`, prompt)).toBe(false)
+  expect(isCheckpointPromptWitness(witness.replace(MOCK_REPLY, `${MOCK_REPLY} INJECTED`), prompt)).toBe(false)
+  expect(isCheckpointPromptWitness(`User: wrong ${prompt}\n\nAssistant: ${MOCK_REPLY}`, prompt)).toBe(false)
+})
 
 test('one server owns inference and a fresh, per-server prompt witness', async (): Promise<void> => {
   const first = await startMockServer()

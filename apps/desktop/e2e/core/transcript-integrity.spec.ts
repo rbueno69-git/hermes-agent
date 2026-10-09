@@ -27,6 +27,7 @@ import {
   currentSessionId,
   launchCoreApp,
   recordWebSockets,
+  retireCurrentDocumentSockets,
   routePrimaryWebSocket,
   send,
   splitProfileRoute,
@@ -199,6 +200,11 @@ test('transcript oracle holds across every transition', async () => {
     await routePrimaryWebSocket(app, backendPort, proxy.port)
 
     await test.step('reload: hydrated transcript equals persisted', async () => {
+      // Electron 41 tears down the old document socket without Playwright
+      // emitting WebSocket.close for that observer. Retire only this document's
+      // recorded sockets before reload; any duplicate dial in the replacement
+      // document remains live and still fails the one-socket assertion below.
+      retireCurrentDocumentSockets(ws)
       await page.reload()
       await waitForInteractive(app, page)
       await installDuplicateSampler(page)

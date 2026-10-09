@@ -1,0 +1,105 @@
+ObjC.import('AppKit')
+ObjC.import('stdlib')
+
+const currentApplication = Application.currentApplication()
+currentApplication.includeStandardAdditions = true
+
+function textOf(element) {
+  const values = []
+  for (const property of ['name', 'description', 'value']) {
+    try {
+      const value = element[property]()
+      if (value !== undefined && value !== null) values.push(String(value).trim())
+    } catch (_) {}
+  }
+  return values.filter(Boolean)
+}
+
+function walk(element, collected, depth) {
+  if (depth > 12 || collected.nodes > 2000) {
+    collected.truncated = true
+    return
+  }
+  collected.nodes += 1
+  const texts = textOf(element)
+  for (const text of texts) collected.texts.push(text)
+  let role = ''
+  try { role = String(element.role()) } catch (_) {}
+  if (role === 'AXButton') {
+    const label = texts.find((text) => text === 'Don’t Allow' || text === "Don't Allow")
+    if (label) collected.deny.push(element)
+  }
+  const children = element.uiElements()
+  for (const child of children) walk(child, collected, depth + 1)
+}
+
+function runningIdentity(pid) {
+  const running = $.NSRunningApplication.runningApplicationWithProcessIdentifier(pid)
+  if (!running) throw new Error(`no running application for pid ${pid}`)
+  const executableURL = running.executableURL
+  if (!executableURL) throw new Error(`application process ${pid} has incomplete identity`)
+  const executablePath = ObjC.unwrap(executableURL.path)
+  const startToken = String(currentApplication.doShellScript(`/bin/ps -p ${pid} -o lstart=`)).trim()
+  if (!executablePath || !startToken) throw new Error(`application process ${pid} has invalid identity`)
+  return { pid, startToken, executablePath: String(executablePath) }
+}
+
+function assertIdentity(pid, expectedStartToken, expectedExecutablePath) {
+  const observed = runningIdentity(pid)
+  if (observed.startToken !== expectedStartToken || observed.executablePath !== expectedExecutablePath) {
+    throw new Error(`application process ${pid} no longer matches the captured Electron incarnation`)
+  }
+  return observed
+}
+
+function probe(pid, expectedStartToken, expectedExecutablePath) {
+  const identity = assertIdentity(pid, expectedStartToken, expectedExecutablePath)
+  const systemEvents = Application('System Events')
+  const processes = systemEvents.applicationProcesses.whose({ unixId: pid })()
+  if (processes.length !== 1) throw new Error(`expected one application process for pid ${pid}, found ${processes.length}`)
+
+  let nativeSheets = 0
+  let localNetworkSheets = 0
+  let denyButtons = 0
+  let clickedDeny = false
+  const windows = processes[0].windows()
+  if (windows.length === 0) throw new Error(`application process ${pid} exposes no native window to verify`)
+  const roots = []
+  for (const window of windows) {
+    const sheets = window.sheets()
+    for (const sheet of sheets) roots.push(sheet)
+    let subrole = ''
+    try { subrole = String(window.subrole()) } catch (_) {}
+    if (/dialog/i.test(subrole)) roots.push(window)
+  }
+  nativeSheets = roots.length
+  for (const root of roots) {
+    const collected = { nodes: 0, texts: [], deny: [], truncated: false }
+    walk(root, collected, 0)
+    if (collected.truncated) throw new Error(`native accessibility tree for pid ${pid} exceeded verification bounds`)
+    const localNetwork = collected.texts.some((text) => /local network/i.test(text))
+    if (!localNetwork) continue
+    localNetworkSheets += 1
+    denyButtons += collected.deny.length
+    if (collected.deny.length === 1) {
+      assertIdentity(pid, expectedStartToken, expectedExecutablePath)
+      collected.deny[0].click()
+      clickedDeny = true
+    }
+  }
+
+  return { ...identity, nativeSheets, localNetworkSheets, denyButtons, clickedDeny }
+}
+
+function run(argv) {
+  if (argv.length === 2 && argv[0] === 'identity' && /^\d+$/.test(argv[1])) {
+    return JSON.stringify(runningIdentity(Number(argv[1])))
+  }
+  if (argv.length === 4 && argv[0] === 'probe' && /^\d+$/.test(argv[1])) {
+    if (!argv[2] || !argv[3]) {
+      throw new Error('probe requires a process start token and executable path')
+    }
+    return JSON.stringify(probe(Number(argv[1]), argv[2], argv[3]))
+  }
+  throw new Error('usage: macos-local-network.jxa identity <pid> | probe <pid> <start-token> <executable>')
+}

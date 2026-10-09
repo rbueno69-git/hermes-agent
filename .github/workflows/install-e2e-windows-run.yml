@@ -104,7 +104,7 @@ jobs:
   bundled-e2e:
     name: packaged bundle (open-app-update)
     if: inputs.install-method == 'packaged-app' && inputs.update-method == 'open-app-update'
-    runs-on: ${{ inputs.bundle-arch == 'arm64' && 'windows-latest-32-arm-core' || 'windows-latest-32-core' }}
+    runs-on: ${{ inputs.bundle-arch == 'arm64' && 'windows-11-arm' || 'windows-latest' }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -147,7 +147,7 @@ jobs:
           mode: stop
           output: ${{ runner.temp }}/hermes-bundled-update-recording.mkv
       - name: Upload native acceptance evidence
-        if: always()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: install-e2e-logs-${{ inputs.leg-id }}-bundle-${{ inputs.bundle-arch }}
@@ -156,7 +156,7 @@ jobs:
             ${{ runner.temp }}/hermes-bundled-update/home/logs/
             ${{ runner.temp }}/hermes-bundled-update-recording.mkv
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 1
   e2e:
     # Short static name on purpose: name expressions render UNEXPANDED on
     # skipped jobs.
@@ -174,7 +174,7 @@ jobs:
         || (contains(fromJSON('["installer-script+desktop", "hermes-desktop-app-update", "desktop-installer@latest"]'), inputs.update-method) && inputs.tag-has-desktop)
         || (inputs.update-method == 'open-app-update' && inputs.tag-has-desktop
             && contains(fromJSON('["desktop-installer@latest", "installer-script+desktop"]'), inputs.install-method)))
-    runs-on: windows-latest-32-core
+    runs-on: windows-latest
     timeout-minutes: ${{ inputs.timeout-minutes }}
 
     env:
@@ -283,7 +283,7 @@ jobs:
           name: install-e2e-known-${{ steps.update.outputs.known_failure }}--${{ inputs.leg-id }}
           path: gui-e2e-proof/known-failure.json
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 1
 
       - name: Stop screen recording
         if: always()
@@ -320,10 +320,10 @@ jobs:
           }
 
       - name: Upload proof + logs
-        if: always()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: install-e2e-logs-${{ inputs.leg-id }}
           path: gui-e2e-proof
-          retention-days: 14
+          retention-days: 1
           if-no-files-found: ignore

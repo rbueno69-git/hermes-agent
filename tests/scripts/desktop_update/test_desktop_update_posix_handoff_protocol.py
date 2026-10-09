@@ -217,6 +217,51 @@ def test_handoff_run_adopts_only_the_matching_live_bridge(tmp_path, procs, bridg
     assert _calls(tmp_path) == []
 
 
+def test_custody_transfer_exports_custodian_for_real_update_lock_adoption(tmp_path):
+    """The hand-off's Python stage must adopt the live identity now named on line 1.
+
+    Once the refresher takes custody, the orchestrator's shell pid is no longer the
+    marker owner. Exercise the shipped UpdateLock rather than a fake CLI-side lock so
+    the exported partner identity cannot drift from the marker protocol again.
+    """
+    home, install = _install(tmp_path)
+    repository = Path(__file__).resolve().parents[3]
+    report = tmp_path / "update-lock.json"
+    (install / "hermes_cli" / "main.py").write_text(
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        f"sys.path.append({str(repository)!r})\n"
+        "import hermes_cli\n"
+        f"hermes_cli.__path__.append({str(repository / 'hermes_cli')!r})\n"
+        "if '--help' in sys.argv:\n"
+        "    print('update options --keep-stash')\n"
+        "    raise SystemExit(0)\n"
+        "from hermes_cli.update_lock import UpdateLock\n"
+        "marker = Path(os.environ['HERMES_HOME']) / '.hermes-update-in-progress'\n"
+        "owner = marker.read_text(encoding='utf-8-sig').splitlines()[0]\n"
+        "lock = UpdateLock(path=marker)\n"
+        "ok = lock.acquire()\n"
+        f"Path({str(report)!r}).write_text(json.dumps({{\n"
+        "    'owner': owner,\n"
+        "    'handoff': os.environ.get('HERMES_UPDATE_HANDOFF_PID'),\n"
+        "    'adopted': ok and not lock.acquired,\n"
+        "}), encoding='utf-8')\n"
+        "lock.release()\n"
+        "raise SystemExit(0 if ok else 2)\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["bash", str(POSIX), "--daemonized", "--no-ui", "--install-root", str(install)],
+        env=_env(tmp_path, home), cwd=tmp_path, capture_output=True, text=True, timeout=120,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    adoption = json.loads(report.read_text(encoding="utf-8"))
+    assert adoption["adopted"] is True, adoption
+    assert adoption["handoff"] == adoption["owner"], adoption
+
+
 def test_withdraw_removes_only_this_desktops_bridge_and_reports_a_taker(tmp_path, procs):
     home, install = _install(tmp_path)
     desktop, script = subprocess.Popen(["sleep", "60"]), subprocess.Popen(["sleep", "60"])

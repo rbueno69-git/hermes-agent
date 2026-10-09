@@ -7,11 +7,14 @@ readers. No bootstrap, installer, build, PM worker, or application entry point.
 from __future__ import annotations
 
 import argparse
+from html.parser import HTMLParser
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import struct
 import subprocess
 import sys
+from urllib.parse import urlsplit
 
 
 def desktop_outputs(root: Path) -> list[Path]:
@@ -22,6 +25,89 @@ def desktop_outputs(root: Path) -> list[Path]:
     ) for path in desktop.glob(pattern)]
 
 
+def desktop_resources(root: Path) -> list[Path]:
+    desktop = root / "apps/desktop"
+    return [path for pattern in (
+        "release/*/resources",
+        "release/mac*/Hermes.app/Contents/Resources",
+    ) for path in desktop.glob(pattern) if path.is_dir()]
+
+
+class _ModuleScripts(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.sources: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "script":
+            return
+        values = {key.lower(): value for key, value in attrs}
+        if (values.get("type") or "").lower() == "module" and values.get("src"):
+            self.sources.append(values["src"] or "")
+
+
+def _legacy_asar_has_renderer(resources: Path) -> bool:
+    archive = resources / "app.asar"
+    try:
+        archive_size = archive.stat().st_size
+        with archive.open("rb") as stream:
+            size, header_size, payload_size, json_size = struct.unpack("<4I", stream.read(16))
+            if (size != 4 or header_size != payload_size + 4
+                    or payload_size != 4 + ((json_size + 3) // 4) * 4
+                    or not 0 < json_size <= 64 * 1024 * 1024
+                    or 8 + header_size > archive_size):
+                raise ValueError("invalid ASAR header")
+            header = json.loads(stream.read(json_size))
+
+            def read_member(name: str) -> bytes:
+                path = PurePosixPath(name)
+                if not name or path.is_absolute() or ".." in path.parts or "\\" in name or ":" in name:
+                    raise ValueError("invalid ASAR entry path")
+                node = header
+                for part in path.parts:
+                    node = node["files"][part]
+                length = node["size"]
+                if type(length) is not int or length <= 0 or node.get("unpacked"):
+                    raise ValueError(f"invalid packed ASAR entry: {name}")
+                raw_offset = node["offset"]
+                if type(raw_offset) is int:
+                    offset = raw_offset
+                elif (isinstance(raw_offset, str) and raw_offset.isascii()
+                      and raw_offset.isdigit()):
+                    offset = int(raw_offset)
+                else:
+                    raise ValueError(f"invalid packed ASAR offset: {name}")
+                if offset < 0 or 8 + header_size + offset + length > archive_size:
+                    raise ValueError(f"truncated ASAR entry: {name}")
+                stream.seek(8 + header_size + offset)
+                data = stream.read(length)
+                if len(data) != length or not data.strip():
+                    raise ValueError(f"incomplete ASAR entry: {name}")
+                return data
+
+            package = json.loads(read_member("package.json"))
+            main = package["main"]
+            if not isinstance(main, str):
+                raise ValueError("invalid packaged main entry")
+            read_member(main)
+            html = read_member("dist/index.html").decode("utf-8-sig")
+            parser = _ModuleScripts()
+            parser.feed(html)
+            if not parser.sources:
+                raise ValueError("renderer has no local module entry")
+            for source in parser.sources:
+                parsed = urlsplit(source)
+                if parsed.scheme or parsed.netloc or source.startswith("//"):
+                    raise ValueError("renderer module entry is not local")
+                relative = PurePosixPath(parsed.path)
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise ValueError("invalid renderer module path")
+                read_member(str(PurePosixPath("dist") / relative))
+        return True
+    except (OSError, UnicodeError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
+        return False
+
+
 def verify_products(root: Path, desktop: str, node: Path | None = None) -> None:
     app = root / "apps/desktop"
     outputs = desktop_outputs(root)
@@ -29,7 +115,9 @@ def verify_products(root: Path, desktop: str, node: Path | None = None) -> None:
     if desktop == "absent" and has_desktop:
         raise RuntimeError("unexpected desktop output in a no-desktop scenario")
     if desktop == "present":
-        if not outputs or not any((out / "index.html").is_file() for out in outputs):
+        unpacked_renderer = any((out / "index.html").is_file() for out in outputs)
+        legacy_renderer = node is None and any(_legacy_asar_has_renderer(path) for path in desktop_resources(root))
+        if not unpacked_renderer and not legacy_renderer:
             raise RuntimeError("desktop packaged renderer is missing or incomplete")
         executables = [path for pattern in (
             "release/*/Hermes.exe", "release/*/Hermes", "release/*/hermes",

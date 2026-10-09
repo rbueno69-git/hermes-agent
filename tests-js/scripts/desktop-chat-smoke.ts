@@ -10,6 +10,36 @@ import { MOCK_REPLY } from './mock-server.ts'
 
 export type ChatPhase = 'old' | 'new' | 'installed'
 
+/** Keep the full random witness below the 64-character composer limit in v2026.6.5. */
+export function createCheckpointPrompt(phase: ChatPhase): string {
+  return `Desktop smoke ${phase} ${randomUUID()}`
+}
+
+const firstMessageNotePrefix = `\n\n[System note: This is the user's very first message ever. `
+
+const taskFirstClause = 'If this message is itself a real request or task, DO THE TASK FIRST -- call whatever tools it needs -- and only then, in the closing sentences of that same reply, do what this note asks. Never let this note replace or skip work the user actually asked for. '
+const profileBuildSteps = 'OFFER — do not assume — to build a short profile of them so you can be more useful, and explain they can decline or do it later. If and ONLY IF they accept:\n  1. Ask for whatever they\'re comfortable sharing (name, what they do, how they like you to work). Volunteered facts come first.\n  2. Before ANY external lookup, say what you intend to look up and get explicit consent for that step. Never read their connected accounts (email, calendar, etc.) silently — ask each time.\n  3. With consent, you may use web_search to confirm public details (e.g. employer, public profiles) from the data points they gave.\n  4. Save each confirmed, durable fact with the memory tool using target="user" — keep entries compact and high-signal.\nIf they decline at any point, stop immediately and continue normally. Keep the whole exchange light and conversational, not an interrogation.]'
+
+const firstMessageNoteBodies = new Set([
+  'Briefly introduce yourself and mention that /help shows available commands. Keep the introduction concise -- one or two sentences max.]',
+  `After a one-sentence introduction (mention /help shows commands), ${profileBuildSteps}`,
+  `${taskFirstClause}What this note asks: briefly introduce yourself and mention that /help shows available commands, in one or two sentences.]`,
+  `${taskFirstClause}What this note asks: after a one-sentence introduction (mention /help shows commands), ${profileBuildSteps}`,
+  ...['/initiate-setup', '/initiate_setup', '/hermes initiate-setup'].map((command): string =>
+    `${taskFirstClause}What this note asks: briefly introduce yourself, mention that /help shows available commands, and end with this one line: "I can run a quick setup so I can help you better. Send ${command} when you want it."]`),
+])
+
+/** Admit the exact checkpoint or one byte-exact, release-supported envelope/note. */
+export function isCheckpointPromptWitness(received: string, prompt: string): boolean {
+  if (received === prompt || received === `User: ${prompt}\n\nAssistant: ${MOCK_REPLY}`) {
+    return true
+  }
+
+  const augmentedPrefix = `${prompt}${firstMessageNotePrefix}`
+
+  return received.startsWith(augmentedPrefix) && firstMessageNoteBodies.has(received.slice(augmentedPrefix.length))
+}
+
 export interface DesktopChatSmokeOptions {
   mockUrl: string
   phase: ChatPhase
@@ -222,7 +252,7 @@ export async function runDesktopChatSmoke(page: Page, options: DesktopChatSmokeO
   const receiptPath = path.join(outDir, `desktop-chat-${phase}.json`)
   const evidencePath = path.join(outDir, `desktop-chat-${phase}-renderer.log`)
   const screenshot = path.join(outDir, `desktop-chat-${phase}.png`)
-  const prompt = `Hello, can you hear me? Desktop smoke ${phase} ${randomUUID()}`
+  const prompt = createCheckpointPrompt(phase)
   const observe = options.observePrompts ?? ((): Promise<string[]> => readMockPrompts(options.mockUrl))
   // A send the app swallows and a send the app never made look identical from
   // the mock's side; the renderer's own console is the only witness to which.
@@ -276,7 +306,7 @@ export async function runDesktopChatSmoke(page: Page, options: DesktopChatSmokeO
     let receivedPrompt = ''
     await expect.poll(async (): Promise<boolean> => {
       const prompts = await observe()
-      witnessIndex = prompts.findIndex((text: string, index: number): boolean => index >= before && text.includes(prompt))
+      witnessIndex = prompts.findIndex((text: string, index: number): boolean => index >= before && isCheckpointPromptWitness(text, prompt))
       receivedPrompt = prompts[witnessIndex] ?? ''
 
       return witnessIndex >= before

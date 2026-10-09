@@ -20,13 +20,19 @@ import {
   applyVoiceStopPhraseFromConfig
 } from './voice-prefs'
 
+function storageSetItemTarget(): Pick<Storage, 'setItem'> {
+  const storage = window.localStorage
+
+  return Object.hasOwn(storage, 'setItem') ? storage : Storage.prototype
+}
+
 it('keeps the desktop toggle local across config refreshes', async () => {
   for (const fails of [false, true]) {
     for (const enabled of [false, true]) {
-      localStorage.clear()
+      window.localStorage.clear()
       vi.resetModules()
       const prefs = await import('./voice-prefs')
-      const write = vi.spyOn(localStorage, 'setItem')
+      const write = vi.spyOn(storageSetItemTarget(), 'setItem')
 
       if (fails) {
         write.mockImplementation(() => {
@@ -41,7 +47,7 @@ it('keeps the desktop toggle local across config refreshes', async () => {
         prefs.applyAutoSpeakFromConfig({ voice: { auto_tts: !enabled } })
         expect(prefs.$autoSpeakReplies.get()).toBe(enabled)
         expect(saveHermesConfig).not.toHaveBeenCalled()
-        expect(localStorage.getItem('hermes.desktop.autoSpeakReplies')).toBe(fails ? null : String(enabled))
+        expect(window.localStorage.getItem('hermes.desktop.autoSpeakReplies')).toBe(fails ? null : String(enabled))
       } finally {
         write.mockRestore()
       }
@@ -52,10 +58,10 @@ it('keeps the desktop toggle local across config refreshes', async () => {
 it('migrates the legacy preference once, not on every refresh', async () => {
   for (const fails of [false, true]) {
     for (const enabled of [false, true]) {
-      localStorage.clear()
+      window.localStorage.clear()
       vi.resetModules()
       const prefs = await import('./voice-prefs')
-      const write = vi.spyOn(localStorage, 'setItem')
+      const write = vi.spyOn(storageSetItemTarget(), 'setItem')
 
       if (fails) {
         write.mockImplementation(() => {
@@ -65,11 +71,11 @@ it('migrates the legacy preference once, not on every refresh', async () => {
 
       try {
         prefs.applyAutoSpeakFromConfig(null)
-        expect(localStorage.getItem('hermes.desktop.autoSpeakReplies')).toBeNull()
+        expect(window.localStorage.getItem('hermes.desktop.autoSpeakReplies')).toBeNull()
         prefs.applyAutoSpeakFromConfig({ voice: { auto_tts: enabled } })
         prefs.applyAutoSpeakFromConfig({ voice: { auto_tts: !enabled } })
         expect(prefs.$autoSpeakReplies.get()).toBe(enabled)
-        expect(localStorage.getItem('hermes.desktop.autoSpeakReplies')).toBe(fails ? null : String(enabled))
+        expect(window.localStorage.getItem('hermes.desktop.autoSpeakReplies')).toBe(fails ? null : String(enabled))
       } finally {
         write.mockRestore()
       }

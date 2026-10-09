@@ -35,9 +35,11 @@ import { fileURLToPath } from 'node:url';
  * The closed method/version vocabulary. Workflows key off these exact
  * strings, so they are types, not conventions.
  *
- * @typedef {'latest'} InstallerVersion
- *   The artifact published on the website right now -- Hermes-Setup.exe has
- *   no versioned archive yet. Widen this union when one exists.
+ * @typedef {'latest' | 'candidate'} InstallerVersion
+ *   `latest` is the artifact published on the website right now.
+ *   `candidate` is built from the exact workflow SHA inside this run, but its
+ *   bootstrap follows staged `main` so it covers historical starts as well as
+ *   HEAD -> NEXT.
  * @typedef {'installer-script' | 'installer-script+desktop' | 'desktop-installer' | 'packaged-app'} InstallMethod
  *   installer-script is the platform's one-liner (curl | bash on
  *   linux/macos, irm | iex on windows); installer-script+desktop is the
@@ -167,8 +169,10 @@ export const SPEC = {
     install: [
       { method: 'installer-script' },
       { method: 'installer-script+desktop' },
-      // The published Hermes-Setup.dmg from the website, mounted and run.
-      { method: 'desktop-installer', versions: ['latest'] },
+      // CI-local, ad-hoc-signed Hermes-Setup.dmg built from the workflow SHA.
+      // The Nous-published asset belongs to upstream release acceptance, not
+      // this fork's required matrix.
+      { method: 'desktop-installer', versions: ['candidate'] },
     ],
     update: [
       { method: 'installer-script' },

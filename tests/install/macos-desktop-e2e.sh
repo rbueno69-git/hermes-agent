@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
-# Prove a macOS user who installed OLD via the published desktop installer
-# (Hermes-Setup.dmg from the website) can reach HEAD.
+# Prove a macOS user who installed via the fork's exact-SHA CI candidate can
+# reach the target.
 #
 # The macOS sibling of tests/install/windows-e2e.ps1's desktop-installer
 # arm, sharing the staging trick: every git process is pointed at a local
 # bare clone via url.<file://serve.git>.insteadOf in a driver-owned
-# GIT_CONFIG_GLOBAL. The published dmg carries no commit pin - it installs
-# whatever `main` serves - so parking serve.git's main at OLD stages the
-# "user on the current release" start, and advancing it to HEAD makes an
-# update available exactly the way it does for a real user. Its separately
-# resolved install.sh must come from OLD too: git's redirect does not cover
-# raw.githubusercontent.com. The published GUI still owns every install stage.
+# GIT_CONFIG_GLOBAL. The CI candidate's bytes come from the exact workflow SHA,
+# while its bootstrap follows staged `main`, so it can install OLD releases and
+# HEAD. The separately resolved install.sh must match install-ref too: git's
+# redirect does not cover raw.githubusercontent.com. The selected GUI still
+# owns every install stage.
 #
 # Phases (state shared via the workroot, mirroring the windows driver):
 #   stage    bare-clone this checkout to serve.git, park main at OLD
@@ -28,8 +27,9 @@
 #
 # Usage:
 #   tests/install/macos-desktop-e2e.sh --phase stage|install|update|all
+#     [--install-method desktop-installer@candidate]
 #     --update-method open-app-update|hermes-desktop-app-update
-#     [--install-ref REF] [--dmg-url URL]
+#     [--install-ref REF] [--dmg-url URL] --dmg-sha256 SHA256
 #     [--update-ref REF]   update target, default HEAD; pass the next
 #                          release tag for a stable-to-stable leg (label the
 #                          leg stable-to-stable only when both refs are tags);
@@ -46,15 +46,20 @@ set -euo pipefail
 export TS_BASE=$SECONDS
 
 PHASE="all"
+INSTALL_METHOD="desktop-installer@candidate"
 UPDATE_METHOD=""
 INSTALL_REF=""
 UPDATE_REF=""
-DMG_URL="https://hermes-assets.nousresearch.com/Hermes-Setup.dmg"
+DMG_URL=""
+DMG_SHA256=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --phase)
       [ "$#" -ge 2 ] || { echo 'error: --phase needs a value' >&2; exit 1; }
       PHASE="$2"; shift 2 ;;
+    --install-method)
+      [ "$#" -ge 2 ] || { echo 'error: --install-method needs a value' >&2; exit 1; }
+      INSTALL_METHOD="$2"; shift 2 ;;
     --update-method)
       [ "$#" -ge 2 ] || { echo 'error: --update-method needs a value' >&2; exit 1; }
       UPDATE_METHOD="$2"; shift 2 ;;
@@ -67,14 +72,23 @@ while [ "$#" -gt 0 ]; do
     --dmg-url)
       [ "$#" -ge 2 ] || { echo 'error: --dmg-url needs a value' >&2; exit 1; }
       DMG_URL="$2"; shift 2 ;;
+    --dmg-sha256)
+      [ "$#" -ge 2 ] || { echo 'error: --dmg-sha256 needs a value' >&2; exit 1; }
+      DMG_SHA256="$2"; shift 2 ;;
     -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
     *) echo "error: unknown argument: $1" >&2; exit 1 ;;
   esac
 done
+case "$INSTALL_METHOD" in
+  desktop-installer@candidate) ;;
+  *) echo "error: unsupported --install-method '$INSTALL_METHOD'" >&2; exit 1 ;;
+esac
 case "$UPDATE_METHOD" in
   open-app-update|hermes-desktop-app-update|hermes-update|installer-script|installer-script+desktop) ;;
   *) echo "error: unsupported --update-method '$UPDATE_METHOD'" >&2; exit 1 ;;
 esac
+[[ "$DMG_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+  || { echo 'error: --dmg-sha256 must be a lowercase SHA-256 digest' >&2; exit 1; }
 [ "$(uname -s)" = "Darwin" ] || { echo "error: this driver runs on macOS only" >&2; exit 1; }
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -182,11 +196,11 @@ phase_install() {
   # shellcheck disable=SC1090
   . "$STATE"
   arm_redirect
-  step "installing OLD ($OLD_REF) via the published Hermes-Setup.dmg"
+  step "installing OLD ($OLD_REF) via $INSTALL_METHOD Hermes-Setup.dmg"
 
-  # Pair both historical inputs. Today's downloaded install.sh can call helpers
-  # absent from OLD (e.g. ensure-rolldown-binding.mjs). Use the published
-  # bootstrap's script-source override, not a patched script or prebuilt app.
+  # Pair both inputs. A newer install.sh can call helpers absent from OLD
+  # (e.g. ensure-rolldown-binding.mjs). Use the bootstrap's script-source
+  # override, not a patched script or prebuilt app.
   local bootstrap_root="$WORK_ROOT/bootstrap-source"
   mkdir -p "$bootstrap_root/scripts"
   git -C "$SERVE_REPO" show "$OLD_SHA:scripts/install.sh" > "$bootstrap_root/scripts/install.sh"
@@ -196,12 +210,23 @@ phase_install() {
     > "$LOG_DIR/bootstrap-install-script.txt"
   ok "bootstrap script is unmodified scripts/install.sh from $OLD_REF ($OLD_SHA)"
 
-  local dmg="$WORK_ROOT/Hermes-Setup.dmg"
-  [ -f "$dmg" ] || curl -fsSL -o "$dmg" "$DMG_URL"
+  local dmg
+  if [[ "$DMG_URL" == file://* ]]; then
+    dmg="$(python3 -c 'import pathlib, sys, urllib.parse; u=urllib.parse.urlsplit(sys.argv[1]); (u.scheme == "file" and not u.netloc) or sys.exit(1); print(pathlib.Path(urllib.parse.unquote(u.path)).resolve())' "$DMG_URL")" \
+      || fail "invalid local candidate URL"
+  else
+    dmg="$WORK_ROOT/Hermes-Setup.dmg"
+    [ -f "$dmg" ] || curl -fsSL -o "$dmg" "$DMG_URL"
+    xattr -dr com.apple.quarantine "$dmg" 2>/dev/null || true
+  fi
   [ "$(stat -f%z "$dmg")" -gt 1000000 ] || fail "dmg download too small: $(stat -f%z "$dmg") bytes"
-  # curl'd files carry no quarantine attr, but belt and braces on a runner.
-  xattr -dr com.apple.quarantine "$dmg" 2>/dev/null || true
 
+  # Re-hash the driver's local file immediately before hdiutil consumes it.
+  # Provenance verification happened in an earlier process and cannot stand
+  # in for binding these bytes at the use boundary.
+  bash "$ASSETS/verify-sha256.sh" "$dmg" "$DMG_SHA256" \
+    || fail "local candidate digest changed before mount"
+  chflags uchg "$dmg"
   local mount
   mount="$(hdiutil attach -nobrowse -readonly "$dmg" | awk -F'\t' '/\/Volumes\//{print $NF; exit}')"
   [ -n "$mount" ] || fail "hdiutil attach produced no mount point"
@@ -267,7 +292,23 @@ phase_install() {
       }
     }
   }' "$installed_bin" || fail "installed app did not close normally; no smoke launch attempted"
-  desktop_checkpoint old "$OLD_SHA" desktop-installer@latest
+  desktop_checkpoint old "$OLD_SHA" "$INSTALL_METHOD"
+}
+
+COLLECTED_INSTALL_LOGS=0
+collect_install_side_logs() {
+  [ "$COLLECTED_INSTALL_LOGS" -eq 0 ] || return 0
+  COLLECTED_INSTALL_LOGS=1
+  local ildest="$LOG_DIR/install-logs"
+  mkdir -p "$ildest"
+  cp -R "$HOME_SANDBOX/.hermes/logs" "$ildest/hermes-logs" 2>/dev/null || true
+  local ud="$HOME_SANDBOX/Library/Application Support/Hermes"
+  [ -d "$ud" ] && cp -R "$ud" "$ildest/desktop-userdata" 2>/dev/null || true
+  cp "$HERMES_HOME/.hermes-update-result.json" "$ildest" 2>/dev/null || true
+  ls -la "$HERMES_HOME" > "$ildest/hermes-home-ls.txt" 2>/dev/null || true
+  ls -la "$INSTALL_DIR/venv/bin" > "$ildest/venv-bin-ls.txt" 2>/dev/null || true
+  ls -la "$INSTALL_DIR/venv" > "$ildest/venv-ls.txt" 2>/dev/null || true
+  ok "collected install-side logs to $ildest"
 }
 
 run_playwright_update() {
@@ -284,6 +325,7 @@ run_playwright_update() {
     --repo-dir "$INSTALL_DIR" 2>&1 \
     | ts_prefix > "$LOG_DIR/app-update.log") || rc=$?
   log_group "app update (Playwright) transcript" "$LOG_DIR/app-update.log"
+  collect_install_side_logs
   [ "$rc" -eq 0 ] || fail "app-driven update exited $rc; transcript above"
 }
 
@@ -384,27 +426,14 @@ PYEOF
       ;;
   esac
 
+  # Evidence precedes every update assertion. App-driven legs already collected
+  # immediately after their observer returned; the guard makes this a no-op.
+  collect_install_side_logs
+
   local got
   got="$(git -C "$INSTALL_DIR" rev-parse HEAD)"
   [ "$got" = "$TARGET_SHA" ] || fail "checkout is $got, expected $TARGET_LABEL ($TARGET_SHA)"
   ok "checkout landed on $TARGET_LABEL ($TARGET_SHA)"
-
-  # Install-side state BEFORE the post-update smoke: on app-update legs the
-  # updater's own transcript is streamed into the app UI and otherwise lost,
-  # so snapshot every place it also lands (product logs, update hand-off
-  # files, the venv's entry-point dir) while the install is still there to
-  # inspect — the smoke assertion below can `fail` out of the driver, and the
-  # evidence must already be on disk when it does.
-  local ildest="$LOG_DIR/install-logs"
-  mkdir -p "$ildest"
-  cp -R "$HOME_SANDBOX/.hermes/logs" "$ildest/hermes-logs" 2>/dev/null || true
-  local ud="$HOME_SANDBOX/Library/Application Support/Hermes"
-  [ -d "$ud" ] && cp -R "$ud" "$ildest/desktop-userdata" 2>/dev/null || true
-  cp "$HERMES_HOME/.hermes-update-result.json" "$ildest" 2>/dev/null || true
-  ls -la "$HERMES_HOME" > "$ildest/hermes-home-ls.txt" 2>/dev/null || true
-  ls -la "$INSTALL_DIR/venv/bin" > "$ildest/venv-bin-ls.txt" 2>/dev/null || true
-  ls -la "$INSTALL_DIR/venv" > "$ildest/venv-ls.txt" 2>/dev/null || true
-  ok "collected install-side logs to $ildest"
 
   # The update may publish a launcher before its installed dependency inputs
   # are current. The next non-metadata startup then owns source completion,

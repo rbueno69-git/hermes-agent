@@ -8,7 +8,7 @@
 #                           script/updater/hermes-desktop-app-update
 #                           updates.
 #   gui-e2e (desktop arm)   tests/install/macos-desktop-e2e.sh - the
-#                           published Hermes-Setup.dmg, mounted and run,
+#                           fork-built candidate Hermes-Setup.dmg, mounted,
 #                           then the app driven by Playwright for the
 #                           app-update methods.
 #
@@ -21,7 +21,7 @@ on:
   workflow_call:
     inputs:
       install-method:
-        description: 'How OLD gets installed. Supported: installer-script, installer-script+desktop (curl | bash one-liner, optionally with --include-desktop) and desktop-installer@latest (the published Hermes-Setup.dmg).'
+        description: 'How OLD gets installed. Supported: installer-script, installer-script+desktop (curl | bash one-liner, optionally with --include-desktop), and desktop-installer@candidate (the exact-SHA same-run CI artifact whose bootstrap follows staged main).'
         required: true
         type: string
       update-method:
@@ -48,10 +48,10 @@ on:
         required: true
         type: string
       dmg-url:
-        description: 'Bootstrap dmg to install OLD with. Default: the latest published one — what a user downloads today.'
+        description: 'Bootstrap dmg to install OLD with. Required acceptance uses the same-run candidate; the Nous-published asset is outside fork acceptance.'
         required: false
         type: string
-        default: https://hermes-assets.nousresearch.com/Hermes-Setup.dmg
+        default: ''
       bundle-manifest-url:
         description: 'URL of the JSON schema-1 bundle manifest for the packaged-app arm. Empty (default) means the bundled arm does not run — native packaged coverage only runs when the caller pins a real signed OLD/NEW pair.'
         required: false
@@ -95,13 +95,13 @@ jobs:
       runner: macos-latest
       timeout-minutes: ${{ inputs.timeout-minutes }}
 
-  # ---- arm 2: the published dmg, then Playwright drives the app ------------
+  # ---- arm 2: the fork candidate dmg, then Playwright drives the app --------
   gui-e2e:
     # Short static name on purpose: name expressions render UNEXPANDED on
     # skipped jobs.
     name: Hermes-Setup.dmg
     if: >-
-      inputs.install-method == 'desktop-installer@latest' && inputs.tag-has-desktop
+      inputs.install-method == 'desktop-installer@candidate' && inputs.tag-has-desktop
       && contains(fromJSON('["open-app-update", "hermes-desktop-app-update", "hermes-update", "installer-script", "installer-script+desktop"]'), inputs.update-method)
     runs-on: macos-latest
     timeout-minutes: ${{ inputs.timeout-minutes }}
@@ -113,6 +113,15 @@ jobs:
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
+
+      # No run-id or repository override: download-artifact can only resolve
+      # the artifact uploaded by this exact caller run.
+      - name: Download exact-SHA candidate installer
+        if: inputs.install-method == 'desktop-installer@candidate'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: install-e2e-macos-candidate-${{ github.sha }}
+          path: ${{ runner.temp }}/macos-candidate
 
       - name: Set up driver tools only
         uses: ./.github/actions/setup-pm
@@ -133,35 +142,105 @@ jobs:
           mode: start
           output: ${{ runner.temp }}/e2e-logs/recording.mkv
 
+      # Keep this after every setup/install hook and directly before staging.
+      - name: Verify candidate installer provenance and payload
+        id: candidate
+        if: inputs.install-method == 'desktop-installer@candidate'
+        env:
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          git diff --quiet
+          git diff --cached --quiet
+          root="$RUNNER_TEMP/macos-candidate"
+          verified="$RUNNER_TEMP/verified-macos-candidate"
+          package_lock_digest="$(shasum -a 256 package-lock.json | awk '{print $1}')"
+          cargo_lock_digest="$(shasum -a 256 apps/bootstrap-installer/src-tauri/Cargo.lock | awk '{print $1}')"
+          result="$(node tests/install/e2e-assets/verify-macos-candidate.mjs \
+            --root "$root" --expected-repository "$EXPECTED_REPOSITORY" \
+            --expected-sha "$EXPECTED_SHA" \
+            --expected-package-lock-sha256 "$package_lock_digest" \
+            --expected-cargo-lock-sha256 "$cargo_lock_digest" \
+            --expected-node-version v24.11.1 --expected-rust-toolchain 1.91.1 \
+            --copy-to "$verified")"
+          dmg="$(jq -er '.dmg' <<<"$result")"
+          digest="$(jq -er '.digest' <<<"$result")"
+          chflags uchg "$dmg"
+
+          mount="$RUNNER_TEMP/candidate-mount"
+          mkdir -p "$mount"
+          cleanup() { hdiutil detach "$mount" -quiet || true; }
+          trap cleanup EXIT
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount" "$dmg" >/dev/null
+          test "$(find "$mount" -mindepth 1 -maxdepth 1 -exec basename {} \; | LC_ALL=C sort | tr '\n' ' ')" = 'Applications Hermes.app '
+          test -L "$mount/Applications"
+          test "$(readlink "$mount/Applications")" = /Applications
+          test -d "$mount/Hermes.app"
+          codesign --verify --deep --strict --verbose=2 "$mount/Hermes.app"
+          codesign -dv --verbose=4 "$mount/Hermes.app" 2>&1 | grep -F 'Signature=adhoc'
+          macho_count=0
+          while IFS= read -r -d '' binary; do
+            if file -b "$binary" | grep -q '^Mach-O'; then
+              macho_count=$((macho_count + 1))
+              test "$(lipo -archs "$binary")" = arm64
+              codesign --verify --strict --verbose=2 "$binary"
+              codesign -dv --verbose=4 "$binary" 2>&1 | grep -F 'Signature=adhoc'
+            fi
+          done < <(find "$mount/Hermes.app" -type f -print0)
+          test "$macho_count" -gt 0
+          cleanup
+          trap - EXIT
+
+          dmg_url="$(python3 -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve().as_uri())' "$dmg")"
+          case "$dmg_url" in file://*) ;; *) echo "::error::candidate URL is not file://"; exit 1 ;; esac
+          {
+            echo "dmg-url=$dmg_url"
+            echo "digest=$digest"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Stage serve repo (main -> ${{ inputs.install-ref }})
         run: |
           set -euo pipefail
           tests/install/macos-desktop-e2e.sh --phase stage \
+            --install-method '${{ inputs.install-method }}' \
             --update-method '${{ inputs.update-method }}' \
             --install-ref '${{ inputs.install-ref }}' \
             --update-ref '${{ inputs.update-ref }}' \
-            --dmg-url '${{ inputs.dmg-url }}'
+            --dmg-url "$DMG_URL" \
+            --dmg-sha256 "$DMG_SHA256"
         env:
+          DMG_URL: ${{ steps.candidate.outputs.dmg-url || inputs.dmg-url }}
+          DMG_SHA256: ${{ steps.candidate.outputs.digest }}
           HERMES_E2E_LOG_DIR: ${{ runner.temp }}/e2e-logs
 
       - name: Install ${{ inputs.install-ref }} via Hermes-Setup.dmg
         run: |
           set -euo pipefail
           tests/install/macos-desktop-e2e.sh --phase install \
+            --install-method '${{ inputs.install-method }}' \
             --update-method '${{ inputs.update-method }}' \
             --install-ref '${{ inputs.install-ref }}' \
-            --dmg-url '${{ inputs.dmg-url }}'
+            --dmg-url "$DMG_URL" \
+            --dmg-sha256 "$DMG_SHA256"
         env:
+          DMG_URL: ${{ steps.candidate.outputs.dmg-url || inputs.dmg-url }}
+          DMG_SHA256: ${{ steps.candidate.outputs.digest }}
           HERMES_E2E_LOG_DIR: ${{ runner.temp }}/e2e-logs
 
       - name: Update ${{ inputs.install-ref }} -> ${{ inputs.update-ref }} (${{ inputs.update-method }})
         run: |
           set -euo pipefail
           tests/install/macos-desktop-e2e.sh --phase update \
+            --install-method '${{ inputs.install-method }}' \
             --update-method '${{ inputs.update-method }}' \
             --install-ref '${{ inputs.install-ref }}' \
-            --dmg-url '${{ inputs.dmg-url }}'
+            --dmg-url "$DMG_URL" \
+            --dmg-sha256 "$DMG_SHA256"
         env:
+          DMG_URL: ${{ steps.candidate.outputs.dmg-url || inputs.dmg-url }}
+          DMG_SHA256: ${{ steps.candidate.outputs.digest }}
           HERMES_E2E_LOG_DIR: ${{ runner.temp }}/e2e-logs
 
       - name: Stop screen recording
@@ -188,12 +267,12 @@ jobs:
           echo "name=install-e2e-logs-${{ inputs.leg-id }}" >> "$GITHUB_OUTPUT"
 
       - name: Upload logs
-        if: always()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.artifact.outputs.name }}
           path: ${{ runner.temp }}/e2e-logs
-          retention-days: 14
+          retention-days: 1
           if-no-files-found: ignore
 
   # ---- arm 3: the real signed bundle pair, in-app update ------------------
@@ -276,10 +355,10 @@ jobs:
           echo "name=install-e2e-logs-${{ inputs.leg-id }}-bundle-${{ inputs.bundle-arch }}" >> "$GITHUB_OUTPUT"
 
       - name: Upload logs
-        if: always()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.artifact.outputs.name }}
           path: ${{ runner.temp }}/e2e-logs
-          retention-days: 14
+          retention-days: 1
           if-no-files-found: ignore

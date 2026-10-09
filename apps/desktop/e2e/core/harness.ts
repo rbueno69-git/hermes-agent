@@ -326,6 +326,13 @@ export function recordWebSockets(page: Page): WsRecorder {
   return rec
 }
 
+/** Retire sockets owned by the document that is about to be replaced. */
+export function retireCurrentDocumentSockets(rec: WsRecorder): void {
+  for (const socket of rec.sockets) {
+    socket.closed = true
+  }
+}
+
 // ─── Network fault injection ────────────────────────────────────────────
 
 export interface TcpProxy {
