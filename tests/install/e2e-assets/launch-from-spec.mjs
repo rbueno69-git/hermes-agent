@@ -86,6 +86,11 @@ function log(msg) {
   console.log(`[launch-from-spec] ${msg}`);
 }
 
+/** @param {string | undefined} configured */
+export function updateReceiptTimeoutMs(configured) {
+  return Number(configured ?? 30 * 60_000);
+}
+
 /**
  * Settle source runtime/package replacement before Playwright owns Electron.
  * A first non-metadata startup may replace the packaged app and relaunch it;
@@ -155,14 +160,15 @@ async function main() {
       'chat-out': { type: 'string' },
       'mock-url': { type: 'string' },
       'no-update': { type: 'boolean', default: false },
-      // A full app-driven update (git pull, dependency sync, npm ci, TUI/web/desktop builds)
-      // takes ~7.5 min on a normal macOS runner and ~10.5 min on a slow one.
-      'timeout-ms': { type: 'string', default: '900000' },
+      // Historical-release takeover plus dependency sync and all desktop builds
+      // can exceed 15 min on a contended macOS runner.
+      'timeout-ms': { type: 'string' },
     },
   });
   // After the update wait (--timeout-ms), not inside it: launch, OLD chat and
   // relaunch checks get their own 20 minutes.
-  const SELF_DEADLINE_MS = Number(values['timeout-ms']) + 20 * 60 * 1000;
+  const updateTimeoutMs = updateReceiptTimeoutMs(values['timeout-ms']);
+  const SELF_DEADLINE_MS = updateTimeoutMs + 20 * 60 * 1000;
   const selfDeadline = setTimeout(() => {
     log(`DRIVER SELF-TIMEOUT after ${SELF_DEADLINE_MS / 60000}min - exiting 124 (phase: ${currentPhase})`);
     process.exit(124);
@@ -220,7 +226,7 @@ async function main() {
     throw new Error('need --result and/or --expect-sha + --repo-dir unless --no-update');
   }
   await assertStagedBranch(window, values['expect-sha'], log);
-  const deadline = Date.now() + Number(values['timeout-ms']);
+  const deadline = Date.now() + updateTimeoutMs;
 
 
   phase('overlay-loop');
