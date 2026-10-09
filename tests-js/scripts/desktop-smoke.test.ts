@@ -57,6 +57,16 @@ test('recognized first-message system notes preserve only the exact checkpoint w
   expect(isCheckpointPromptWitness(`${prompt}\n\nunrelated suffix`, prompt)).toBe(false)
 })
 
+test('v2026.6.5 transcript envelope preserves only the exact checkpoint turn', (): void => {
+  const prompt = 'Desktop smoke old 17d937ab-9cd6-4938-99e2-6906d961d2e'
+  const witness = `User: ${prompt}\n\nAssistant: ${MOCK_REPLY}`
+
+  expect(isCheckpointPromptWitness(witness, prompt)).toBe(true)
+  expect(isCheckpointPromptWitness(`${witness}\nINJECTED`, prompt)).toBe(false)
+  expect(isCheckpointPromptWitness(witness.replace(MOCK_REPLY, `${MOCK_REPLY} INJECTED`), prompt)).toBe(false)
+  expect(isCheckpointPromptWitness(`User: wrong ${prompt}\n\nAssistant: ${MOCK_REPLY}`, prompt)).toBe(false)
+})
+
 test('one server owns inference and a fresh, per-server prompt witness', async (): Promise<void> => {
   const first = await startMockServer()
   const second = await startMockServer()

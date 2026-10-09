@@ -29,9 +29,9 @@ const firstMessageNoteBodies = new Set([
     `${taskFirstClause}What this note asks: briefly introduce yourself, mention that /help shows available commands, and end with this one line: "I can run a quick setup so I can help you better. Send ${command} when you want it."]`),
 ])
 
-/** Admit the exact checkpoint or one byte-exact, release-supported onboarding note. */
+/** Admit the exact checkpoint or one byte-exact, release-supported envelope/note. */
 export function isCheckpointPromptWitness(received: string, prompt: string): boolean {
-  if (received === prompt) {
+  if (received === prompt || received === `User: ${prompt}\n\nAssistant: ${MOCK_REPLY}`) {
     return true
   }
 
