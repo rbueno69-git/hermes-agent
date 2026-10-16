@@ -1,0 +1,56 @@
+[Unit]
+Description=INACTIVE candidate: contained Hermes audit worker f10749396cea
+Documentation=file:/opt/hermes-int-c/README.md
+ConditionPathExists=/SECOND-AUTHORIZATION-REQUIRED/INT-2026-10-16-C
+
+[Service]
+Type=exec
+User=hermes-int-c
+Group=hermes-int-c
+WorkingDirectory=/
+ExecStartPre=/usr/bin/sha256sum --check --strict /opt/hermes-int-c/PACKAGE.sha256
+ExecStartPre=/usr/bin/sha256sum --check --strict /opt/hermes-int-c/EXECUTABLES.sha256
+ExecStart=/usr/bin/env -i LANG=C.UTF-8 LC_ALL=C.UTF-8 PATH=/usr/bin /usr/bin/python3 -I /opt/hermes-int-c/worker.py --policy /opt/hermes-int-c/egress-policy.json --batch-root /var/lib/hermes-int-c/input --batch batch.json
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadOnlyPaths=/opt/hermes-int-c /var/lib/hermes-int-c/input
+InaccessiblePaths=/root /home /media /mnt /srv
+RestrictAddressFamilies=AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=@@ALLOW_IPV4_CIDRS@@
+IPAddressAllow=@@ALLOW_IPV6_CIDRS@@
+SystemCallArchitectures=native
+SystemCallFilter=~@process @mount @privileged @resources
+CPUQuota=25%
+CPUWeight=10
+MemoryHigh=384M
+MemoryMax=512M
+MemorySwapMax=0
+TasksMax=2
+RuntimeMaxSec=900
+TimeoutStartSec=20
+TimeoutStopSec=10
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+
+# Deliberately no [Install]. Installation, rendering, identity creation and activation
+# require a second authorization bound to the final package digest.
