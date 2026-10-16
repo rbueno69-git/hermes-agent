@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "job_id": "f10749396cea",
+  "endpoints": [
+    {
+      "id": "github-hermes-releases",
+      "host": "api.github.com",
+      "port": 443,
+      "path": "/repos/NousResearch/hermes-agent/releases/latest",
+      "connect_ips": ["@@GITHUB_IPV4@@", "@@GITHUB_IPV6@@"],
+      "allowed_ipv4_cidrs": ["@@GITHUB_IPV4_CIDR@@"],
+      "allowed_ipv6_cidrs": ["@@GITHUB_IPV6_CIDR@@"]
+    }
+  ]
+}

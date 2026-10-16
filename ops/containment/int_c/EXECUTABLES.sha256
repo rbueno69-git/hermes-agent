@@ -1,0 +1,3 @@
+@@SHA256_USR_BIN_ENV@@  /usr/bin/env
+@@SHA256_USR_BIN_PYTHON3@@  /usr/bin/python3
+@@SHA256_USR_BIN_SHA256SUM@@  /usr/bin/sha256sum
