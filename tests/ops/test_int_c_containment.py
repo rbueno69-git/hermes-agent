@@ -238,6 +238,16 @@ def test_package_manifest_binds_exact_payload_surface():
     for name, digest in declared.items():
         assert hashlib.sha256((PACKAGE / name).read_bytes()).hexdigest() == digest
 
+    precheck = subprocess.run(
+        ["/usr/bin/sha256sum", "--check", "--strict", "PACKAGE.sha256"],
+        cwd=PACKAGE,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert precheck.returncode == 0, precheck.stderr
+    assert _unit_directives()["WorkingDirectory"] == ["/opt/hermes-int-c"]
+
 
 def test_invalid_batch_exits_nonzero_without_payload_echo(tmp_path):
     policy = _policy(tmp_path)

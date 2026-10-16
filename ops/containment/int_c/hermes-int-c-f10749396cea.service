@@ -7,7 +7,7 @@ ConditionPathExists=/SECOND-AUTHORIZATION-REQUIRED/INT-2026-10-16-C
 Type=exec
 User=hermes-int-c
 Group=hermes-int-c
-WorkingDirectory=/
+WorkingDirectory=/opt/hermes-int-c
 ExecStartPre=/usr/bin/sha256sum --check --strict /opt/hermes-int-c/PACKAGE.sha256
 ExecStartPre=/usr/bin/sha256sum --check --strict /opt/hermes-int-c/EXECUTABLES.sha256
 ExecStart=/usr/bin/env -i LANG=C.UTF-8 LC_ALL=C.UTF-8 PATH=/usr/bin /usr/bin/python3 -I /opt/hermes-int-c/worker.py --policy /opt/hermes-int-c/egress-policy.json --batch-root /var/lib/hermes-int-c/input --batch batch.json
