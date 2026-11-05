@@ -34,6 +34,12 @@ class ApprovalClaim:
     superseded: Tuple[ApprovalCard, ...] = ()
 
 
+@dataclass(frozen=True)
+class ApprovalObservation:
+    status: str
+    response: Optional[str] = None
+
+
 def canonical_binding_key(binding: Dict[str, str]) -> str:
     required = {"item_key", "head_sha", "contract_digest_sha256", "scope"}
     if type(binding) is not dict or set(binding) != required:
@@ -177,6 +183,15 @@ class ApprovalCardLedger:
                 """,
                 (binding["item_key"],),
             ).fetchall()
+            delivering = next((row for row in old_rows if row["status"] == "delivering"), None)
+            if delivering is not None:
+                connection.commit()
+                return ApprovalClaim(
+                    action="wait_predecessor",
+                    binding_key=binding_key,
+                    card_id=int(delivering["card_id"]),
+                    clarify_id=str(delivering["clarify_id"]),
+                )
             if old_rows:
                 old_ids = [int(row["card_id"]) for row in old_rows]
                 connection.executemany(
@@ -248,20 +263,30 @@ class ApprovalCardLedger:
         if card_id is None:
             return
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT binding_key FROM approval_cards WHERE card_id = ?", (int(card_id),)
+                "SELECT binding_key, status FROM approval_cards WHERE card_id = ?", (int(card_id),)
             ).fetchone()
-            if row is None:
+            if row is None or row["status"] not in ("delivering", "active"):
+                connection.commit()
                 return
             now = time.time()
-            connection.execute(
-                "UPDATE approval_cards SET status = 'failed', updated_at = ? WHERE card_id = ?",
+            changed = connection.execute(
+                """
+                UPDATE approval_cards SET status = 'failed', updated_at = ?
+                WHERE card_id = ? AND status IN ('delivering', 'active')
+                """,
                 (now, int(card_id)),
-            )
-            connection.execute(
-                "UPDATE approval_bindings SET status = 'failed', updated_at = ? WHERE binding_key = ?",
-                (now, str(row["binding_key"])),
-            )
+            ).rowcount
+            if changed == 1:
+                connection.execute(
+                    """
+                    UPDATE approval_bindings SET status = 'failed', updated_at = ?
+                    WHERE binding_key = ? AND status = 'pending'
+                    """,
+                    (now, str(row["binding_key"])),
+                )
+            connection.commit()
 
     def fail_clarify(self, clarify_id: str) -> bool:
         """Expire one active delivery so a later identical claim may safely publish again."""
@@ -279,7 +304,10 @@ class ApprovalCardLedger:
                 (now, int(row["card_id"])),
             )
             connection.execute(
-                "UPDATE approval_bindings SET status = 'failed', updated_at = ? WHERE binding_key = ?",
+                """
+                UPDATE approval_bindings SET status = 'failed', updated_at = ?
+                WHERE binding_key = ? AND status = 'pending'
+                """,
                 (now, str(row["binding_key"])),
             )
             connection.commit()
@@ -348,10 +376,19 @@ class ApprovalCardLedger:
 
     def response_for_binding(self, binding_key: str) -> Optional[str]:
         """Return the submitted decision only after the binding is durably answered."""
+        observation = self.observe(binding_key)
+        if observation.status != "answered":
+            return None
+        return observation.response or ""
+
+    def observe(self, binding_key: str) -> ApprovalObservation:
+        """Return the durable typed lifecycle state for one canonical binding."""
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT status, response FROM approval_bindings WHERE binding_key = ?", (binding_key,)
             ).fetchone()
-        if row is None or row["status"] != "answered":
-            return None
-        return str(row["response"] or "")
+        if row is None:
+            return ApprovalObservation(status="missing")
+        status = str(row["status"])
+        response = str(row["response"] or "") if status == "answered" else None
+        return ApprovalObservation(status=status, response=response)

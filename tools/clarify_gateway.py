@@ -33,7 +33,7 @@ _lock = threading.RLock()
 _entries: Dict[str, _ClarifyEntry] = {}  # clarify_id -> entry (button callbacks)
 _session_index: Dict[str, List[str]] = {}  # session_key -> [clarify_id] FIFO (text intercept, cleanup)
 _linked_entries: Dict[str, set[str]] = {}  # equivalent cross-session requests share one answer
-_resolution_cbs: Dict[str, Callable[[str], None]] = {}
+_resolution_cbs: Dict[str, Callable[[str], object]] = {}
 _resolution_probes: Dict[str, Callable[[], Optional[str]]] = {}
 _resolving: set[str] = set()
 # Per-session notify callbacks (gateway -> adapter bridge); mirrors tools.approval. Tests clear it.
@@ -89,7 +89,7 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
                 logger.exception("Failed to probe durable clarify resolution for %s", clarify_id)
             else:
                 if durable_response is not None:
-                    resolve_gateway_clarify(clarify_id, durable_response)
+                    resolve_gateway_clarify(clarify_id, durable_response, persist=False)
         # Periodic activity touch so the gateway's inactivity timeout doesn't kill the agent during long
         # code execution (#10807).
         if touch_activity_if_due is not None:
@@ -128,7 +128,7 @@ def link_equivalent(primary_id: str, duplicate_id: str) -> bool:
         return True
 
 
-def on_resolution(clarify_id: str, callback: Callable[[str], None]) -> bool:
+def on_resolution(clarify_id: str, callback: Callable[[str], object]) -> bool:
     """Register a one-shot observer used to durably record a submitted decision."""
     with _lock:
         entry = _entries.get(clarify_id)
@@ -148,8 +148,8 @@ def set_resolution_probe(clarify_id: str, probe: Callable[[], Optional[str]]) ->
         return True
 
 
-def resolve_gateway_clarify(clarify_id: str, response: str) -> bool:
-    """Durably record, then unblock, every waiter linked to ``clarify_id``."""
+def resolve_gateway_clarify(clarify_id: str, response: str, *, persist: bool = True) -> bool:
+    """Durably record when local, then unblock every waiter linked to ``clarify_id``."""
     with _lock:
         entry = _entries.get(clarify_id)
         if entry is None or entry.event.is_set():
@@ -160,7 +160,7 @@ def resolve_gateway_clarify(clarify_id: str, response: str) -> bool:
             return False
         callbacks = [
             callback for linked_id in group
-            if (callback := _resolution_cbs.get(linked_id)) is not None
+            if persist and (callback := _resolution_cbs.get(linked_id)) is not None
         ]
         _resolving.update(group)
     try:

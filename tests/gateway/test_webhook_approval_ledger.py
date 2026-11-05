@@ -113,6 +113,72 @@ def test_timed_out_card_can_be_safely_reissued(tmp_path):
     assert replacement.clarify_id == "clarify-b"
 
 
+def test_stale_send_failure_cannot_erase_answered_decision(tmp_path):
+    ledger = ApprovalCardLedger(tmp_path / "approval-cards.db", instance_id="gateway-a")
+    claim = ledger.claim(
+        _binding(), platform="telegram", chat_id="327791380",
+        clarify_id="clarify-a", session_key="session-a", choices=["Approve", "Reject"],
+    )
+
+    assert ledger.answer("clarify-a", "Approve") is True
+    ledger.fail(claim.card_id)
+
+    observation = ledger.observe(claim.binding_key)
+    assert observation.status == "answered"
+    assert observation.response == "Approve"
+    replay = ledger.claim(
+        _binding(), platform="telegram", chat_id="327791380",
+        clarify_id="clarify-b", session_key="session-b", choices=["Approve", "Reject"],
+    )
+    assert replay.action == "reuse_answered"
+    assert replay.response == "Approve"
+
+
+def test_material_change_waits_for_ambiguous_delivery_before_replacement(tmp_path):
+    ledger = ApprovalCardLedger(tmp_path / "approval-cards.db", instance_id="gateway-a")
+    old = ledger.claim(
+        _binding(), platform="telegram", chat_id="327791380",
+        clarify_id="clarify-old", session_key="session-old", choices=["Approve", "Reject"],
+    )
+
+    deferred = ApprovalCardLedger(
+        tmp_path / "approval-cards.db", instance_id="gateway-b"
+    ).claim(
+        _binding(digest="3" * 64), platform="telegram", chat_id="327791380",
+        clarify_id="clarify-new", session_key="session-new", choices=["Approve", "Reject"],
+    )
+
+    assert deferred.action == "wait_predecessor"
+    assert deferred.clarify_id == "clarify-old"
+    ledger.activate(old.card_id, "501")
+    replacement = ApprovalCardLedger(
+        tmp_path / "approval-cards.db", instance_id="gateway-b"
+    ).claim(
+        _binding(digest="3" * 64), platform="telegram", chat_id="327791380",
+        clarify_id="clarify-new", session_key="session-new", choices=["Approve", "Reject"],
+    )
+    assert replacement.action == "send"
+    assert [card.clarify_id for card in replacement.superseded] == ["clarify-old"]
+
+
+def test_observe_exposes_terminal_supersession(tmp_path):
+    ledger = ApprovalCardLedger(tmp_path / "approval-cards.db", instance_id="gateway-a")
+    old = ledger.claim(
+        _binding(), platform="telegram", chat_id="327791380",
+        clarify_id="clarify-old", session_key="session-old", choices=["Approve", "Reject"],
+    )
+    ledger.activate(old.card_id, "501")
+    replacement = ledger.claim(
+        _binding(digest="3" * 64), platform="telegram", chat_id="327791380",
+        clarify_id="clarify-new", session_key="session-new", choices=["Approve", "Reject"],
+    )
+
+    assert replacement.action == "send"
+    observation = ledger.observe(old.binding_key)
+    assert observation.status == "superseded"
+    assert observation.response is None
+
+
 def test_persisted_choice_can_answer_card_after_gateway_restart(tmp_path):
     path = tmp_path / "approval-cards.db"
     first_gateway = ApprovalCardLedger(path, instance_id="gateway-a")

@@ -415,27 +415,47 @@ class WebhookAdapter(BasePlatformAdapter):
                 if ledger is None:
                     ledger = self._approval_ledgers[ledger_path] = ApprovalCardLedger(
                         get_hermes_home() / "approval_cards.db", instance_id=self._approval_instance_id)
-                from tools.clarify_gateway import is_registered
+                from tools.clarify_gateway import (
+                    CANCELLED,
+                    is_registered,
+                    link_equivalent,
+                    on_resolution,
+                    resolve_gateway_clarify,
+                    set_resolution_probe,
+                )
                 claim = ledger.claim(
                     binding, platform=deliver_type, chat_id=str(target_chat_id),
                     clarify_id=clarify_id, session_key=session_key, choices=choices,
                     is_active=is_registered)
+
+                def _probe_resolution() -> Optional[str]:
+                    observation = ledger.observe(claim.binding_key)
+                    if observation.status == "answered":
+                        return observation.response or ""
+                    if observation.status in ("superseded", "failed"):
+                        return CANCELLED
+                    return None
+
+                if not set_resolution_probe(clarify_id, _probe_resolution):
+                    if claim.action == "send":
+                        ledger.fail(claim.card_id)
+                    return SendResult(success=False, error="Approval waiter expired before delivery")
                 if claim.action == "reuse_answered":
-                    from tools.clarify_gateway import resolve_gateway_clarify
                     resolve_gateway_clarify(clarify_id, claim.response or "")
                     return SendResult(success=True, message_id=claim.message_id)
                 if claim.action == "reuse_active":
-                    from tools.clarify_gateway import link_equivalent, set_resolution_probe
                     link_equivalent(claim.clarify_id or "", clarify_id)
-                    set_resolution_probe(
-                        clarify_id, lambda: ledger.response_for_binding(claim.binding_key))
                     if not hasattr(self, "_clarify_delegates"):
                         self._clarify_delegates = {}
                     self._clarify_delegates[clarify_id] = (
                         adapter, claim.clarify_id or clarify_id, ledger,
                         str(target_chat_id), claim.message_id)
                     return SendResult(success=True, message_id=claim.message_id)
-                from tools.clarify_gateway import CANCELLED, on_resolution, resolve_gateway_clarify
+                if claim.action == "wait_predecessor":
+                    return SendResult(
+                        success=False,
+                        error="Previous approval delivery is not yet settled; replacement withheld",
+                    )
                 def _record_resolution(response: str) -> bool:
                     return ledger.answer(clarify_id, response)
                 if not on_resolution(clarify_id, _record_resolution):
@@ -476,8 +496,8 @@ class WebhookAdapter(BasePlatformAdapter):
         if delegated is None:
             return
         adapter, delegated_id, ledger, chat_id, message_id = delegated
-        if ledger is not None:
-            ledger.fail_clarify(delegated_id)
+        if ledger is not None and not ledger.fail_clarify(delegated_id):
+            return
         retire = getattr(adapter, "retire_clarify_card", None)
         if callable(retire):
             retired = await retire(delegated_id, notice)

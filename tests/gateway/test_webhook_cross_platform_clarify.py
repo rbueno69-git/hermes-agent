@@ -86,6 +86,38 @@ async def test_webhook_timeout_retirement_reaches_delegated_adapter():
 
 
 @pytest.mark.asyncio
+async def test_timeout_does_not_retire_a_durably_answered_card(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools import clarify_gateway as cm
+
+    binding = {
+        "item_key": "owner/repo#161", "head_sha": "1" * 40,
+        "contract_digest_sha256": "2" * 64, "scope": "merge",
+    }
+    target = MagicMock()
+    target.send_clarify = AsyncMock(return_value=SendResult(success=True, message_id="501"))
+    target.retire_clarify_card = AsyncMock(return_value=True)
+    runner = MagicMock()
+    runner._authorization_adapter.return_value = target
+    adapter = object.__new__(WebhookAdapter)
+    adapter.gateway_runner = runner
+    adapter._delivery_info = {
+        "delivery": {"deliver": "telegram", "deliver_extra": {"chat_id": "327791380"},
+                     "approval_binding": binding}
+    }
+    cm.register("clarify-answered", "session-answered", "Approve?", ["Approve", "Reject"])
+    await adapter.send_clarify(
+        chat_id="delivery", question="Approve?", choices=["Approve", "Reject"],
+        clarify_id="clarify-answered", session_key="session-answered",
+    )
+    assert cm.resolve_gateway_clarify("clarify-answered", "Approve") is True
+
+    await adapter.retire_clarify_card("clarify-answered", "Expired")
+
+    target.retire_clarify_card.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_equivalent_webhook_approvals_publish_one_card_across_sessions(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     from tools import clarify_gateway as cm
@@ -144,6 +176,75 @@ async def test_equivalent_webhook_approvals_publish_one_card_across_sessions(tmp
     assert second.success is True
     assert target.send_clarify.await_count == 1
     assert {first.message_id, second.message_id} == {"501"}
+
+
+@pytest.mark.asyncio
+async def test_originating_publisher_observes_answer_committed_by_another_gateway(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway.approval_card_ledger import ApprovalCardLedger
+    from tools import clarify_gateway as cm
+
+    binding = {
+        "item_key": "owner/repo#161", "head_sha": "1" * 40,
+        "contract_digest_sha256": "2" * 64, "scope": "merge",
+    }
+    target = MagicMock()
+    target.send_clarify = AsyncMock(return_value=SendResult(success=True, message_id="501"))
+    runner = MagicMock()
+    runner._authorization_adapter.return_value = target
+    adapter = object.__new__(WebhookAdapter)
+    adapter.gateway_runner = runner
+    adapter._delivery_info = {
+        "first": {"deliver": "telegram", "deliver_extra": {"chat_id": "327791380"},
+                  "approval_binding": binding}
+    }
+    cm.register("owner-card", "owner-session", "Approve?", ["Approve", "Reject"])
+    await adapter.send_clarify(
+        chat_id="first", question="Approve?", choices=["Approve", "Reject"],
+        clarify_id="owner-card", session_key="owner-session",
+    )
+
+    remote = ApprovalCardLedger(tmp_path / "approval_cards.db", instance_id="gateway-b")
+    assert remote.answer_choice("owner-card", 0) == "Approve"
+
+    assert cm.wait_for_response("owner-card", timeout=3.0) == "Approve"
+
+
+@pytest.mark.asyncio
+async def test_originating_publisher_observes_remote_supersession(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway.approval_card_ledger import ApprovalCardLedger
+    from tools import clarify_gateway as cm
+
+    binding = {
+        "item_key": "owner/repo#161", "head_sha": "1" * 40,
+        "contract_digest_sha256": "2" * 64, "scope": "merge",
+    }
+    target = MagicMock()
+    target.send_clarify = AsyncMock(return_value=SendResult(success=True, message_id="501"))
+    runner = MagicMock()
+    runner._authorization_adapter.return_value = target
+    adapter = object.__new__(WebhookAdapter)
+    adapter.gateway_runner = runner
+    adapter._delivery_info = {
+        "first": {"deliver": "telegram", "deliver_extra": {"chat_id": "327791380"},
+                  "approval_binding": binding}
+    }
+    cm.register("owner-card", "owner-session", "Approve?", ["Approve", "Reject"])
+    await adapter.send_clarify(
+        chat_id="first", question="Approve?", choices=["Approve", "Reject"],
+        clarify_id="owner-card", session_key="owner-session",
+    )
+
+    remote = ApprovalCardLedger(tmp_path / "approval_cards.db", instance_id="gateway-b")
+    replacement = remote.claim(
+        {**binding, "contract_digest_sha256": "3" * 64},
+        platform="telegram", chat_id="327791380", clarify_id="new-card",
+        session_key="new-session", choices=["Approve", "Reject"],
+    )
+    assert replacement.action == "send"
+
+    assert cm.wait_for_response("owner-card", timeout=3.0) == cm.CANCELLED
 
 
 @pytest.mark.asyncio
