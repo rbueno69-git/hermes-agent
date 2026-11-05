@@ -735,6 +735,43 @@ class TestSessionIsolation:
         assert [adapter._delivery_info[e.source.chat_id]["deliver_extra"]["chat_id"] for e in (high, low, other)] == [
             "high-chat", "low-chat", "other-chat"]
 
+    @pytest.mark.asyncio
+    async def test_contract_payload_attaches_canonical_approval_binding(self):
+        adapter = _make_adapter()
+        captured_events = []
+
+        async def _capture(event):
+            captured_events.append(event)
+
+        adapter.handle_message = _capture
+        payload = {
+            "item_key": "rbueno69-git/carteira-investimentos#160",
+            "head_sha": "1" * 40,
+            "contract_digest_sha256": "2" * 64,
+            "contract_scope": "Somente leitura; merge e deploy autorizados.",
+            "contract_accepted": True,
+            "executor_binding_status": "pending_approval",
+        }
+        task = adapter._spawn_agent_run(
+            payload,
+            "approval prompt",
+            "delivery-160",
+            100.0,
+            route_config={"deliver": "telegram", "deliver_extra": {"chat_id": "327791380"}},
+            route_name="github-hermes-intake",
+            profile=None,
+            event_type="pull_request",
+        )
+        await task
+
+        chat_id = captured_events[0].source.chat_id
+        assert adapter._delivery_info[chat_id]["approval_binding"] == {
+            "item_key": payload["item_key"],
+            "head_sha": payload["head_sha"],
+            "contract_digest_sha256": payload["contract_digest_sha256"],
+            "scope": payload["contract_scope"],
+        }
+
 
 # ===================================================================
 # Silence-marker suppression

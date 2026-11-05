@@ -1,3 +1,4 @@
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -60,3 +61,158 @@ async def test_webhook_clarify_without_interactive_destination_fails_before_wait
 
     assert result.success is False
     assert "no interactive destination" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_equivalent_webhook_approvals_publish_one_card_across_sessions(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools import clarify_gateway as cm
+    with cm._lock:
+        cm._entries.clear()
+        cm._session_index.clear()
+        cm._linked_entries.clear()
+        cm._resolution_cbs.clear()
+    cm.register("clarify-a", "session-a", "Aprovar?", ["Aprovar", "Não aprovar"])
+    cm.register("clarify-b", "session-b", "Aprovar?", ["Aprovar", "Não aprovar"])
+    target = MagicMock()
+    target.send_clarify = AsyncMock(
+        side_effect=[
+            SendResult(success=True, message_id="501"),
+            AssertionError("equivalent approval emitted a second card"),
+        ]
+    )
+    runner = MagicMock()
+    runner._authorization_adapter.return_value = target
+
+    adapter = object.__new__(WebhookAdapter)
+    adapter.gateway_runner = runner
+    binding = {
+        "item_key": "rbueno69-git/carteira-investimentos#160",
+        "head_sha": "1" * 40,
+        "contract_digest_sha256": "2" * 64,
+        "scope": "Somente leitura; merge e deploy autorizados.",
+    }
+    adapter._delivery_info = {
+        "delivery-a": {
+            "deliver": "telegram",
+            "deliver_extra": {"chat_id": "327791380"},
+            "approval_binding": binding,
+        },
+        "delivery-b": {
+            "deliver": "telegram",
+            "deliver_extra": {"chat_id": "327791380"},
+            "approval_binding": dict(binding),
+        },
+    }
+
+    first, second = await asyncio.gather(
+        adapter.send_clarify(
+            chat_id="delivery-a", question="Aprovar?", choices=["Aprovar", "Não aprovar"],
+            clarify_id="clarify-a", session_key="session-a",
+        ),
+        adapter.send_clarify(
+            chat_id="delivery-b", question="Aprovar?", choices=["Aprovar", "Não aprovar"],
+            clarify_id="clarify-b", session_key="session-b",
+        ),
+    )
+
+    assert first.success is True
+    assert second.success is True
+    assert target.send_clarify.await_count == 1
+    assert {first.message_id, second.message_id} == {"501"}
+
+
+@pytest.mark.asyncio
+async def test_material_change_retires_old_card_before_publishing_replacement(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    calls = []
+    target = MagicMock()
+
+    async def _send(**kwargs):
+        calls.append(("send", kwargs["clarify_id"]))
+        return SendResult(success=True, message_id=str(500 + len(calls)))
+
+    async def _retire(**kwargs):
+        calls.append(("retire", kwargs["message_id"]))
+        return True
+
+    target.send_clarify = AsyncMock(side_effect=_send)
+    target.retire_clarify = AsyncMock(side_effect=_retire)
+    runner = MagicMock()
+    runner._authorization_adapter.return_value = target
+    adapter = object.__new__(WebhookAdapter)
+    adapter.gateway_runner = runner
+    old_binding = {
+        "item_key": "rbueno69-git/carteira-investimentos#160",
+        "head_sha": "1" * 40,
+        "contract_digest_sha256": "2" * 64,
+        "scope": "Somente leitura.",
+    }
+    new_binding = {**old_binding, "contract_digest_sha256": "3" * 64}
+    adapter._delivery_info = {
+        "old": {"deliver": "telegram", "deliver_extra": {"chat_id": "327791380"}, "approval_binding": old_binding},
+        "new": {"deliver": "telegram", "deliver_extra": {"chat_id": "327791380"}, "approval_binding": new_binding},
+    }
+
+    await adapter.send_clarify(
+        chat_id="old", question="Old?", choices=["Approve", "Reject"],
+        clarify_id="clarify-old", session_key="session-old",
+    )
+    await adapter.send_clarify(
+        chat_id="new", question="New?", choices=["Approve", "Reject"],
+        clarify_id="clarify-new", session_key="session-new",
+    )
+
+    assert calls == [("send", "clarify-old"), ("retire", "501"), ("send", "clarify-new")]
+
+
+@pytest.mark.asyncio
+async def test_submitted_decision_is_reused_after_gateway_restart(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools import clarify_gateway as cm
+
+    with cm._lock:
+        cm._entries.clear()
+        cm._session_index.clear()
+        cm._linked_entries.clear()
+        cm._resolution_cbs.clear()
+
+    binding = {
+        "item_key": "rbueno69-git/carteira-investimentos#160",
+        "head_sha": "1" * 40,
+        "contract_digest_sha256": "2" * 64,
+        "scope": "Somente leitura.",
+    }
+    target = MagicMock()
+    target.send_clarify = AsyncMock(return_value=SendResult(success=True, message_id="501"))
+    runner = MagicMock()
+    runner._authorization_adapter.return_value = target
+    first = object.__new__(WebhookAdapter)
+    first.gateway_runner = runner
+    first._delivery_info = {
+        "first": {"deliver": "telegram", "deliver_extra": {"chat_id": "327791380"}, "approval_binding": binding}
+    }
+    cm.register("clarify-a", "session-a", "Approve?", ["Approve", "Reject"])
+    await first.send_clarify(
+        chat_id="first", question="Approve?", choices=["Approve", "Reject"],
+        clarify_id="clarify-a", session_key="session-a",
+    )
+    assert cm.resolve_gateway_clarify("clarify-a", "Approve") is True
+    assert cm.wait_for_response("clarify-a", timeout=1.0) == "Approve"
+
+    restarted = object.__new__(WebhookAdapter)
+    restarted.gateway_runner = runner
+    restarted._delivery_info = {
+        "replay": {"deliver": "telegram", "deliver_extra": {"chat_id": "327791380"}, "approval_binding": binding}
+    }
+    target.send_clarify.reset_mock()
+    cm.register("clarify-b", "session-b", "Approve?", ["Approve", "Reject"])
+
+    result = await restarted.send_clarify(
+        chat_id="replay", question="Approve?", choices=["Approve", "Reject"],
+        clarify_id="clarify-b", session_key="session-b",
+    )
+
+    assert result.success is True
+    target.send_clarify.assert_not_awaited()
+    assert cm.wait_for_response("clarify-b", timeout=1.0) == "Approve"

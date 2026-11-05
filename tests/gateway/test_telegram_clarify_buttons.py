@@ -37,6 +37,46 @@ def _make_adapter(extra=None):
     return adapter
 
 
+@pytest.mark.asyncio
+async def test_retire_clarify_falls_back_to_non_actionable_edit_when_delete_fails():
+    adapter = _make_adapter()
+    adapter._bot.delete_message = AsyncMock(side_effect=RuntimeError("delete window elapsed"))
+    adapter._bot.edit_message_text = AsyncMock(return_value=True)
+
+    retired = await adapter.retire_clarify(chat_id="12345", message_id="100", reason="superseded")
+
+    assert retired is True
+    kwargs = adapter._bot.edit_message_text.await_args.kwargs
+    assert kwargs["chat_id"] == 12345
+    assert kwargs["message_id"] == 100
+    assert kwargs["reply_markup"] is None
+    assert "substituída" in kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_timeout_retirement_uses_persisted_card_coordinates():
+    adapter = _make_adapter()
+    mock_msg = MagicMock()
+    mock_msg.message_id = 100
+    adapter._bot.send_message = AsyncMock(return_value=mock_msg)
+    adapter._bot.edit_message_text = AsyncMock(return_value=True)
+
+    await adapter.send_clarify(
+        chat_id="12345", question="Approve?", choices=["Approve", "Reject"],
+        clarify_id="clarify-timeout", session_key="session-timeout",
+    )
+    await adapter.retire_clarify_card("clarify-timeout", "This approval request expired.")
+
+    kwargs = adapter._bot.edit_message_text.await_args.kwargs
+    assert kwargs == {
+        "chat_id": 12345,
+        "message_id": 100,
+        "text": "This approval request expired.",
+        "reply_markup": None,
+    }
+    assert "clarify-timeout" not in adapter._clarify_state
+
+
 def _clear_clarify_state():
     from tools import clarify_gateway as cm
     with cm._lock:

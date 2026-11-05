@@ -703,6 +703,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         self._approval_state: Dict[int, str] = {}  # message_id → session_key
         self._slash_confirm_state: Dict[str, str] = {}  # confirm_id → session_key
         self._clarify_state: Dict[str, str] = {}  # clarify_id → session_key
+        self._clarify_card_state: Dict[str, tuple[str, str]] = {}  # clarify_id → (chat_id, message_id)
         # "important" (default): only final responses, approvals and slash confirmations notify;
         # "all": every message notifies (display.platforms.telegram.notifications).
         self._notifications_mode: str = "important"
@@ -4064,6 +4065,34 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             logger.debug("[%s] Failed to delete Telegram message %s: %s", self.name, message_id, _redact_telegram_error_text(e))
             return False
 
+    async def retire_clarify(self, chat_id: str, message_id: str, reason: str = "superseded") -> bool:
+        """Make an obsolete approval card non-actionable, preferring deletion."""
+        if await self.delete_message(chat_id, message_id):
+            return True
+        if not self._bot:
+            return False
+        replacement = "⚠️ Solicitação de aprovação substituída/cancelada. Use somente a mensagem mais recente."
+        try:
+            await _await_with_thread_deadline(
+                self._bot.edit_message_text(
+                    chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id),
+                    text=replacement, reply_markup=None),
+                timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
+            return True
+        except Exception as exc:
+            logger.debug("[%s] Failed to replace obsolete clarify %s: %s", self.name, message_id,
+                         _redact_telegram_error_text(exc))
+        try:
+            await _await_with_thread_deadline(
+                self._bot.edit_message_reply_markup(
+                    chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id), reply_markup=None),
+                timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
+            return True
+        except Exception as exc:
+            logger.debug("[%s] Failed to remove obsolete clarify keyboard %s: %s", self.name, message_id,
+                         _redact_telegram_error_text(exc))
+            return False
+
     def supports_draft_streaming(self, chat_type: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> bool:
         """sendMessageDraft works for private chats only (Bot API 9.5) and needs PTB >= 22.6; groups and
         older installs use the edit-based path. ``rich_drafts`` controls draft *format*, not availability."""
@@ -4280,9 +4309,36 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                 rows = [[InlineKeyboardButton(str(idx + 1), callback_data=f"cl:{clarify_id}:{idx}")] for idx in range(len(choices))]
                 rows.append([InlineKeyboardButton(t("platform.telegram.prompt.other"), callback_data=f"cl:{clarify_id}:other")])
                 keyboard = InlineKeyboardMarkup(rows)
-            return text, keyboard, lambda msg: self._clarify_state.__setitem__(clarify_id, session_key)
+            def _record(msg) -> None:
+                self._clarify_state[clarify_id] = session_key
+                message_id = getattr(msg, "message_id", None)
+                if message_id is not None:
+                    self._clarify_card_state[clarify_id] = (str(chat_id), str(message_id))
+            return text, keyboard, _record
         return await self._send_prompt(
             "send_clarify", chat_id, metadata, build, parse_mode=ParseMode.HTML, thread_id=self._metadata_thread_id(metadata))
+
+    async def retire_clarify_card(self, clarify_id: str, notice: str) -> None:
+        """Rewrite a timed-out/cancelled Telegram clarify into a terminal card without buttons."""
+        coordinates = self._clarify_card_state.pop(clarify_id, None)
+        self._clarify_state.pop(clarify_id, None)
+        if coordinates is None or not self._bot:
+            return
+        chat_id, message_id = coordinates
+        try:
+            await _await_with_thread_deadline(
+                self._bot.edit_message_text(
+                    chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id),
+                    text=str(notice), reply_markup=None),
+                timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
+        except Exception as exc:
+            logger.debug("[%s] Failed to retire clarify card %s: %s", self.name, clarify_id,
+                         _redact_telegram_error_text(exc))
+            with contextlib.suppress(Exception):
+                await _await_with_thread_deadline(
+                    self._bot.edit_message_reply_markup(
+                        chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id), reply_markup=None),
+                    timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
 
     @staticmethod
     def _provider_get_label():
@@ -4833,6 +4889,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             if not flipped:
                 # Entry evicted / gateway restarted — a typed answer would go nowhere.
                 self._clarify_state.pop(clarify_id, None)
+                self._clarify_card_state.pop(clarify_id, None)
                 await self._notify_clarify_expired(query, user_display)
                 return
             await query.answer(text=_toast("platform.telegram.prompt.type_answer"))
@@ -4859,6 +4916,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             # Race (timeout / session reset): echo the index so the agent sees an intentional response.
             resolved_text = f"choice {idx + 1}"
         self._clarify_state.pop(clarify_id, None)
+        self._clarify_card_state.pop(clarify_id, None)
         try:
             from tools.clarify_gateway import resolve_gateway_clarify
             resolved = resolve_gateway_clarify(clarify_id, resolved_text)

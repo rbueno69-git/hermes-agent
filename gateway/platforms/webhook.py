@@ -35,12 +35,14 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.approval_card_ledger import ApprovalCardLedger
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.platforms.tcp_site import start_tcp_site
 from gateway.platforms.webhook_coalesce import WebhookCoalescer, validate_coalesce_config
 from gateway.platforms.webhook_filters import DEFAULT_SCRIPT_TIMEOUT_SECONDS, WebhookRouteProcessor
 from gateway.response_filters import is_autonomous_silence_response
+from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +71,30 @@ _TEMPLATE_KEY_RE = re.compile(r"\{([a-zA-Z0-9_.]+)\}")
 _REPO_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
 # Credentials `gh` reads; a routed profile's github_comment must use its own, never the process env's.
 _GH_TOKEN_VARS = ("GH_TOKEN", "GITHUB_TOKEN")
+_APPROVAL_ITEM_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[1-9][0-9]*$")
+_HEX_40_RE = re.compile(r"^[0-9a-f]{40}$")
+_HEX_64_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _approval_binding_from_payload(payload: Any) -> Optional[Dict[str, str]]:
+    """Return the canonical approval identity emitted by the trusted intake transform."""
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("contract_accepted") is not True or payload.get("executor_binding_status") != "pending_approval":
+        return None
+    item_key = payload.get("item_key")
+    head_sha = payload.get("head_sha")
+    digest = payload.get("contract_digest_sha256")
+    scope = payload.get("contract_scope")
+    if not isinstance(item_key, str) or not _APPROVAL_ITEM_RE.fullmatch(item_key):
+        return None
+    if not isinstance(head_sha, str) or not _HEX_40_RE.fullmatch(head_sha):
+        return None
+    if not isinstance(digest, str) or not _HEX_64_RE.fullmatch(digest):
+        return None
+    if not isinstance(scope, str) or not scope or len(scope) > 4000:
+        return None
+    return {"item_key": item_key, "head_sha": head_sha, "contract_digest_sha256": digest, "scope": scope}
 
 
 @dataclass(frozen=True)
@@ -221,6 +247,11 @@ class WebhookAdapter(BasePlatformAdapter):
         self._delivery_info_created: Dict[str, float] = {}
         self._delivery_info_order: Deque[tuple[float, str]] = deque()
         self.gateway_runner = None  # set externally; needed for cross-platform delivery
+        # Canonical contract binding -> the one native card published by this Gateway process.
+        # The lock spans the send so sibling webhook sessions cannot both pass the empty check.
+        self._approval_prompt_lock = asyncio.Lock()
+        self._approval_instance_id = uuid.uuid4().hex
+        self._approval_ledgers: Dict[str, ApprovalCardLedger] = {}
         # Idempotency is scoped to the authenticated route and routed profile: provider delivery
         # IDs are not globally unique across unrelated webhook endpoints.
         self._seen_deliveries: Dict[_WebhookDeliveryIdentity, float] = {}
@@ -357,11 +388,62 @@ class WebhookAdapter(BasePlatformAdapter):
             if thread_id:
                 target_metadata["thread_id"] = thread_id
             target_metadata["is_approval_prompt"] = True
-            return await adapter.send_clarify(
-                chat_id=str(target_chat_id), question=question, choices=choices,
-                clarify_id=clarify_id, session_key=session_key,
-                metadata=target_metadata or None,
-            )
+            binding = delivery.get("approval_binding")
+            if not isinstance(binding, dict):
+                return await adapter.send_clarify(
+                    chat_id=str(target_chat_id), question=question, choices=choices,
+                    clarify_id=clarify_id, session_key=session_key,
+                    metadata=target_metadata or None,
+                )
+            if not hasattr(self, "_approval_prompt_lock"):
+                self._approval_prompt_lock = asyncio.Lock()
+                self._approval_instance_id = uuid.uuid4().hex
+                self._approval_ledgers = {}
+            async with self._approval_prompt_lock:
+                ledger_path = str(get_hermes_home() / "approval_cards.db")
+                ledger = self._approval_ledgers.get(ledger_path)
+                if ledger is None:
+                    ledger = self._approval_ledgers[ledger_path] = ApprovalCardLedger(
+                        get_hermes_home() / "approval_cards.db", instance_id=self._approval_instance_id)
+                from tools.clarify_gateway import is_registered
+                claim = ledger.claim(
+                    binding, platform=deliver_type, chat_id=str(target_chat_id),
+                    clarify_id=clarify_id, session_key=session_key, is_active=is_registered)
+                if claim.action == "reuse_answered":
+                    from tools.clarify_gateway import resolve_gateway_clarify
+                    resolve_gateway_clarify(clarify_id, claim.response or "")
+                    return SendResult(success=True, message_id=claim.message_id)
+                if claim.action == "reuse_active":
+                    from tools.clarify_gateway import link_equivalent
+                    link_equivalent(claim.clarify_id or "", clarify_id)
+                    return SendResult(success=True, message_id=claim.message_id)
+                from tools.clarify_gateway import CANCELLED, on_resolution, resolve_gateway_clarify
+                def _record_resolution(response: str) -> None:
+                    ledger.answer(clarify_id, response)
+                on_resolution(clarify_id, _record_resolution)
+                for old_card in claim.superseded:
+                    resolve_gateway_clarify(old_card.clarify_id, CANCELLED)
+                    retired = False
+                    if old_card.message_id and callable(getattr(adapter, "retire_clarify", None)):
+                        retired = bool(await adapter.retire_clarify(
+                            chat_id=old_card.chat_id, message_id=old_card.message_id,
+                            reason="superseded"))
+                    if not retired:
+                        await adapter.send(
+                            old_card.chat_id,
+                            "⚠️ Solicitação de aprovação anterior cancelada/substituída. Use somente a mensagem mais recente.")
+                result = await adapter.send_clarify(
+                    chat_id=str(target_chat_id), question=question, choices=choices,
+                    clarify_id=clarify_id, session_key=session_key,
+                    metadata=target_metadata or None,
+                )
+                if result.success and result.message_id:
+                    ledger.activate(claim.card_id, result.message_id)
+                else:
+                    ledger.fail(claim.card_id)
+                    if result.success:
+                        return SendResult(success=False, error="Approval card delivery returned no message_id")
+                return result
 
     def _prune_delivery_info(self, now: float) -> None:
         """Drop delivery_info entries older than the idempotency TTL (bounds the dict by ``rate_limit * TTL``
@@ -764,6 +846,8 @@ class WebhookAdapter(BasePlatformAdapter):
             "deliver_extra": self._render_delivery_extra(route_config.get("deliver_extra", {}), payload),
             "route": route_name,
             "mirror": route_config.get("mirror_to_session") is True}
+        if approval_binding := _approval_binding_from_payload(payload):
+            self._delivery_info[session_chat_id]["approval_binding"] = approval_binding
         self._delivery_info_created[session_chat_id] = now
         self._delivery_info_order.append((now, session_chat_id))
         self._prune_delivery_info(now)
