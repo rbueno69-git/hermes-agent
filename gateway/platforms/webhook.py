@@ -14,6 +14,7 @@ import base64
 import binascii
 import hashlib
 import hmac
+import inspect
 import json
 import logging
 import os
@@ -421,6 +422,7 @@ class WebhookAdapter(BasePlatformAdapter):
                     link_equivalent,
                     on_resolution,
                     resolve_gateway_clarify,
+                    set_expiry_callback,
                     set_resolution_probe,
                 )
                 claim = ledger.claim(
@@ -440,22 +442,40 @@ class WebhookAdapter(BasePlatformAdapter):
                     if claim.action == "send":
                         ledger.fail(claim.card_id)
                     return SendResult(success=False, error="Approval waiter expired before delivery")
+                while claim.action == "wait_predecessor":
+                    # The predecessor may already be visible remotely while its message id is
+                    # not committed.  Keep this send future pending (therefore ambiguous to the
+                    # generic delivery layer) until activation/failure makes retirement safe.
+                    await asyncio.sleep(0.1)
+                    if not is_registered(clarify_id):
+                        return SendResult(
+                            success=False,
+                            error="Approval waiter ended while predecessor delivery was unsettled",
+                            raw_response={"ambiguous": True},
+                        )
+                    claim = ledger.claim(
+                        binding, platform=deliver_type, chat_id=str(target_chat_id),
+                        clarify_id=clarify_id, session_key=session_key, choices=choices,
+                        is_active=is_registered)
                 if claim.action == "reuse_answered":
                     resolve_gateway_clarify(clarify_id, claim.response or "")
                     return SendResult(success=True, message_id=claim.message_id)
                 if claim.action == "reuse_active":
                     link_equivalent(claim.clarify_id or "", clarify_id)
-                    if not hasattr(self, "_clarify_delegates"):
-                        self._clarify_delegates = {}
-                    self._clarify_delegates[clarify_id] = (
-                        adapter, claim.clarify_id or clarify_id, ledger,
-                        str(target_chat_id), claim.message_id)
                     return SendResult(success=True, message_id=claim.message_id)
-                if claim.action == "wait_predecessor":
-                    return SendResult(
-                        success=False,
-                        error="Previous approval delivery is not yet settled; replacement withheld",
-                    )
+
+                def _expire_resolution() -> Optional[str]:
+                    ledger.fail_clarify(clarify_id)
+                    observation = ledger.observe(claim.binding_key)
+                    if observation.status == "answered":
+                        return observation.response or ""
+                    if observation.status in ("superseded", "failed"):
+                        return CANCELLED
+                    return None
+
+                if not set_expiry_callback(clarify_id, _expire_resolution):
+                    ledger.fail(claim.card_id)
+                    return SendResult(success=False, error="Approval waiter expired before delivery")
                 def _record_resolution(response: str) -> bool:
                     return ledger.answer(clarify_id, response)
                 if not on_resolution(clarify_id, _record_resolution):
@@ -478,7 +498,31 @@ class WebhookAdapter(BasePlatformAdapter):
                     metadata=target_metadata or None,
                 )
                 if result.success and result.message_id:
-                    ledger.activate(claim.card_id, result.message_id)
+                    activated = ledger.activate(claim.card_id, result.message_id)
+                    if not activated:
+                        # The waiter expired while the remote send was in flight.  The
+                        # backend already rejects this terminal card; retire its newly
+                        # learned coordinates immediately and report a sent outcome so
+                        # the generic layer cannot publish a text fallback.
+                        retired = False
+                        retire_by_coordinates = getattr(adapter, "retire_clarify", None)
+                        if callable(retire_by_coordinates):
+                            retirement = retire_by_coordinates(
+                                chat_id=str(target_chat_id), message_id=result.message_id,
+                                reason="expired")
+                            if inspect.isawaitable(retirement):
+                                retirement = await retirement
+                            retired = bool(retirement)
+                        if not retired:
+                            retire_card = getattr(adapter, "retire_clarify_card", None)
+                            if callable(retire_card):
+                                retirement = retire_card(
+                                    clarify_id,
+                                    "⚠️ Solicitação de aprovação expirada/cancelada.",
+                                )
+                                if inspect.isawaitable(retirement):
+                                    await retirement
+                        return result
                     if not hasattr(self, "_clarify_delegates"):
                         self._clarify_delegates = {}
                     self._clarify_delegates[clarify_id] = (
@@ -497,7 +541,9 @@ class WebhookAdapter(BasePlatformAdapter):
             return
         adapter, delegated_id, ledger, chat_id, message_id = delegated
         if ledger is not None and not ledger.fail_clarify(delegated_id):
-            return
+            observation = ledger.observe_clarify(delegated_id)
+            if observation.status not in ("failed", "superseded"):
+                return
         retire = getattr(adapter, "retire_clarify_card", None)
         if callable(retire):
             retired = await retire(delegated_id, notice)

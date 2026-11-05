@@ -35,6 +35,7 @@ _session_index: Dict[str, List[str]] = {}  # session_key -> [clarify_id] FIFO (t
 _linked_entries: Dict[str, set[str]] = {}  # equivalent cross-session requests share one answer
 _resolution_cbs: Dict[str, Callable[[str], object]] = {}
 _resolution_probes: Dict[str, Callable[[], Optional[str]]] = {}
+_expiry_cbs: Dict[str, Callable[[], Optional[str]]] = {}
 _resolving: set[str] = set()
 # Per-session notify callbacks (gateway -> adapter bridge); mirrors tools.approval. Tests clear it.
 _notify_cbs: Dict[str, Callable[[_ClarifyEntry], None]] = {}
@@ -76,9 +77,13 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
         touch_activity_if_due = None
     deadline = None if timeout is None or float(timeout) <= 0.0 else time.monotonic() + float(timeout)
     activity_state = {"last_touch": time.monotonic(), "start": time.monotonic()}
+    timed_out = False
     while True:
         remaining = 1.0 if deadline is None else deadline - time.monotonic()
-        if remaining <= 0 or entry.event.wait(timeout=min(1.0, remaining)):
+        if remaining <= 0:
+            timed_out = True
+            break
+        if entry.event.wait(timeout=min(1.0, remaining)):
             break
         with _lock:
             probe = _resolution_probes.get(clarify_id)
@@ -94,10 +99,26 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
         # code execution (#10807).
         if touch_activity_if_due is not None:
             touch_activity_if_due(activity_state, "waiting for user clarify response")
+    if timed_out:
+        with _lock:
+            expire = _expiry_cbs.get(clarify_id)
+        # A durable approval must be terminal before its waiter is released.  Retry a
+        # transiently unavailable ledger instead of reopening the late-answer race.
+        while expire is not None and not entry.event.is_set():
+            try:
+                durable_response = expire()
+            except Exception:
+                logger.exception("Failed to durably expire clarify %s", clarify_id)
+                durable_response = None
+            if durable_response is not None:
+                resolve_gateway_clarify(clarify_id, durable_response, persist=False)
+                break
+            entry.event.wait(timeout=0.1)
     with _lock:
         _entries.pop(clarify_id, None)  # regardless of outcome
         _resolution_cbs.pop(clarify_id, None)
         _resolution_probes.pop(clarify_id, None)
+        _expiry_cbs.pop(clarify_id, None)
         _resolving.discard(clarify_id)
         linked = _linked_entries.pop(clarify_id, None)
         if linked is not None:
@@ -145,6 +166,16 @@ def set_resolution_probe(clarify_id: str, probe: Callable[[], Optional[str]]) ->
         if entry is None or entry.event.is_set():
             return False
         _resolution_probes[clarify_id] = probe
+        return True
+
+
+def set_expiry_callback(clarify_id: str, callback: Callable[[], Optional[str]]) -> bool:
+    """Install the durable timeout transition for a locally published clarify card."""
+    with _lock:
+        entry = _entries.get(clarify_id)
+        if entry is None or entry.event.is_set():
+            return False
+        _expiry_cbs[clarify_id] = callback
         return True
 
 
@@ -351,6 +382,7 @@ def clear_session(session_key: str) -> int:
                 linked.discard(entry.clarify_id)
             _resolution_cbs.pop(entry.clarify_id, None)
             _resolution_probes.pop(entry.clarify_id, None)
+            _expiry_cbs.pop(entry.clarify_id, None)
             _resolving.discard(entry.clarify_id)
             entry.response = CANCELLED
             entry.event.set()

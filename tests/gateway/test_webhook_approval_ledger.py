@@ -113,6 +113,19 @@ def test_timed_out_card_can_be_safely_reissued(tmp_path):
     assert replacement.clarify_id == "clarify-b"
 
 
+def test_late_send_ack_cannot_reactivate_expired_card(tmp_path):
+    ledger = ApprovalCardLedger(tmp_path / "approval-cards.db", instance_id="gateway-a")
+    claim = ledger.claim(
+        _binding(), platform="telegram", chat_id="327791380",
+        clarify_id="clarify-a", session_key="session-a", choices=["Approve", "Reject"],
+    )
+
+    assert ledger.fail_clarify("clarify-a") is True
+    assert ledger.activate(claim.card_id, "501") is False
+    assert ledger.observe(claim.binding_key).status == "failed"
+    assert ledger.observe_clarify("clarify-a").status == "failed"
+
+
 def test_stale_send_failure_cannot_erase_answered_decision(tmp_path):
     ledger = ApprovalCardLedger(tmp_path / "approval-cards.db", instance_id="gateway-a")
     claim = ledger.claim(

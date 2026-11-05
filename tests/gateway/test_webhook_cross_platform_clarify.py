@@ -127,6 +127,8 @@ async def test_equivalent_webhook_approvals_publish_one_card_across_sessions(tmp
         cm._linked_entries.clear()
         cm._resolution_cbs.clear()
         cm._resolution_probes.clear()
+        if hasattr(cm, "_expiry_cbs"):
+            cm._expiry_cbs.clear()
         cm._resolving.clear()
     cm.register("clarify-a", "session-a", "Aprovar?", ["Aprovar", "Não aprovar"])
     cm.register("clarify-b", "session-b", "Aprovar?", ["Aprovar", "Não aprovar"])
@@ -305,6 +307,8 @@ async def test_submitted_decision_is_reused_after_gateway_restart(tmp_path, monk
         cm._linked_entries.clear()
         cm._resolution_cbs.clear()
         cm._resolution_probes.clear()
+        if hasattr(cm, "_expiry_cbs"):
+            cm._expiry_cbs.clear()
         cm._resolving.clear()
 
     binding = {
@@ -391,3 +395,138 @@ async def test_active_card_from_previous_gateway_is_reused_and_polled(tmp_path, 
     assert result.success is True
     target.send_clarify.assert_not_awaited()
     assert cm.wait_for_response("new-wait", timeout=3.0) == "Approve"
+
+
+@pytest.mark.asyncio
+async def test_material_successor_waits_until_ambiguous_predecessor_is_recorded(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools import clarify_gateway as cm
+
+    old_binding = {
+        "item_key": "owner/repo#161", "head_sha": "1" * 40,
+        "contract_digest_sha256": "2" * 64, "scope": "merge",
+    }
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    call_count = 0
+
+    async def send_card(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            first_started.set()
+            await release_first.wait()
+        return SendResult(success=True, message_id=str(500 + call_count))
+
+    target = MagicMock()
+    target.send_clarify = AsyncMock(side_effect=send_card)
+    target.retire_clarify = AsyncMock(return_value=True)
+    runner = MagicMock()
+    runner._authorization_adapter.return_value = target
+    adapter = object.__new__(WebhookAdapter)
+    adapter.gateway_runner = runner
+    adapter._delivery_info = {
+        "old": {"deliver": "telegram", "deliver_extra": {"chat_id": "327791380"},
+                "approval_binding": old_binding},
+        "new": {"deliver": "telegram", "deliver_extra": {"chat_id": "327791380"},
+                "approval_binding": {**old_binding, "contract_digest_sha256": "3" * 64}},
+    }
+    cm.register("old-card", "old-session", "Old?", ["Approve", "Reject"])
+    cm.register("new-card", "new-session", "New?", ["Approve", "Reject"])
+
+    old_send = asyncio.create_task(adapter.send_clarify(
+        chat_id="old", question="Old?", choices=["Approve", "Reject"],
+        clarify_id="old-card", session_key="old-session",
+    ))
+    await first_started.wait()
+    new_send = asyncio.create_task(adapter.send_clarify(
+        chat_id="new", question="New?", choices=["Approve", "Reject"],
+        clarify_id="new-card", session_key="new-session",
+    ))
+    await asyncio.sleep(0.15)
+
+    assert target.send_clarify.await_count == 1
+    assert not new_send.done()
+
+    release_first.set()
+    assert (await old_send).success is True
+    assert (await asyncio.wait_for(new_send, timeout=3.0)).success is True
+    assert target.send_clarify.await_count == 2
+    target.retire_clarify.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_timeout_expires_durable_card_before_waiter_returns(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway.approval_card_ledger import ApprovalCardLedger, canonical_binding_key
+    from tools import clarify_gateway as cm
+
+    binding = {
+        "item_key": "owner/repo#161", "head_sha": "1" * 40,
+        "contract_digest_sha256": "2" * 64, "scope": "merge",
+    }
+    target = MagicMock()
+    target.send_clarify = AsyncMock(return_value=SendResult(success=True, message_id="501"))
+    target.retire_clarify_card = AsyncMock(return_value=True)
+    runner = MagicMock()
+    runner._authorization_adapter.return_value = target
+    adapter = object.__new__(WebhookAdapter)
+    adapter.gateway_runner = runner
+    adapter._delivery_info = {
+        "delivery": {"deliver": "telegram", "deliver_extra": {"chat_id": "327791380"},
+                     "approval_binding": binding}
+    }
+    cm.register("timeout-card", "timeout-session", "Approve?", ["Approve", "Reject"])
+    await adapter.send_clarify(
+        chat_id="delivery", question="Approve?", choices=["Approve", "Reject"],
+        clarify_id="timeout-card", session_key="timeout-session",
+    )
+
+    assert cm.wait_for_response("timeout-card", timeout=0.01) == cm.CANCELLED
+    await adapter.retire_clarify_card("timeout-card", "Expired")
+    target.retire_clarify_card.assert_awaited_once_with("timeout-card", "Expired")
+    remote = ApprovalCardLedger(tmp_path / "approval_cards.db", instance_id="gateway-b")
+    assert remote.answer_choice("timeout-card", 0) is None
+    assert remote.observe(canonical_binding_key(binding)).status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_late_send_success_is_retired_after_durable_timeout(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools import clarify_gateway as cm
+
+    binding = {
+        "item_key": "owner/repo#161", "head_sha": "1" * 40,
+        "contract_digest_sha256": "2" * 64, "scope": "merge",
+    }
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_send(**kwargs):
+        started.set()
+        await release.wait()
+        return SendResult(success=True, message_id="501")
+
+    target = MagicMock()
+    target.send_clarify = AsyncMock(side_effect=delayed_send)
+    target.retire_clarify = AsyncMock(return_value=True)
+    runner = MagicMock()
+    runner._authorization_adapter.return_value = target
+    adapter = object.__new__(WebhookAdapter)
+    adapter.gateway_runner = runner
+    adapter._delivery_info = {
+        "delivery": {"deliver": "telegram", "deliver_extra": {"chat_id": "327791380"},
+                     "approval_binding": binding}
+    }
+    cm.register("late-card", "late-session", "Approve?", ["Approve", "Reject"])
+    sending = asyncio.create_task(adapter.send_clarify(
+        chat_id="delivery", question="Approve?", choices=["Approve", "Reject"],
+        clarify_id="late-card", session_key="late-session",
+    ))
+    await started.wait()
+
+    assert await asyncio.to_thread(cm.wait_for_response, "late-card", 0.01) == cm.CANCELLED
+    release.set()
+    assert (await sending).success is True
+    target.retire_clarify.assert_awaited_once_with(
+        chat_id="327791380", message_id="501", reason="expired")

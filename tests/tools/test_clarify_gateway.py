@@ -26,6 +26,8 @@ def _clear_clarify_state():
             cm._resolution_cbs.clear()
         if hasattr(cm, "_resolution_probes"):
             cm._resolution_probes.clear()
+        if hasattr(cm, "_expiry_cbs"):
+            cm._expiry_cbs.clear()
         if hasattr(cm, "_resolving"):
             cm._resolving.clear()
 

@@ -243,7 +243,7 @@ class ApprovalCardLedger:
                 superseded=tuple(self._card(row, status="superseded") for row in old_rows),
             )
 
-    def activate(self, card_id: Optional[int], message_id: str) -> None:
+    def activate(self, card_id: Optional[int], message_id: str) -> bool:
         if card_id is None:
             raise ValueError("card_id is required")
         with self._connect() as connection:
@@ -256,8 +256,7 @@ class ApprovalCardLedger:
                 """,
                 (str(message_id), time.time(), int(card_id)),
             ).rowcount
-            if changed != 1:
-                raise RuntimeError("approval card is not deliverable")
+            return changed == 1
 
     def fail(self, card_id: Optional[int]) -> None:
         if card_id is None:
@@ -386,6 +385,24 @@ class ApprovalCardLedger:
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT status, response FROM approval_bindings WHERE binding_key = ?", (binding_key,)
+            ).fetchone()
+        if row is None:
+            return ApprovalObservation(status="missing")
+        status = str(row["status"])
+        response = str(row["response"] or "") if status == "answered" else None
+        return ApprovalObservation(status=status, response=response)
+
+    def observe_clarify(self, clarify_id: str) -> ApprovalObservation:
+        """Return the durable binding state addressed by a rendered clarify card."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT b.status, b.response
+                FROM approval_cards AS c
+                JOIN approval_bindings AS b ON b.binding_key = c.binding_key
+                WHERE c.clarify_id = ?
+                """,
+                (clarify_id,),
             ).fetchone()
         if row is None:
             return ApprovalObservation(status="missing")
