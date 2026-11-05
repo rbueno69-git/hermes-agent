@@ -1,3 +1,6 @@
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
+
 from gateway.approval_card_ledger import ApprovalCardLedger
 
 
@@ -8,6 +11,15 @@ def _binding(digest="2" * 64, head="1" * 40):
         "contract_digest_sha256": digest,
         "scope": "Somente leitura; merge e deploy autorizados.",
     }
+
+
+def _claim_in_process(path, instance_id, clarify_id):
+    ledger = ApprovalCardLedger(path, instance_id=instance_id)
+    claim = ledger.claim(
+        _binding(), platform="telegram", chat_id="327791380",
+        clarify_id=clarify_id, session_key=f"session-{clarify_id}", choices=["Approve", "Reject"],
+    )
+    return claim.action
 
 
 def test_equivalent_claim_reuses_active_card_in_same_gateway(tmp_path):
@@ -27,6 +39,92 @@ def test_equivalent_claim_reuses_active_card_in_same_gateway(tmp_path):
     assert duplicate.action == "reuse_active"
     assert duplicate.clarify_id == "clarify-a"
     assert duplicate.message_id == "501"
+
+
+def test_equivalent_claim_reuses_active_card_from_another_gateway_instance(tmp_path):
+    path = tmp_path / "approval-cards.db"
+    first_gateway = ApprovalCardLedger(path, instance_id="gateway-a")
+    first = first_gateway.claim(
+        _binding(), platform="telegram", chat_id="327791380",
+        clarify_id="clarify-a", session_key="session-a", choices=["Approve", "Reject"],
+    )
+    first_gateway.activate(first.card_id, "501")
+
+    second_gateway = ApprovalCardLedger(path, instance_id="gateway-b")
+    duplicate = second_gateway.claim(
+        _binding(), platform="telegram", chat_id="327791380",
+        clarify_id="clarify-b", session_key="session-b", choices=["Approve", "Reject"],
+        is_active=lambda clarify_id: False,
+    )
+
+    assert duplicate.action == "reuse_active"
+    assert duplicate.clarify_id == "clarify-a"
+    assert duplicate.message_id == "501"
+
+
+def test_concurrent_gateway_processes_publish_exactly_one_card(tmp_path):
+    path = tmp_path / "approval-cards.db"
+    context = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=2, mp_context=context) as pool:
+        futures = [
+            pool.submit(_claim_in_process, path, "gateway-a", "clarify-a"),
+            pool.submit(_claim_in_process, path, "gateway-b", "clarify-b"),
+        ]
+        actions = [future.result(timeout=20) for future in futures]
+
+    assert sorted(actions) == ["reuse_active", "send"]
+
+
+def test_unknown_delivery_is_not_republished_after_gateway_restart(tmp_path):
+    path = tmp_path / "approval-cards.db"
+    first_gateway = ApprovalCardLedger(path, instance_id="gateway-a")
+    first = first_gateway.claim(
+        _binding(), platform="telegram", chat_id="327791380",
+        clarify_id="clarify-a", session_key="session-a", choices=["Approve", "Reject"],
+    )
+    assert first.action == "send"
+
+    restarted = ApprovalCardLedger(path, instance_id="gateway-b")
+    replay = restarted.claim(
+        _binding(), platform="telegram", chat_id="327791380",
+        clarify_id="clarify-b", session_key="session-b", choices=["Approve", "Reject"],
+    )
+
+    assert replay.action == "reuse_active"
+    assert replay.clarify_id == "clarify-a"
+    assert replay.message_id is None
+
+
+def test_timed_out_card_can_be_safely_reissued(tmp_path):
+    ledger = ApprovalCardLedger(tmp_path / "approval-cards.db", instance_id="gateway-a")
+    first = ledger.claim(
+        _binding(), platform="telegram", chat_id="327791380",
+        clarify_id="clarify-a", session_key="session-a", choices=["Approve", "Reject"],
+    )
+    ledger.activate(first.card_id, "501")
+
+    assert ledger.fail_clarify("clarify-a") is True
+    replacement = ledger.claim(
+        _binding(), platform="telegram", chat_id="327791380",
+        clarify_id="clarify-b", session_key="session-b", choices=["Approve", "Reject"],
+    )
+
+    assert replacement.action == "send"
+    assert replacement.clarify_id == "clarify-b"
+
+
+def test_persisted_choice_can_answer_card_after_gateway_restart(tmp_path):
+    path = tmp_path / "approval-cards.db"
+    first_gateway = ApprovalCardLedger(path, instance_id="gateway-a")
+    first = first_gateway.claim(
+        _binding(), platform="telegram", chat_id="327791380",
+        clarify_id="clarify-a", session_key="session-a", choices=["Approve", "Reject"],
+    )
+    first_gateway.activate(first.card_id, "501")
+
+    restarted = ApprovalCardLedger(path, instance_id="gateway-b")
+    assert restarted.answer_choice("clarify-a", 0) == "Approve"
+    assert restarted.response_for_binding(first.binding_key) == "Approve"
 
 
 def test_answered_binding_is_reused_after_gateway_restart(tmp_path):
@@ -88,7 +186,7 @@ def test_fast_answer_before_send_returns_is_persisted_with_message_id(tmp_path):
     assert replay.message_id == "501"
 
 
-def test_expired_in_memory_wait_is_atomically_replaced(tmp_path):
+def test_expired_in_memory_wait_reuses_durable_card_instead_of_duplicating_it(tmp_path):
     ledger = ApprovalCardLedger(tmp_path / "approval-cards.db", instance_id="gateway-a")
     old = ledger.claim(
         _binding(), platform="telegram", chat_id="327791380",
@@ -96,13 +194,12 @@ def test_expired_in_memory_wait_is_atomically_replaced(tmp_path):
     )
     ledger.activate(old.card_id, "501")
 
-    replacement = ledger.claim(
+    duplicate = ledger.claim(
         _binding(), platform="telegram", chat_id="327791380",
         clarify_id="clarify-new", session_key="session-new",
         is_active=lambda clarify_id: False,
     )
 
-    assert replacement.action == "send"
-    assert [(card.clarify_id, card.message_id) for card in replacement.superseded] == [
-        ("clarify-expired", "501")
-    ]
+    assert duplicate.action == "reuse_active"
+    assert duplicate.clarify_id == "clarify-expired"
+    assert duplicate.message_id == "501"

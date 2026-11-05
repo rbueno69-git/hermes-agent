@@ -80,20 +80,24 @@ def _approval_binding_from_payload(payload: Any) -> Optional[Dict[str, str]]:
     """Return the canonical approval identity emitted by the trusted intake transform."""
     if not isinstance(payload, dict):
         return None
-    if payload.get("contract_accepted") is not True or payload.get("executor_binding_status") != "pending_approval":
+    accepted = payload.get("contract_accepted")
+    binding_status = payload.get("executor_binding_status")
+    if accepted is not True and binding_status != "pending_approval":
         return None
+    if accepted is not True or binding_status != "pending_approval":
+        raise ValueError("invalid approval binding state")
     item_key = payload.get("item_key")
     head_sha = payload.get("head_sha")
     digest = payload.get("contract_digest_sha256")
     scope = payload.get("contract_scope")
     if not isinstance(item_key, str) or not _APPROVAL_ITEM_RE.fullmatch(item_key):
-        return None
+        raise ValueError("invalid approval binding item_key")
     if not isinstance(head_sha, str) or not _HEX_40_RE.fullmatch(head_sha):
-        return None
+        raise ValueError("invalid approval binding head_sha")
     if not isinstance(digest, str) or not _HEX_64_RE.fullmatch(digest):
-        return None
+        raise ValueError("invalid approval binding contract_digest_sha256")
     if not isinstance(scope, str) or not scope or len(scope) > 4000:
-        return None
+        raise ValueError("invalid approval binding contract_scope")
     return {"item_key": item_key, "head_sha": head_sha, "contract_digest_sha256": digest, "scope": scope}
 
 
@@ -390,11 +394,17 @@ class WebhookAdapter(BasePlatformAdapter):
             target_metadata["is_approval_prompt"] = True
             binding = delivery.get("approval_binding")
             if not isinstance(binding, dict):
-                return await adapter.send_clarify(
+                result = await adapter.send_clarify(
                     chat_id=str(target_chat_id), question=question, choices=choices,
                     clarify_id=clarify_id, session_key=session_key,
                     metadata=target_metadata or None,
                 )
+                if result.success:
+                    if not hasattr(self, "_clarify_delegates"):
+                        self._clarify_delegates = {}
+                    self._clarify_delegates[clarify_id] = (
+                        adapter, clarify_id, None, str(target_chat_id), result.message_id)
+                return result
             if not hasattr(self, "_approval_prompt_lock"):
                 self._approval_prompt_lock = asyncio.Lock()
                 self._approval_instance_id = uuid.uuid4().hex
@@ -408,19 +418,29 @@ class WebhookAdapter(BasePlatformAdapter):
                 from tools.clarify_gateway import is_registered
                 claim = ledger.claim(
                     binding, platform=deliver_type, chat_id=str(target_chat_id),
-                    clarify_id=clarify_id, session_key=session_key, is_active=is_registered)
+                    clarify_id=clarify_id, session_key=session_key, choices=choices,
+                    is_active=is_registered)
                 if claim.action == "reuse_answered":
                     from tools.clarify_gateway import resolve_gateway_clarify
                     resolve_gateway_clarify(clarify_id, claim.response or "")
                     return SendResult(success=True, message_id=claim.message_id)
                 if claim.action == "reuse_active":
-                    from tools.clarify_gateway import link_equivalent
+                    from tools.clarify_gateway import link_equivalent, set_resolution_probe
                     link_equivalent(claim.clarify_id or "", clarify_id)
+                    set_resolution_probe(
+                        clarify_id, lambda: ledger.response_for_binding(claim.binding_key))
+                    if not hasattr(self, "_clarify_delegates"):
+                        self._clarify_delegates = {}
+                    self._clarify_delegates[clarify_id] = (
+                        adapter, claim.clarify_id or clarify_id, ledger,
+                        str(target_chat_id), claim.message_id)
                     return SendResult(success=True, message_id=claim.message_id)
                 from tools.clarify_gateway import CANCELLED, on_resolution, resolve_gateway_clarify
-                def _record_resolution(response: str) -> None:
-                    ledger.answer(clarify_id, response)
-                on_resolution(clarify_id, _record_resolution)
+                def _record_resolution(response: str) -> bool:
+                    return ledger.answer(clarify_id, response)
+                if not on_resolution(clarify_id, _record_resolution):
+                    ledger.fail(claim.card_id)
+                    return SendResult(success=False, error="Approval waiter expired before delivery")
                 for old_card in claim.superseded:
                     resolve_gateway_clarify(old_card.clarify_id, CANCELLED)
                     retired = False
@@ -439,11 +459,33 @@ class WebhookAdapter(BasePlatformAdapter):
                 )
                 if result.success and result.message_id:
                     ledger.activate(claim.card_id, result.message_id)
+                    if not hasattr(self, "_clarify_delegates"):
+                        self._clarify_delegates = {}
+                    self._clarify_delegates[clarify_id] = (
+                        adapter, clarify_id, ledger, str(target_chat_id), result.message_id)
                 else:
                     ledger.fail(claim.card_id)
                     if result.success:
                         return SendResult(success=False, error="Approval card delivery returned no message_id")
                 return result
+
+    async def retire_clarify_card(self, clarify_id: str, notice: str) -> None:
+        """Forward timeout/cancellation retirement to the adapter that rendered the card."""
+        delegates = getattr(self, "_clarify_delegates", {})
+        delegated = delegates.pop(clarify_id, None)
+        if delegated is None:
+            return
+        adapter, delegated_id, ledger, chat_id, message_id = delegated
+        if ledger is not None:
+            ledger.fail_clarify(delegated_id)
+        retire = getattr(adapter, "retire_clarify_card", None)
+        if callable(retire):
+            retired = await retire(delegated_id, notice)
+            if retired is True:
+                return
+        retire_by_coordinates = getattr(adapter, "retire_clarify", None)
+        if message_id and asyncio.iscoroutinefunction(retire_by_coordinates):
+            await retire_by_coordinates(chat_id=chat_id, message_id=message_id, reason="expired")
 
     def _prune_delivery_info(self, now: float) -> None:
         """Drop delivery_info entries older than the idempotency TTL (bounds the dict by ``rate_limit * TTL``
@@ -799,6 +841,11 @@ class WebhookAdapter(BasePlatformAdapter):
                     logger.info("[webhook] script ignored event=%s route=%s", event_type, route_name)
                     return web.json_response({"status": "ignored", "reason": "script", "route": route_name})
                 payload = transformed_payload or payload
+            try:
+                _approval_binding_from_payload(payload)
+            except ValueError as exc:
+                logger.warning("[webhook] Rejected malformed approval payload on route %s: %s", route_name, exc)
+                return _json_error("Invalid approval binding", 422)
             prompt = self._render_prompt(route_config.get("prompt", ""), payload, event_type, route_name)
             # cron_job routes: the job's own skills apply; the rendered prompt is only per-run context.
             if (skills := route_config.get("skills", [])) and not route_config.get("cron_job"):

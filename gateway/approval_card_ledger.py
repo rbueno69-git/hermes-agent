@@ -9,7 +9,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -84,6 +84,7 @@ class ApprovalCardLedger:
                     platform TEXT NOT NULL,
                     chat_id TEXT NOT NULL,
                     message_id TEXT,
+                    choices_json TEXT,
                     status TEXT NOT NULL CHECK(status IN ('delivering','active','answered','superseded','failed')),
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
@@ -94,6 +95,9 @@ class ApprovalCardLedger:
                     ON approval_bindings(item_key, status);
                 """
             )
+            columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(approval_cards)")}
+            if "choices_json" not in columns:
+                connection.execute("ALTER TABLE approval_cards ADD COLUMN choices_json TEXT")
         os.chmod(self.path, 0o600)
 
     @staticmethod
@@ -116,9 +120,16 @@ class ApprovalCardLedger:
         chat_id: str,
         clarify_id: str,
         session_key: str,
+        choices: Optional[List[str]] = None,
         is_active: Optional[Callable[[str], bool]] = None,
     ) -> ApprovalClaim:
         binding_key = canonical_binding_key(binding)
+        if choices is not None and (
+            type(choices) is not list or not choices
+            or any(not isinstance(choice, str) or not choice for choice in choices)
+        ):
+            raise ValueError("approval choices must be a non-empty list of strings")
+        choices_json = json.dumps(choices, ensure_ascii=False, separators=(",", ":")) if choices else None
         now = time.time()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -142,12 +153,12 @@ class ApprovalCardLedger:
             active = connection.execute(
                 """
                 SELECT * FROM approval_cards
-                WHERE binding_key = ? AND instance_id = ? AND status IN ('delivering','active')
+                WHERE binding_key = ? AND status IN ('delivering','active')
                 ORDER BY card_id DESC LIMIT 1
                 """,
-                (binding_key, self.instance_id),
+                (binding_key,),
             ).fetchone()
-            if active is not None and (is_active is None or is_active(str(active["clarify_id"]))):
+            if active is not None:
                 connection.commit()
                 return ApprovalClaim(
                     action="reuse_active",
@@ -199,10 +210,11 @@ class ApprovalCardLedger:
                 """
                 INSERT INTO approval_cards(
                     binding_key, clarify_id, session_key, instance_id, platform, chat_id,
-                    message_id, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, NULL, 'delivering', ?, ?)
+                    message_id, choices_json, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'delivering', ?, ?)
                 """,
-                (binding_key, clarify_id, session_key, self.instance_id, platform, chat_id, now, now),
+                (binding_key, clarify_id, session_key, self.instance_id, platform, chat_id,
+                 choices_json, now, now),
             )
             if cursor.lastrowid is None:
                 raise RuntimeError("approval card insert returned no identity")
@@ -251,6 +263,28 @@ class ApprovalCardLedger:
                 (now, str(row["binding_key"])),
             )
 
+    def fail_clarify(self, clarify_id: str) -> bool:
+        """Expire one active delivery so a later identical claim may safely publish again."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT card_id, binding_key, status FROM approval_cards WHERE clarify_id = ?", (clarify_id,)
+            ).fetchone()
+            if row is None or row["status"] not in ("delivering", "active"):
+                connection.commit()
+                return False
+            now = time.time()
+            connection.execute(
+                "UPDATE approval_cards SET status = 'failed', updated_at = ? WHERE card_id = ?",
+                (now, int(row["card_id"])),
+            )
+            connection.execute(
+                "UPDATE approval_bindings SET status = 'failed', updated_at = ? WHERE binding_key = ?",
+                (now, str(row["binding_key"])),
+            )
+            connection.commit()
+            return True
+
     def answer(self, clarify_id: str, response: str) -> bool:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -274,3 +308,50 @@ class ApprovalCardLedger:
             )
             connection.commit()
             return True
+
+    def answer_choice(self, clarify_id: str, choice_index: int) -> Optional[str]:
+        """Resolve an active card from its persisted choice list after a process restart."""
+        if type(choice_index) is not int or choice_index < 0:
+            return None
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT card_id, binding_key, status, choices_json FROM approval_cards WHERE clarify_id = ?",
+                (clarify_id,),
+            ).fetchone()
+            if row is None or row["status"] not in ("delivering", "active") or not row["choices_json"]:
+                connection.commit()
+                return None
+            try:
+                choices = json.loads(str(row["choices_json"]))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                connection.rollback()
+                return None
+            if type(choices) is not list or not (0 <= choice_index < len(choices)):
+                connection.commit()
+                return None
+            response = choices[choice_index]
+            if not isinstance(response, str) or not response:
+                connection.rollback()
+                return None
+            now = time.time()
+            connection.execute(
+                "UPDATE approval_cards SET status = 'answered', updated_at = ? WHERE card_id = ?",
+                (now, int(row["card_id"])),
+            )
+            connection.execute(
+                "UPDATE approval_bindings SET status = 'answered', response = ?, updated_at = ? WHERE binding_key = ?",
+                (response, now, str(row["binding_key"])),
+            )
+            connection.commit()
+            return response
+
+    def response_for_binding(self, binding_key: str) -> Optional[str]:
+        """Return the submitted decision only after the binding is durably answered."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT status, response FROM approval_bindings WHERE binding_key = ?", (binding_key,)
+            ).fetchone()
+        if row is None or row["status"] != "answered":
+            return None
+        return str(row["response"] or "")

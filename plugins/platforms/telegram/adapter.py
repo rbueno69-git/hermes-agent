@@ -4318,12 +4318,12 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         return await self._send_prompt(
             "send_clarify", chat_id, metadata, build, parse_mode=ParseMode.HTML, thread_id=self._metadata_thread_id(metadata))
 
-    async def retire_clarify_card(self, clarify_id: str, notice: str) -> None:
+    async def retire_clarify_card(self, clarify_id: str, notice: str) -> bool:
         """Rewrite a timed-out/cancelled Telegram clarify into a terminal card without buttons."""
         coordinates = self._clarify_card_state.pop(clarify_id, None)
         self._clarify_state.pop(clarify_id, None)
         if coordinates is None or not self._bot:
-            return
+            return False
         chat_id, message_id = coordinates
         try:
             await _await_with_thread_deadline(
@@ -4331,14 +4331,18 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                     chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id),
                     text=str(notice), reply_markup=None),
                 timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
+            return True
         except Exception as exc:
             logger.debug("[%s] Failed to retire clarify card %s: %s", self.name, clarify_id,
                          _redact_telegram_error_text(exc))
-            with contextlib.suppress(Exception):
+            try:
                 await _await_with_thread_deadline(
                     self._bot.edit_message_reply_markup(
                         chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id), reply_markup=None),
                     timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
+                return True
+            except Exception:
+                return False
 
     @staticmethod
     def _provider_get_label():
@@ -4871,13 +4875,14 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             return
         clarify_id = parts[1]
         choice_token = parts[2]
-        session_key = await self._claim_callback_state(
-            query, cb, self._clarify_state, clarify_id, _unauthorized(),
-            _toast("platform.telegram.slash_confirm.already_resolved"), pop=False)
-        if not session_key:
+        if not await self._callback_authorized(query, cb, _unauthorized()):
             return
+        session_key = self._clarify_state.get(clarify_id)
         user_display = getattr(query.from_user, "first_name", None) or t("platform.telegram.user_fallback")
         if choice_token == "other":
+            if not session_key:
+                await self._notify_clarify_expired(query, user_display)
+                return
             # Flip to text-capture: the gateway's text-intercept resolves the clarify with the next message.
             # Do NOT pop _clarify_state yet — still needed if the entry gets cleared by something else.
             flipped = False
@@ -4898,40 +4903,64 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                 f"❓ {query.message.text or ''}\n\n"
                 f"<i>{_html.escape(t('platform.telegram.prompt.awaiting_typed', user=user_display))}</i>")
             return
-        # Numeric choice → resolve immediately with the chosen text
+        # Numeric choice → resolve immediately with the chosen text.
         try:
             idx = int(choice_token)
         except (ValueError, TypeError):
             await query.answer(text=_toast("platform.telegram.prompt.invalid_choice"))
             return
         resolved_text: Optional[str] = None
+        entry = None
         try:
             from tools.clarify_gateway import _entries as _clarify_entries  # type: ignore
             entry = _clarify_entries.get(clarify_id)
             if entry and entry.choices and 0 <= idx < len(entry.choices):
                 resolved_text = entry.choices[idx]
         except Exception:
+            entry = None
             resolved_text = None
-        if resolved_text is None:
-            # Race (timeout / session reset): echo the index so the agent sees an intentional response.
-            resolved_text = f"choice {idx + 1}"
-        self._clarify_state.pop(clarify_id, None)
-        self._clarify_card_state.pop(clarify_id, None)
-        try:
-            from tools.clarify_gateway import resolve_gateway_clarify
-            resolved = resolve_gateway_clarify(clarify_id, resolved_text)
-        except Exception as exc:
-            logger.error("[%s] resolve_gateway_clarify failed: %s", self.name, exc)
-            resolved = False
+        if entry is None:
+            # A Gateway restart drops the in-memory waiter and adapter maps, but the durable
+            # approval ledger still owns the card and its exact choices.
+            try:
+                from gateway.approval_card_ledger import ApprovalCardLedger
+                from hermes_constants import get_hermes_home
+                profile_name = getattr(self, "_hermes_profile_name", None)
+                if profile_name and profile_name != "default":
+                    from hermes_cli.profiles import get_profile_dir
+                    ledger_path = get_profile_dir(profile_name) / "approval_cards.db"
+                else:
+                    ledger_path = get_hermes_home() / "approval_cards.db"
+                if ledger_path.exists():
+                    ledger = ApprovalCardLedger(ledger_path, instance_id="telegram-callback")
+                    resolved_text = ledger.answer_choice(clarify_id, idx)
+            except Exception:
+                logger.exception("[%s] Failed durable clarify callback for %s", self.name, clarify_id)
+            resolved = resolved_text is not None
+        else:
+            if resolved_text is None:
+                await query.answer(text=_toast("platform.telegram.prompt.invalid_choice"))
+                return
+            try:
+                from tools.clarify_gateway import resolve_gateway_clarify
+                resolved = resolve_gateway_clarify(clarify_id, resolved_text)
+            except Exception as exc:
+                logger.error("[%s] resolve_gateway_clarify failed: %s", self.name, exc)
+                resolved = False
         if resolved:
+            self._clarify_state.pop(clarify_id, None)
+            self._clarify_card_state.pop(clarify_id, None)
             await query.answer(text=f"✓ {resolved_text[:60]}")
             await self._edit_html_quiet(
                 query, f"❓ {_html.escape(query.message.text or '')}\n\n<b>{_html.escape(user_display)}:</b> {_html.escape(resolved_text)}")
             logger.info("Telegram clarify button resolved (id=%s, choice=%r, user=%s)", clarify_id, resolved_text, user_display)
-        else:
-            # Entry evicted / gateway restarted between ask and tap.
+        elif entry is None:
             await self._notify_clarify_expired(query, user_display)
-            logger.warning("Telegram clarify button: resolve_gateway_clarify returned False (id=%s)", clarify_id)
+            logger.warning("Telegram clarify button: no active durable card (id=%s)", clarify_id)
+        else:
+            # Persistence is authoritative: keep the card actionable so the user can retry.
+            await query.answer(text=_toast("platform.telegram.prompt.invalid_choice"))
+            logger.warning("Telegram clarify button: durable resolution failed (id=%s)", clarify_id)
 
     async def _handle_update_prompt_callback(self, query, data: str, cb: Dict[str, Any]) -> None:
         """``update_prompt:<y|n>`` — forward the answer to the update process."""

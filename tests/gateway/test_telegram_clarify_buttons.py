@@ -83,6 +83,10 @@ def _clear_clarify_state():
         cm._entries.clear()
         cm._session_index.clear()
         cm._notify_cbs.clear()
+        cm._linked_entries.clear()
+        cm._resolution_cbs.clear()
+        cm._resolution_probes.clear()
+        cm._resolving.clear()
 
 
 # ===========================================================================
@@ -204,6 +208,58 @@ class TestTelegramClarifyCallback:
         assert entry.event.is_set()
         query.answer.assert_called_once()
         query.edit_message_text.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_persistence_failure_keeps_button_state_for_retry(self):
+        from tools import clarify_gateway as cm
+
+        adapter = _make_adapter()
+        cm.register("cid-durable", "sk-cb", "Pick", ["red", "green"])
+        cm.on_resolution("cid-durable", lambda response: (_ for _ in ()).throw(RuntimeError("locked")))
+        adapter._clarify_state["cid-durable"] = "sk-cb"
+        adapter._clarify_card_state["cid-durable"] = ("12345", "100")
+        query = AsyncMock()
+        query.data = "cl:cid-durable:1"
+        query.message = MagicMock(chat_id=12345, text="Pick")
+        query.from_user = MagicMock(id="777", first_name="Tester")
+        update = MagicMock(callback_query=query)
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            await adapter._handle_callback_query(update, MagicMock())
+
+        assert adapter._clarify_state["cid-durable"] == "sk-cb"
+        assert adapter._clarify_card_state["cid-durable"] == ("12345", "100")
+        assert cm._entries["cid-durable"].event.is_set() is False
+
+    @pytest.mark.asyncio
+    async def test_restart_callback_uses_durable_choices_and_unblocks_replacement_waiter(self, tmp_path):
+        from gateway.approval_card_ledger import ApprovalCardLedger
+        from tools import clarify_gateway as cm
+
+        binding = {
+            "item_key": "owner/repo#1", "head_sha": "1" * 40,
+            "contract_digest_sha256": "2" * 64, "scope": "merge",
+        }
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path), "TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            ledger = ApprovalCardLedger(tmp_path / "approval_cards.db", instance_id="old")
+            claim = ledger.claim(
+                binding, platform="telegram", chat_id="12345", clarify_id="old-card",
+                session_key="old-session", choices=["Approve", "Reject"],
+            )
+            ledger.activate(claim.card_id, "100")
+            cm.register("replacement-wait", "new-session", "Approve?", ["Approve", "Reject"])
+            cm.set_resolution_probe(
+                "replacement-wait", lambda: ledger.response_for_binding(claim.binding_key))
+            adapter = _make_adapter()
+            query = AsyncMock()
+            query.data = "cl:old-card:0"
+            query.message = MagicMock(chat_id=12345, text="Approve?")
+            query.from_user = MagicMock(id="777", first_name="Tester")
+
+            await adapter._handle_callback_query(MagicMock(callback_query=query), MagicMock())
+
+            assert ledger.response_for_binding(claim.binding_key) == "Approve"
+            assert cm.wait_for_response("replacement-wait", timeout=3.0) == "Approve"
 
 
     @pytest.mark.asyncio

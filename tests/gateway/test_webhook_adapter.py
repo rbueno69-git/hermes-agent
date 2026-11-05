@@ -31,8 +31,28 @@ from gateway.platforms.base import SendResult
 from gateway.platforms.webhook import (
     WebhookAdapter,
     _INSECURE_NO_AUTH,
+    _approval_binding_from_payload,
     _is_usable_secret,
 )
+
+
+def test_declared_approval_with_malformed_binding_fails_closed():
+    payload = {
+        "contract_accepted": True,
+        "executor_binding_status": "pending_approval",
+        "item_key": "owner/repo#1",
+        "head_sha": "bad",
+        "contract_digest_sha256": "2" * 64,
+        "contract_scope": "merge",
+    }
+
+    with pytest.raises(ValueError, match="invalid approval binding"):
+        _approval_binding_from_payload(payload)
+
+    payload["contract_accepted"] = "true"
+    payload["head_sha"] = "1" * 40
+    with pytest.raises(ValueError, match="invalid approval binding state"):
+        _approval_binding_from_payload(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -480,6 +500,33 @@ class TestPayloadFilters:
         await asyncio.sleep(0.05)
         assert captured[0].text == "Task: PAY BILLS"
         assert captured[0].raw_message["body"] == "PAY BILLS"
+
+    @pytest.mark.asyncio
+    async def test_malformed_transformed_approval_is_rejected_before_agent_run(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        scripts = tmp_path / "scripts"
+        scripts.mkdir()
+        script = scripts / "approval_filter.py"
+        script.write_text(
+            "import json\n"
+            "print(json.dumps({'contract_accepted': True, 'executor_binding_status': 'pending_approval', "
+            "'item_key': 'owner/repo#1', 'head_sha': 'bad', "
+            "'contract_digest_sha256': '2' * 64, 'contract_scope': 'merge'}))\n",
+            encoding="utf-8",
+        )
+        adapter = _make_adapter(routes={"approval": {
+            "secret": _INSECURE_NO_AUTH, "script": "approval_filter.py", "prompt": "approval",
+        }})
+        adapter.handle_message = AsyncMock()
+
+        async with TestClient(TestServer(_create_app(adapter))) as cli:
+            resp = await cli.post(
+                "/webhooks/approval", json={"event": "pull_request"},
+                headers={"X-GitHub-Delivery": "approval-invalid-1"},
+            )
+
+        assert resp.status == 422
+        adapter.handle_message.assert_not_awaited()
 
 
 # ===================================================================

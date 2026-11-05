@@ -64,6 +64,28 @@ async def test_webhook_clarify_without_interactive_destination_fails_before_wait
 
 
 @pytest.mark.asyncio
+async def test_webhook_timeout_retirement_reaches_delegated_adapter():
+    target = MagicMock()
+    target.send_clarify = AsyncMock(return_value=SendResult(success=True, message_id="501"))
+    target.retire_clarify_card = AsyncMock()
+    runner = MagicMock()
+    runner._authorization_adapter.return_value = target
+    adapter = object.__new__(WebhookAdapter)
+    adapter.gateway_runner = runner
+    adapter._delivery_info = {
+        "delivery": {"deliver": "telegram", "deliver_extra": {"chat_id": "327791380"}}
+    }
+
+    await adapter.send_clarify(
+        chat_id="delivery", question="Approve?", choices=["Yes", "No"],
+        clarify_id="clarify-timeout", session_key="session-timeout",
+    )
+    await adapter.retire_clarify_card("clarify-timeout", "Expired")
+
+    target.retire_clarify_card.assert_awaited_once_with("clarify-timeout", "Expired")
+
+
+@pytest.mark.asyncio
 async def test_equivalent_webhook_approvals_publish_one_card_across_sessions(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     from tools import clarify_gateway as cm
@@ -72,6 +94,8 @@ async def test_equivalent_webhook_approvals_publish_one_card_across_sessions(tmp
         cm._session_index.clear()
         cm._linked_entries.clear()
         cm._resolution_cbs.clear()
+        cm._resolution_probes.clear()
+        cm._resolving.clear()
     cm.register("clarify-a", "session-a", "Aprovar?", ["Aprovar", "Não aprovar"])
     cm.register("clarify-b", "session-b", "Aprovar?", ["Aprovar", "Não aprovar"])
     target = MagicMock()
@@ -125,6 +149,9 @@ async def test_equivalent_webhook_approvals_publish_one_card_across_sessions(tmp
 @pytest.mark.asyncio
 async def test_material_change_retires_old_card_before_publishing_replacement(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools import clarify_gateway as cm
+    cm.register("clarify-old", "session-old", "Old?", ["Approve", "Reject"])
+    cm.register("clarify-new", "session-new", "New?", ["Approve", "Reject"])
     calls = []
     target = MagicMock()
 
@@ -176,6 +203,8 @@ async def test_submitted_decision_is_reused_after_gateway_restart(tmp_path, monk
         cm._session_index.clear()
         cm._linked_entries.clear()
         cm._resolution_cbs.clear()
+        cm._resolution_probes.clear()
+        cm._resolving.clear()
 
     binding = {
         "item_key": "rbueno69-git/carteira-investimentos#160",
@@ -216,3 +245,48 @@ async def test_submitted_decision_is_reused_after_gateway_restart(tmp_path, monk
     assert result.success is True
     target.send_clarify.assert_not_awaited()
     assert cm.wait_for_response("clarify-b", timeout=1.0) == "Approve"
+
+
+@pytest.mark.asyncio
+async def test_active_card_from_previous_gateway_is_reused_and_polled(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway.approval_card_ledger import ApprovalCardLedger
+    from tools import clarify_gateway as cm
+
+    binding = {
+        "item_key": "owner/repo#1", "head_sha": "1" * 40,
+        "contract_digest_sha256": "2" * 64, "scope": "merge",
+    }
+    target = MagicMock()
+    target.send_clarify = AsyncMock(return_value=SendResult(success=True, message_id="501"))
+    runner = MagicMock()
+    runner._authorization_adapter.return_value = target
+    first = object.__new__(WebhookAdapter)
+    first.gateway_runner = runner
+    first._delivery_info = {
+        "first": {"deliver": "telegram", "deliver_extra": {"chat_id": "327791380"}, "approval_binding": binding}
+    }
+    cm.register("old-card", "old-session", "Approve?", ["Approve", "Reject"])
+    await first.send_clarify(
+        chat_id="first", question="Approve?", choices=["Approve", "Reject"],
+        clarify_id="old-card", session_key="old-session",
+    )
+    cm.clear_session("old-session")
+
+    restarted = object.__new__(WebhookAdapter)
+    restarted.gateway_runner = runner
+    restarted._delivery_info = {
+        "replay": {"deliver": "telegram", "deliver_extra": {"chat_id": "327791380"}, "approval_binding": binding}
+    }
+    target.send_clarify.reset_mock()
+    cm.register("new-wait", "new-session", "Approve?", ["Approve", "Reject"])
+    result = await restarted.send_clarify(
+        chat_id="replay", question="Approve?", choices=["Approve", "Reject"],
+        clarify_id="new-wait", session_key="new-session",
+    )
+    ledger = ApprovalCardLedger(tmp_path / "approval_cards.db", instance_id="test")
+    assert ledger.answer_choice("old-card", 0) == "Approve"
+
+    assert result.success is True
+    target.send_clarify.assert_not_awaited()
+    assert cm.wait_for_response("new-wait", timeout=3.0) == "Approve"
