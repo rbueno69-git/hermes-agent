@@ -319,6 +319,50 @@ class WebhookAdapter(BasePlatformAdapter):
         logger.warning("[webhook] Unknown deliver type: %s", deliver_type)
         return SendResult(success=False, error=f"Unknown deliver type: {deliver_type}")
 
+    async def send_clarify(
+        self, chat_id: str, question: str, choices: Optional[list], clarify_id: str,
+        session_key: str, metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Render a webhook-run clarify on its real cross-platform destination.
+
+        Calling ``BasePlatformAdapter.send_clarify`` here sends a numbered text prompt through
+        ``send()`` but leaves the waiter bound to the opaque webhook session. A reply arriving on
+        Telegram/Slack belongs to a different session and can never resolve that waiter, producing
+        endless ``Working … clarify`` heartbeats. Delegate to the destination adapter instead so
+        native button callbacks resolve the original global ``clarify_id``.
+        """
+        delivery = self._delivery_info.get(chat_id, {})
+        deliver_type = delivery.get("deliver", "log")
+        if deliver_type == "log" or deliver_type == "github_comment":
+            return SendResult(success=False, error="Webhook clarify has no interactive destination")
+        if not self.gateway_runner or not _is_known_platform(deliver_type):
+            return SendResult(success=False, error=f"Interactive destination unavailable: {deliver_type}")
+        try:
+            target_platform = Platform(deliver_type)
+        except ValueError:
+            return SendResult(success=False, error=f"Unknown platform: {deliver_type}")
+        profile = delivery.get("profile")
+        if not (adapter := self._find_adapter(target_platform, profile)):
+            return SendResult(success=False, error=f"Platform {deliver_type} not connected")
+        extra = delivery.get("deliver_extra", {})
+        target_chat_id = extra.get("chat_id", "")
+        with self._profile_scope(profile):
+            if not target_chat_id:
+                home = self._delivery_config(profile).get_home_channel(target_platform)
+                if not home:
+                    return SendResult(success=False, error=f"No chat_id or home channel for {deliver_type}")
+                target_chat_id = home.chat_id
+            thread_id = extra.get("message_thread_id") or extra.get("thread_id")
+            target_metadata = dict(metadata or {})
+            if thread_id:
+                target_metadata["thread_id"] = thread_id
+            target_metadata["is_approval_prompt"] = True
+            return await adapter.send_clarify(
+                chat_id=str(target_chat_id), question=question, choices=choices,
+                clarify_id=clarify_id, session_key=session_key,
+                metadata=target_metadata or None,
+            )
+
     def _prune_delivery_info(self, now: float) -> None:
         """Drop delivery_info entries older than the idempotency TTL (bounds the dict by ``rate_limit * TTL``
         even when runs never produce a final response)."""
