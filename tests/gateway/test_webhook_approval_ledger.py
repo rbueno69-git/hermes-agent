@@ -200,7 +200,7 @@ def test_explicit_recovery_choice_unblocks_crashed_delivering_predecessor(tmp_pa
         old.card_id, platform="telegram", chat_id="327791380"
     )
     assert recovery.action == "send"
-    recovery_id = f"approval-recovery-{old.card_id}"
+    recovery_id = recovery.clarify_id or ""
     assert restarted.answer_choice(recovery_id, 0) == "Reemitir aprovação"
     assert restarted.observe(old.binding_key).status == "failed"
     replacement = restarted.claim(
@@ -250,6 +250,9 @@ def test_stale_recovery_delivery_is_safely_reissued_without_authorizing_item(tmp
     assert takeover.action == "send"
     assert takeover.owner_instance_id == "gateway-c"
     assert takeover.delivery_generation != first_recovery.delivery_generation
+    assert takeover.clarify_id != first_recovery.clarify_id
+    assert crashed.answer_choice(first_recovery.clarify_id or "", 0) is None
+    assert crashed.observe(old.binding_key).status == "pending"
     assert crashed.activate_recovery(
         old.card_id, first_recovery.delivery_generation, "600"
     ) is False
@@ -267,12 +270,12 @@ def test_recovery_keep_blocked_choice_preserves_unknown_delivery(tmp_path):
         clarify_id="clarify-old", session_key="session-old", choices=["Approve", "Reject"],
     )
     restarted = ApprovalCardLedger(path, instance_id="gateway-b")
-    restarted.claim_recovery(
+    recovery = restarted.claim_recovery(
         old.card_id, platform="telegram", chat_id="327791380"
     )
 
     assert restarted.answer_choice(
-        f"approval-recovery-{old.card_id}", 1
+        recovery.clarify_id or "", 1
     ) == "Manter bloqueado"
     assert restarted.observe(old.binding_key).status == "pending"
     assert restarted.claim(

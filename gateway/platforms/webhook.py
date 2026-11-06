@@ -548,15 +548,32 @@ class WebhookAdapter(BasePlatformAdapter):
                             if not recovery_activated:
                                 clear_session(recovery_session)
                                 resolve_gateway_clarify(recovery_id, CANCELLED, persist=False)
+                                retired = False
                                 try:
-                                    await adapter.retire_clarify_card(
-                                        recovery_id,
-                                        "This recovery control was superseded by a newer delivery.",
-                                    )
+                                    retire_exact = getattr(adapter, "retire_clarify", None)
+                                    if inspect.iscoroutinefunction(retire_exact):
+                                        retired = bool(await retire_exact(
+                                            chat_id=str(target_chat_id),
+                                            message_id=recovery_result.message_id,
+                                            reason="superseded",
+                                        ))
+                                    else:
+                                        retire_card = getattr(adapter, "retire_clarify_card", None)
+                                        if inspect.iscoroutinefunction(retire_card):
+                                            retired = bool(await retire_card(
+                                                recovery_id,
+                                                "This recovery control was superseded by a newer delivery.",
+                                            ))
                                 except Exception:
                                     logger.exception(
                                         "Failed to retire stale approval recovery %s",
                                         recovery_id,
+                                    )
+                                if not retired:
+                                    return SendResult(
+                                        success=False,
+                                        error="Stale approval recovery control could not be retired",
+                                        raw_response={"ambiguous": True},
                                     )
                                 return recovery_result
                         task = asyncio.create_task(self._resume_after_approval_recovery(

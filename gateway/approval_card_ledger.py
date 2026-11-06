@@ -131,6 +131,10 @@ class ApprovalCardLedger:
                     "UPDATE approval_recoveries SET generation = lower(hex(randomblob(16))) "
                     "WHERE generation IS NULL"
                 )
+                connection.execute(
+                    "UPDATE approval_recoveries SET clarify_id = "
+                    "'approval-recovery-' || card_id || '-' || generation"
+                )
         os.chmod(self.path, 0o600)
 
     @staticmethod
@@ -276,8 +280,8 @@ class ApprovalCardLedger:
         """Elect exactly one publisher for a non-authorizing delivery recovery control."""
         if card_id is None:
             raise ValueError("card_id is required")
-        clarify_id = f"approval-recovery-{int(card_id)}"
         generation = secrets.token_hex(16)
+        clarify_id = f"approval-recovery-{int(card_id)}-{generation}"
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             card = connection.execute(
@@ -302,10 +306,10 @@ class ApprovalCardLedger:
                     connection.execute(
                         """
                         UPDATE approval_recoveries SET instance_id = ?, platform = ?, chat_id = ?,
-                            message_id = NULL, generation = ?, updated_at = ?
+                            clarify_id = ?, message_id = NULL, generation = ?, updated_at = ?
                         WHERE card_id = ? AND status = 'delivering'
                         """,
-                        (self.instance_id, str(platform), str(chat_id), generation,
+                        (self.instance_id, str(platform), str(chat_id), clarify_id, generation,
                          time.time(), int(card_id)),
                     )
                     connection.commit()
@@ -319,11 +323,11 @@ class ApprovalCardLedger:
                     connection.execute(
                         """
                         UPDATE approval_recoveries SET instance_id = ?, platform = ?, chat_id = ?,
-                            message_id = NULL, generation = ?, status = 'delivering',
+                            clarify_id = ?, message_id = NULL, generation = ?, status = 'delivering',
                             response = NULL, updated_at = ?
                         WHERE card_id = ? AND status = 'failed'
                         """,
-                        (self.instance_id, str(platform), str(chat_id), generation,
+                        (self.instance_id, str(platform), str(chat_id), clarify_id, generation,
                          time.time(), int(card_id)),
                     )
                     connection.commit()
@@ -508,19 +512,27 @@ class ApprovalCardLedger:
             connection.execute("BEGIN IMMEDIATE")
             recovery_prefix = "approval-recovery-"
             if clarify_id.startswith(recovery_prefix):
-                card_token = clarify_id[len(recovery_prefix):]
-                if not card_token.isdigit() or choice_index not in (0, 1):
+                recovery_token = clarify_id[len(recovery_prefix):]
+                token_parts = recovery_token.rsplit("-", 1)
+                if (
+                    len(token_parts) != 2
+                    or not token_parts[0].isdigit()
+                    or len(token_parts[1]) != 32
+                    or any(char not in "0123456789abcdef" for char in token_parts[1])
+                    or choice_index not in (0, 1)
+                ):
                     connection.commit()
                     return None
+                card_token, generation = token_parts
                 recovery = connection.execute(
                     """
                     SELECT r.card_id, c.binding_key, c.status AS card_status,
                            r.status AS recovery_status, r.response
                     FROM approval_recoveries r
                     JOIN approval_cards c ON c.card_id = r.card_id
-                    WHERE r.card_id = ?
+                    WHERE r.card_id = ? AND r.generation = ? AND r.clarify_id = ?
                     """,
-                    (int(card_token),),
+                    (int(card_token), generation, clarify_id),
                 ).fetchone()
                 if recovery is None:
                     connection.commit()
@@ -536,9 +548,10 @@ class ApprovalCardLedger:
                 connection.execute(
                     """
                     UPDATE approval_recoveries SET status = 'answered', response = ?, updated_at = ?
-                    WHERE card_id = ? AND status IN ('delivering','active')
+                    WHERE card_id = ? AND generation = ? AND clarify_id = ?
+                      AND status IN ('delivering','active')
                     """,
-                    (response, now, int(recovery["card_id"])),
+                    (response, now, int(recovery["card_id"]), generation, clarify_id),
                 )
                 if choice_index == 1:
                     connection.commit()
