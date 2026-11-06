@@ -13,6 +13,10 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 
+RECOVERY_PREFIX = "approval-rcv-"
+LEGACY_RECOVERY_PREFIX = "approval-recovery-"
+
+
 @dataclass(frozen=True)
 class ApprovalCard:
     card_id: int
@@ -133,7 +137,7 @@ class ApprovalCardLedger:
                 )
                 connection.execute(
                     "UPDATE approval_recoveries SET clarify_id = "
-                    "'approval-recovery-' || card_id || '-' || generation"
+                    "'approval-rcv-' || card_id || '-' || generation"
                 )
         os.chmod(self.path, 0o600)
 
@@ -281,7 +285,7 @@ class ApprovalCardLedger:
         if card_id is None:
             raise ValueError("card_id is required")
         generation = secrets.token_hex(16)
-        clarify_id = f"approval-recovery-{int(card_id)}-{generation}"
+        clarify_id = f"{RECOVERY_PREFIX}{int(card_id)}-{generation}"
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             card = connection.execute(
@@ -510,30 +514,44 @@ class ApprovalCardLedger:
             return None
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            recovery_prefix = "approval-recovery-"
-            if clarify_id.startswith(recovery_prefix):
-                recovery_token = clarify_id[len(recovery_prefix):]
+            matched_prefix = next(
+                (prefix for prefix in (RECOVERY_PREFIX, LEGACY_RECOVERY_PREFIX)
+                 if clarify_id.startswith(prefix)),
+                None,
+            )
+            if matched_prefix is not None:
+                recovery_token = clarify_id[len(matched_prefix):]
                 token_parts = recovery_token.rsplit("-", 1)
-                if (
-                    len(token_parts) != 2
-                    or not token_parts[0].isdigit()
-                    or len(token_parts[1]) != 32
-                    or any(char not in "0123456789abcdef" for char in token_parts[1])
-                    or choice_index not in (0, 1)
+                generation: Optional[str]
+                if recovery_token.isdigit():
+                    card_token = recovery_token
+                    generation = None
+                elif (
+                    len(token_parts) == 2
+                    and token_parts[0].isdigit()
+                    and len(token_parts[1]) == 32
+                    and all(char in "0123456789abcdef" for char in token_parts[1])
                 ):
+                    card_token, generation = token_parts
+                else:
                     connection.commit()
                     return None
-                card_token, generation = token_parts
+                if choice_index not in (0, 1):
+                    connection.commit()
+                    return None
                 recovery = connection.execute(
                     """
-                    SELECT r.card_id, c.binding_key, c.status AS card_status,
-                           r.status AS recovery_status, r.response
+                    SELECT r.card_id, r.generation, c.binding_key,
+                           c.status AS card_status, r.status AS recovery_status, r.response
                     FROM approval_recoveries r
                     JOIN approval_cards c ON c.card_id = r.card_id
-                    WHERE r.card_id = ? AND r.generation = ? AND r.clarify_id = ?
+                    WHERE r.card_id = ? AND r.clarify_id = ?
+                      AND (? IS NULL OR r.generation = ?)
                     """,
-                    (int(card_token), generation, clarify_id),
+                    (int(card_token), clarify_id, generation, generation),
                 ).fetchone()
+                if recovery is not None:
+                    generation = str(recovery["generation"])
                 if recovery is None:
                     connection.commit()
                     return None

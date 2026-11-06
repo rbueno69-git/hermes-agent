@@ -1,4 +1,5 @@
 import multiprocessing
+import sqlite3
 from concurrent.futures import ProcessPoolExecutor
 
 from gateway.approval_card_ledger import ApprovalCardLedger
@@ -392,3 +393,51 @@ def test_expired_in_memory_wait_reuses_durable_card_instead_of_duplicating_it(tm
     assert duplicate.action == "reuse_active"
     assert duplicate.clarify_id == "clarify-expired"
     assert duplicate.message_id == "501"
+
+
+def test_predecessor_schema_active_recovery_remains_answerable_after_upgrade(tmp_path):
+    path = tmp_path / "approval-cards.db"
+    ledger = ApprovalCardLedger(path, instance_id="gateway-a")
+    old = ledger.claim(
+        _binding(), platform="telegram", chat_id="327791380",
+        clarify_id="clarify-old", session_key="session-old", choices=["Approve", "Reject"],
+    )
+    recovery_ledger = ApprovalCardLedger(path, instance_id="gateway-b")
+    recovery = recovery_ledger.claim_recovery(
+        old.card_id, platform="telegram", chat_id="327791380")
+    assert recovery_ledger.activate_recovery(
+        old.card_id, recovery.delivery_generation, "600") is True
+    legacy_id = f"approval-recovery-{old.card_id}"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE approval_recoveries SET clarify_id = ? WHERE card_id = ?",
+            (legacy_id, old.card_id),
+        )
+
+    upgraded = ApprovalCardLedger(path, instance_id="gateway-b")
+    reused = upgraded.claim_recovery(
+        old.card_id, platform="telegram", chat_id="327791380")
+
+    assert reused.action == "reuse_active"
+    assert reused.clarify_id == legacy_id
+    assert upgraded.answer_choice(legacy_id, 1) == "Manter bloqueado"
+
+
+def test_recovery_callback_data_fits_telegram_limit_after_ten_thousand_cards(tmp_path):
+    path = tmp_path / "approval-cards.db"
+    ledger = ApprovalCardLedger(path, instance_id="gateway-a")
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO sqlite_sequence(name, seq) VALUES('approval_cards', 9999)"
+        )
+    old = ledger.claim(
+        _binding(), platform="telegram", chat_id="327791380",
+        clarify_id="clarify-old", session_key="session-old", choices=["Approve", "Reject"],
+    )
+    recovery_ledger = ApprovalCardLedger(path, instance_id="gateway-b")
+    recovery = recovery_ledger.claim_recovery(
+        old.card_id, platform="telegram", chat_id="327791380")
+
+    assert old.card_id == 10000
+    callback = f"cl:{recovery.clarify_id}:other".encode("utf-8")
+    assert len(callback) <= 64

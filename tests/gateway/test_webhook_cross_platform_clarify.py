@@ -475,7 +475,7 @@ async def test_crashed_predecessor_requires_explicit_recovery_before_successor(t
 
     async def send_card(**kwargs):
         sent.append(kwargs)
-        if kwargs["clarify_id"].startswith("approval-recovery-"):
+        if kwargs["clarify_id"].startswith("approval-rcv-"):
             asyncio.get_running_loop().call_soon(
                 cm.resolve_gateway_clarify,
                 kwargs["clarify_id"],
@@ -508,7 +508,7 @@ async def test_crashed_predecessor_requires_explicit_recovery_before_successor(t
     assert result.message_id == "600"
     await asyncio.wait_for(successor_sent.wait(), timeout=3.0)
     assert len(sent) == 2
-    assert sent[0]["clarify_id"].startswith("approval-recovery-")
+    assert sent[0]["clarify_id"].startswith("approval-rcv-")
     assert sent[0]["choices"] == ["Reemitir aprovação", "Manter bloqueado"]
     assert sent[1]["clarify_id"] == "new-card"
     target.send.assert_awaited_once()
@@ -627,6 +627,7 @@ async def test_late_recovery_sender_fails_closed_when_exact_retirement_fails(
     target.send_clarify = AsyncMock(
         return_value=SendResult(success=True, message_id="stale-600"))
     target.retire_clarify = AsyncMock(return_value=False)
+    target.retire_clarify_card = AsyncMock(return_value=False)
     runner = MagicMock()
     runner._authorization_adapter.return_value = target
     adapter = object.__new__(WebhookAdapter)
@@ -646,6 +647,7 @@ async def test_late_recovery_sender_fails_closed_when_exact_retirement_fails(
     assert result.success is False
     assert result.raw_response == {"ambiguous": True}
     assert result.error == "Stale approval recovery control could not be retired"
+    target.retire_clarify_card.assert_awaited_once()
 
 
 @pytest.mark.asyncio
