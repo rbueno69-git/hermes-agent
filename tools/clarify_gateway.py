@@ -32,6 +32,11 @@ class _ClarifyEntry:
 _lock = threading.RLock()
 _entries: Dict[str, _ClarifyEntry] = {}  # clarify_id -> entry (button callbacks)
 _session_index: Dict[str, List[str]] = {}  # session_key -> [clarify_id] FIFO (text intercept, cleanup)
+_linked_entries: Dict[str, set[str]] = {}  # equivalent cross-session requests share one answer
+_resolution_cbs: Dict[str, Callable[[str], object]] = {}
+_resolution_probes: Dict[str, Callable[[], Optional[str]]] = {}
+_expiry_cbs: Dict[str, Callable[[], Optional[str]]] = {}
+_resolving: set[str] = set()
 # Per-session notify callbacks (gateway -> adapter bridge); mirrors tools.approval. Tests clear it.
 _notify_cbs: Dict[str, Callable[[_ClarifyEntry], None]] = {}
 
@@ -72,16 +77,55 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
         touch_activity_if_due = None
     deadline = None if timeout is None or float(timeout) <= 0.0 else time.monotonic() + float(timeout)
     activity_state = {"last_touch": time.monotonic(), "start": time.monotonic()}
+    timed_out = False
     while True:
         remaining = 1.0 if deadline is None else deadline - time.monotonic()
-        if remaining <= 0 or entry.event.wait(timeout=min(1.0, remaining)):
+        if remaining <= 0:
+            timed_out = True
             break
+        if entry.event.wait(timeout=min(1.0, remaining)):
+            break
+        with _lock:
+            probe = _resolution_probes.get(clarify_id)
+        if probe is not None:
+            try:
+                durable_response = probe()
+            except Exception:
+                logger.exception("Failed to probe durable clarify resolution for %s", clarify_id)
+            else:
+                if durable_response is not None:
+                    resolve_gateway_clarify(clarify_id, durable_response, persist=False)
         # Periodic activity touch so the gateway's inactivity timeout doesn't kill the agent during long
         # code execution (#10807).
         if touch_activity_if_due is not None:
             touch_activity_if_due(activity_state, "waiting for user clarify response")
+    if timed_out:
+        with _lock:
+            expire = _expiry_cbs.get(clarify_id)
+        # A durable approval must be terminal before its waiter is released.  Retry a
+        # transiently unavailable ledger instead of reopening the late-answer race.
+        while expire is not None and not entry.event.is_set():
+            try:
+                durable_response = expire()
+            except Exception:
+                logger.exception("Failed to durably expire clarify %s", clarify_id)
+                durable_response = None
+            if durable_response is not None:
+                resolve_gateway_clarify(clarify_id, durable_response, persist=False)
+                break
+            entry.event.wait(timeout=0.1)
     with _lock:
         _entries.pop(clarify_id, None)  # regardless of outcome
+        _resolution_cbs.pop(clarify_id, None)
+        _resolution_probes.pop(clarify_id, None)
+        _expiry_cbs.pop(clarify_id, None)
+        _resolving.discard(clarify_id)
+        linked = _linked_entries.pop(clarify_id, None)
+        if linked is not None:
+            linked.discard(clarify_id)
+            for linked_id in linked:
+                if _linked_entries.get(linked_id) is linked:
+                    _linked_entries[linked_id] = linked
         ids = _session_index.get(entry.session_key) or []
         if clarify_id in ids:
             ids.remove(clarify_id)
@@ -90,15 +134,87 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
     return entry.response
 
 
-def resolve_gateway_clarify(clarify_id: str, response: str) -> bool:
-    """Unblock the waiter on ``clarify_id``; False if already resolved/expired/unknown."""
+def link_equivalent(primary_id: str, duplicate_id: str) -> bool:
+    """Make two already-registered requests resolve as one cross-session decision."""
+    with _lock:
+        primary = _entries.get(primary_id)
+        duplicate = _entries.get(duplicate_id)
+        if primary is None or duplicate is None or primary.event.is_set() or duplicate.event.is_set():
+            return False
+        primary_group = _linked_entries.get(primary_id, {primary_id})
+        duplicate_group = _linked_entries.get(duplicate_id, {duplicate_id})
+        group = set(primary_group) | set(duplicate_group)
+        for clarify_id in group:
+            _linked_entries[clarify_id] = group
+        return True
+
+
+def on_resolution(clarify_id: str, callback: Callable[[str], object]) -> bool:
+    """Register a one-shot observer used to durably record a submitted decision."""
     with _lock:
         entry = _entries.get(clarify_id)
         if entry is None or entry.event.is_set():
             return False
-        entry.response = str(response) if response is not None else ""
-        entry.event.set()
+        _resolution_cbs[clarify_id] = callback
         return True
+
+
+def set_resolution_probe(clarify_id: str, probe: Callable[[], Optional[str]]) -> bool:
+    """Poll a durable authority while this process waits on a card owned elsewhere."""
+    with _lock:
+        entry = _entries.get(clarify_id)
+        if entry is None or entry.event.is_set():
+            return False
+        _resolution_probes[clarify_id] = probe
+        return True
+
+
+def set_expiry_callback(clarify_id: str, callback: Callable[[], Optional[str]]) -> bool:
+    """Install the durable timeout transition for a locally published clarify card."""
+    with _lock:
+        entry = _entries.get(clarify_id)
+        if entry is None or entry.event.is_set():
+            return False
+        _expiry_cbs[clarify_id] = callback
+        return True
+
+
+def resolve_gateway_clarify(clarify_id: str, response: str, *, persist: bool = True) -> bool:
+    """Durably record when local, then unblock every waiter linked to ``clarify_id``."""
+    with _lock:
+        entry = _entries.get(clarify_id)
+        if entry is None or entry.event.is_set():
+            return False
+        value = str(response) if response is not None else ""
+        group = set(_linked_entries.get(clarify_id, {clarify_id}))
+        if any(linked_id in _resolving for linked_id in group):
+            return False
+        callbacks = [
+            callback for linked_id in group
+            if persist and (callback := _resolution_cbs.get(linked_id)) is not None
+        ]
+        _resolving.update(group)
+    try:
+        for callback in callbacks:
+            if callback(value) is False:
+                raise RuntimeError("clarify resolution persistence rejected the response")
+    except Exception:
+        logger.exception("Failed to record clarify resolution for %s", clarify_id)
+        with _lock:
+            _resolving.difference_update(group)
+        return False
+    resolved = False
+    with _lock:
+        for linked_id in group:
+            linked = _entries.get(linked_id)
+            if linked is not None and not linked.event.is_set():
+                linked.response = value
+                linked.event.set()
+                resolved = True
+            _resolution_cbs.pop(linked_id, None)
+            _resolution_probes.pop(linked_id, None)
+        _resolving.difference_update(group)
+    return resolved or bool(callbacks)
 
 
 def get_pending_for_session(session_key: str, *, include_choice_prompts: bool = False) -> Optional[_ClarifyEntry]:
@@ -243,6 +359,13 @@ def has_pending(session_key: str) -> bool:
         return any(_entries.get(cid) is not None for cid in _session_index.get(session_key) or [])
 
 
+def is_registered(clarify_id: str) -> bool:
+    """True only while this process still owns an unresolved waiter for the id."""
+    with _lock:
+        entry = _entries.get(clarify_id)
+        return entry is not None and not entry.event.is_set()
+
+
 def clear_session(session_key: str) -> int:
     """Drop every pending clarify for a session (``/new``, shutdown, cached-agent eviction) so
     blocked agent threads don't outlive it; returns how many were cancelled. First-writer-wins: an already-set entry was answered for
@@ -254,6 +377,13 @@ def clear_session(session_key: str) -> int:
         for entry in (_entries.pop(cid, None) for cid in list(_session_index.pop(session_key, []) or [])):
             if entry is None or entry.event.is_set():
                 continue
+            linked = _linked_entries.pop(entry.clarify_id, None)
+            if linked is not None:
+                linked.discard(entry.clarify_id)
+            _resolution_cbs.pop(entry.clarify_id, None)
+            _resolution_probes.pop(entry.clarify_id, None)
+            _expiry_cbs.pop(entry.clarify_id, None)
+            _resolving.discard(entry.clarify_id)
             entry.response = CANCELLED
             entry.event.set()
             cancelled += 1

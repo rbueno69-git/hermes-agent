@@ -31,8 +31,55 @@ from gateway.platforms.base import SendResult
 from gateway.platforms.webhook import (
     WebhookAdapter,
     _INSECURE_NO_AUTH,
+    _approval_binding_from_payload,
     _is_usable_secret,
 )
+
+
+def test_declared_approval_with_malformed_binding_fails_closed():
+    payload = {
+        "contract_accepted": True,
+        "executor_binding_status": "pending_approval",
+        "item_key": "owner/repo#1",
+        "head_sha": "bad",
+        "contract_digest_sha256": "2" * 64,
+        "contract_scope": "merge",
+    }
+
+    with pytest.raises(ValueError, match="invalid approval binding"):
+        _approval_binding_from_payload(payload)
+
+    payload["contract_accepted"] = "true"
+    payload["head_sha"] = "1" * 40
+    with pytest.raises(ValueError, match="invalid approval binding state"):
+        _approval_binding_from_payload(payload)
+
+
+@pytest.mark.parametrize(
+    ("accepted", "recipient_status", "binding_status", "executor"),
+    [
+        (False, "explicit_foreign", "foreign_executor", "openclaw"),
+        (False, "invalid", "not_eligible", "openclaw"),
+        (False, "unknown", "not_eligible", "openclaw"),
+        (False, "absent", "not_eligible", "openclaw"),
+        (False, "explicit_local", "not_eligible", "openclaw"),
+        (None, "explicit_foreign", None, "openclaw"),
+    ],
+)
+def test_foreign_or_invalid_recipient_cannot_fall_through_as_non_approval(
+    accepted, recipient_status, binding_status, executor,
+):
+    payload = {
+        "recipient_status": recipient_status,
+        "executor": executor,
+    }
+    if accepted is not None:
+        payload["contract_accepted"] = accepted
+    if binding_status is not None:
+        payload["executor_binding_status"] = binding_status
+
+    with pytest.raises(ValueError, match="invalid approval binding state"):
+        _approval_binding_from_payload(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -481,6 +528,33 @@ class TestPayloadFilters:
         assert captured[0].text == "Task: PAY BILLS"
         assert captured[0].raw_message["body"] == "PAY BILLS"
 
+    @pytest.mark.asyncio
+    async def test_malformed_transformed_approval_is_rejected_before_agent_run(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        scripts = tmp_path / "scripts"
+        scripts.mkdir()
+        script = scripts / "approval_filter.py"
+        script.write_text(
+            "import json\n"
+            "print(json.dumps({'contract_accepted': True, 'executor_binding_status': 'pending_approval', "
+            "'item_key': 'owner/repo#1', 'head_sha': 'bad', "
+            "'contract_digest_sha256': '2' * 64, 'contract_scope': 'merge'}))\n",
+            encoding="utf-8",
+        )
+        adapter = _make_adapter(routes={"approval": {
+            "secret": _INSECURE_NO_AUTH, "script": "approval_filter.py", "prompt": "approval",
+        }})
+        adapter.handle_message = AsyncMock()
+
+        async with TestClient(TestServer(_create_app(adapter))) as cli:
+            resp = await cli.post(
+                "/webhooks/approval", json={"event": "pull_request"},
+                headers={"X-GitHub-Delivery": "approval-invalid-1"},
+            )
+
+        assert resp.status == 422
+        adapter.handle_message.assert_not_awaited()
+
 
 # ===================================================================
 # HTTP handling
@@ -734,6 +808,46 @@ class TestSessionIsolation:
         assert (other.source.profile, other.source.user_id) == ("other-profile", "webhook:build")
         assert [adapter._delivery_info[e.source.chat_id]["deliver_extra"]["chat_id"] for e in (high, low, other)] == [
             "high-chat", "low-chat", "other-chat"]
+
+    @pytest.mark.asyncio
+    async def test_contract_payload_attaches_canonical_approval_binding(self):
+        adapter = _make_adapter()
+        captured_events = []
+
+        async def _capture(event):
+            captured_events.append(event)
+
+        adapter.handle_message = _capture
+        payload = {
+            "item_key": "rbueno69-git/carteira-investimentos#160",
+            "head_sha": "1" * 40,
+            "contract_digest_sha256": "2" * 64,
+            "contract_scope": "Somente leitura; merge e deploy autorizados.",
+            "contract_accepted": True,
+            "executor_binding_status": "pending_approval",
+            "recipient_status": "absent",
+            "executor": "",
+        }
+        task = adapter._spawn_agent_run(
+            payload,
+            "approval prompt",
+            "delivery-160",
+            100.0,
+            route_config={"deliver": "telegram", "deliver_extra": {"chat_id": "327791380"}},
+            route_name="github-hermes-intake",
+            profile=None,
+            event_type="pull_request",
+        )
+        await task
+
+        chat_id = captured_events[0].source.chat_id
+        assert adapter._delivery_info[chat_id]["approval_binding"] == {
+            "item_key": payload["item_key"],
+            "head_sha": payload["head_sha"],
+            "contract_digest_sha256": payload["contract_digest_sha256"],
+            "scope": payload["contract_scope"],
+            "selected_executor": "hermes",
+        }
 
 
 # ===================================================================

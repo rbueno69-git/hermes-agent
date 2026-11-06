@@ -14,6 +14,7 @@ import base64
 import binascii
 import hashlib
 import hmac
+import inspect
 import json
 import logging
 import os
@@ -35,12 +36,14 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.approval_card_ledger import ApprovalCardLedger
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.platforms.tcp_site import start_tcp_site
 from gateway.platforms.webhook_coalesce import WebhookCoalescer, validate_coalesce_config
 from gateway.platforms.webhook_filters import DEFAULT_SCRIPT_TIMEOUT_SECONDS, WebhookRouteProcessor
 from gateway.response_filters import is_autonomous_silence_response
+from hermes_constants import get_hermes_home, get_process_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +72,56 @@ _TEMPLATE_KEY_RE = re.compile(r"\{([a-zA-Z0-9_.]+)\}")
 _REPO_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
 # Credentials `gh` reads; a routed profile's github_comment must use its own, never the process env's.
 _GH_TOKEN_VARS = ("GH_TOKEN", "GITHUB_TOKEN")
+_APPROVAL_ITEM_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[1-9][0-9]*$")
+_HEX_40_RE = re.compile(r"^[0-9a-f]{40}$")
+_HEX_64_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _approval_binding_from_payload(payload: Any) -> Optional[Dict[str, str]]:
+    """Return the canonical approval identity emitted by the trusted intake transform."""
+    if not isinstance(payload, dict):
+        return None
+    accepted = payload.get("contract_accepted")
+    binding_status = payload.get("executor_binding_status")
+    recipient_status = payload.get("recipient_status")
+    declared_executor = payload.get("executor")
+    if not any(key in payload for key in ("contract_accepted", "executor_binding_status", "recipient_status")):
+        return None
+    if accepted is False and binding_status == "not_eligible":
+        if recipient_status == "absent" and declared_executor == "":
+            return None
+        if recipient_status == "explicit_local" and declared_executor == "hermes":
+            return None
+        raise ValueError("invalid approval binding state")
+    if accepted is not True or binding_status != "pending_approval":
+        raise ValueError("invalid approval binding state")
+    item_key = payload.get("item_key")
+    head_sha = payload.get("head_sha")
+    digest = payload.get("contract_digest_sha256")
+    scope = payload.get("contract_scope")
+    if not isinstance(item_key, str) or not _APPROVAL_ITEM_RE.fullmatch(item_key):
+        raise ValueError("invalid approval binding item_key")
+    if not isinstance(head_sha, str) or not _HEX_40_RE.fullmatch(head_sha):
+        raise ValueError("invalid approval binding head_sha")
+    if not isinstance(digest, str) or not _HEX_64_RE.fullmatch(digest):
+        raise ValueError("invalid approval binding contract_digest_sha256")
+    if not isinstance(scope, str) or not scope or len(scope) > 4000:
+        raise ValueError("invalid approval binding contract_scope")
+    if recipient_status == "absent":
+        if declared_executor != "":
+            raise ValueError("unassigned approval binding cannot declare an executor")
+    elif recipient_status == "explicit_local":
+        if declared_executor != "hermes":
+            raise ValueError("local approval binding must declare hermes")
+    else:
+        raise ValueError("invalid recipient status for local approval binding")
+    return {
+        "item_key": item_key,
+        "head_sha": head_sha,
+        "contract_digest_sha256": digest,
+        "scope": scope,
+        "selected_executor": "hermes",
+    }
 
 
 @dataclass(frozen=True)
@@ -221,6 +274,11 @@ class WebhookAdapter(BasePlatformAdapter):
         self._delivery_info_created: Dict[str, float] = {}
         self._delivery_info_order: Deque[tuple[float, str]] = deque()
         self.gateway_runner = None  # set externally; needed for cross-platform delivery
+        # Canonical contract binding -> the one native card published by this Gateway process.
+        # The lock spans the send so sibling webhook sessions cannot both pass the empty check.
+        self._approval_prompt_lock = asyncio.Lock()
+        self._approval_instance_id = uuid.uuid4().hex
+        self._approval_ledgers: Dict[str, ApprovalCardLedger] = {}
         # Idempotency is scoped to the authenticated route and routed profile: provider delivery
         # IDs are not globally unique across unrelated webhook endpoints.
         self._seen_deliveries: Dict[_WebhookDeliveryIdentity, float] = {}
@@ -235,6 +293,90 @@ class WebhookAdapter(BasePlatformAdapter):
         self._coalescer = WebhookCoalescer(dispatch=self._spawn_agent_run, render=self._render_prompt)
 
     # --- Lifecycle ---
+
+    def _approval_ledger(self) -> ApprovalCardLedger:
+        home = get_process_hermes_home()
+        ledger_path = str(home / "approval_cards.db")
+        ledger = self._approval_ledgers.get(ledger_path)
+        if ledger is None:
+            ledger = self._approval_ledgers[ledger_path] = ApprovalCardLedger(
+                home / "approval_cards.db", instance_id=self._approval_instance_id)
+        return ledger
+
+    def _hydrate_approval_delivery_info(self) -> None:
+        """Restore webhook routing needed by interrupted approval turns after restart."""
+        now = time.time()
+        for context in self._approval_ledger().recoverable_delivery_contexts(now=now):
+            session_chat_id = context.get("session_chat_id")
+            delivery = context.get("delivery")
+            if not isinstance(session_chat_id, str) or not session_chat_id or type(delivery) is not dict:
+                continue
+            self._delivery_info[session_chat_id] = delivery
+            self._delivery_info_created[session_chat_id] = now
+            self._delivery_info_order.append((now, session_chat_id))
+
+    async def _drain_approval_recovery_continuations_once(self) -> None:
+        from tools.clarify_gateway import clear_session, is_registered, register
+
+        ledger = self._approval_ledger()
+        for claimed in ledger.claim_answered_recovery_continuations():
+            context = claimed["context"]
+            response = claimed["response"]
+            if response != "Reemitir aprovação":
+                ledger.complete_recovery_continuation(
+                    claimed["card_id"], claimed["generation"], claimed["claim_id"])
+                continue
+            question = context.get("question")
+            choices = context.get("choices")
+            clarify_id = context.get("clarify_id")
+            session_key = context.get("session_key")
+            session_chat_id = context.get("session_chat_id")
+            valid = (
+                isinstance(question, str) and bool(question)
+                and type(choices) is list and bool(choices)
+                and all(isinstance(choice, str) and choice for choice in choices)
+                and isinstance(clarify_id, str) and bool(clarify_id)
+                and isinstance(session_key, str) and bool(session_key)
+                and isinstance(session_chat_id, str) and bool(session_chat_id)
+            )
+            if not valid or is_registered(clarify_id):
+                ledger.release_recovery_continuation_claim(
+                    claimed["card_id"], claimed["generation"], claimed["claim_id"])
+                continue
+            register(clarify_id, session_key, question, choices)
+            try:
+                result = await self.send_clarify(
+                    chat_id=session_chat_id,
+                    question=question,
+                    choices=choices,
+                    clarify_id=clarify_id,
+                    session_key=session_key,
+                )
+            except Exception:
+                logger.exception("Durable approval recovery continuation failed for %s", clarify_id)
+                clear_session(session_key)
+                ledger.release_recovery_continuation_claim(
+                    claimed["card_id"], claimed["generation"], claimed["claim_id"])
+                continue
+            ambiguous = (
+                isinstance(result.raw_response, dict)
+                and result.raw_response.get("ambiguous") is True
+            )
+            if result.success or ambiguous:
+                ledger.complete_recovery_continuation(
+                    claimed["card_id"], claimed["generation"], claimed["claim_id"])
+            else:
+                clear_session(session_key)
+                ledger.release_recovery_continuation_claim(
+                    claimed["card_id"], claimed["generation"], claimed["claim_id"])
+
+    async def _approval_recovery_continuation_worker(self) -> None:
+        while self._runner is not None:
+            try:
+                await self._drain_approval_recovery_continuations_once()
+            except Exception:
+                logger.exception("Durable approval recovery worker failed")
+            await asyncio.sleep(1.0)
 
     def _validate_route(self, name: str, route: dict) -> None:
         """Startup validation: secret required; INSECURE_NO_AUTH only on loopback (crash early on a public footgun)."""
@@ -260,6 +402,7 @@ class WebhookAdapter(BasePlatformAdapter):
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         self._reload_dynamic_routes()
+        self._hydrate_approval_delivery_info()
         for name, route in self._routes.items():
             self._validate_route(name, route)
         # client_max_size enforces the cap on every read path, including chunked bodies without
@@ -287,9 +430,19 @@ class WebhookAdapter(BasePlatformAdapter):
         logger.info("[webhook] Listening on %s:%d — routes: %s", self._host or "* (all interfaces, IPv4+IPv6)",
                     self._port, ", ".join(self._routes.keys()) or "(none configured)")
         self._wire_plugin_handlers(None)
+        continuation_task = getattr(self, "_approval_continuation_worker_task", None)
+        if continuation_task is None or continuation_task.done():
+            self._approval_continuation_worker_task = asyncio.create_task(
+                self._approval_recovery_continuation_worker())
         return True
 
     async def disconnect(self) -> None:
+        continuation_task = getattr(self, "_approval_continuation_worker_task", None)
+        if continuation_task is not None and not continuation_task.done():
+            continuation_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await continuation_task
+        self._approval_continuation_worker_task = None
         await self._coalescer.flush()  # buffered events are dispatched, not dropped, on shutdown/reconnect
         if self._runner:
             await self._runner.cleanup()
@@ -318,6 +471,491 @@ class WebhookAdapter(BasePlatformAdapter):
             return await self._deliver_cross_platform(deliver_type, content, delivery)
         logger.warning("[webhook] Unknown deliver type: %s", deliver_type)
         return SendResult(success=False, error=f"Unknown deliver type: {deliver_type}")
+
+    async def send_clarify(
+        self, chat_id: str, question: str, choices: Optional[list], clarify_id: str,
+        session_key: str, metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Render a webhook-run clarify on its real cross-platform destination.
+
+        Calling ``BasePlatformAdapter.send_clarify`` here sends a numbered text prompt through
+        ``send()`` but leaves the waiter bound to the opaque webhook session. A reply arriving on
+        Telegram/Slack belongs to a different session and can never resolve that waiter, producing
+        endless ``Working … clarify`` heartbeats. Delegate to the destination adapter instead so
+        native button callbacks resolve the original global ``clarify_id``.
+        """
+        delivery = self._delivery_info.get(chat_id, {})
+        deliver_type = delivery.get("deliver", "log")
+        if deliver_type == "log" or deliver_type == "github_comment":
+            return SendResult(success=False, error="Webhook clarify has no interactive destination")
+        if not self.gateway_runner or not _is_known_platform(deliver_type):
+            return SendResult(success=False, error=f"Interactive destination unavailable: {deliver_type}")
+        try:
+            target_platform = Platform(deliver_type)
+        except ValueError:
+            return SendResult(success=False, error=f"Unknown platform: {deliver_type}")
+        profile = delivery.get("profile")
+        if not (adapter := self._find_adapter(target_platform, profile)):
+            return SendResult(success=False, error=f"Platform {deliver_type} not connected")
+        extra = delivery.get("deliver_extra", {})
+        target_chat_id = extra.get("chat_id", "")
+        with self._profile_scope(profile):
+            if not target_chat_id:
+                home = self._delivery_config(profile).get_home_channel(target_platform)
+                if not home:
+                    return SendResult(success=False, error=f"No chat_id or home channel for {deliver_type}")
+                target_chat_id = home.chat_id
+            thread_id = extra.get("message_thread_id") or extra.get("thread_id")
+            target_metadata = dict(metadata or {})
+            if thread_id:
+                target_metadata["thread_id"] = thread_id
+            binding = delivery.get("approval_binding")
+            if isinstance(binding, dict):
+                if (
+                    type(choices) is not list
+                    or not choices
+                    or any(type(choice) is not str or not choice for choice in choices)
+                ):
+                    return SendResult(
+                        success=False,
+                        error="Approval prompt requires closed choices",
+                        raw_response={"approval_policy_rejected": True},
+                    )
+                target_metadata["is_approval_prompt"] = True
+                decision_semantics = {
+                    "executor": binding.get("selected_executor"),
+                    "action_type": "approval",
+                    "item_key": binding.get("item_key"),
+                    "question": question,
+                    "choices": list(choices or []),
+                }
+                decision_bytes = json.dumps(
+                    decision_semantics,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                binding = {
+                    **binding,
+                    "decision_digest_sha256": hashlib.sha256(decision_bytes).hexdigest(),
+                }
+            if not isinstance(binding, dict):
+                result = await adapter.send_clarify(
+                    chat_id=str(target_chat_id), question=question, choices=choices,
+                    clarify_id=clarify_id, session_key=session_key,
+                    metadata=target_metadata or None,
+                )
+                if result.success:
+                    if not hasattr(self, "_clarify_delegates"):
+                        self._clarify_delegates = {}
+                    self._clarify_delegates[clarify_id] = (
+                        adapter, clarify_id, None, str(target_chat_id), result.message_id)
+                return result
+            if not hasattr(self, "_approval_prompt_lock"):
+                self._approval_prompt_lock = asyncio.Lock()
+                self._approval_instance_id = uuid.uuid4().hex
+                self._approval_ledgers = {}
+            async with self._approval_prompt_lock:
+                ledger = self._approval_ledger()
+                from tools.clarify_gateway import (
+                    CANCELLED,
+                    clear_session,
+                    get_clarify_timeout,
+                    is_registered,
+                    link_equivalent,
+                    on_resolution,
+                    register,
+                    resolve_gateway_clarify,
+                    set_expiry_callback,
+                    set_resolution_probe,
+                    wait_for_response,
+                )
+                approval_timeout = float(get_clarify_timeout())
+                approval_expires_at = (
+                    time.time() + approval_timeout if approval_timeout > 0 else None
+                )
+                claim = ledger.claim(
+                    binding, platform=deliver_type, chat_id=str(target_chat_id),
+                    clarify_id=clarify_id, session_key=session_key, choices=choices,
+                    is_active=is_registered, expires_at=approval_expires_at)
+
+                def _probe_resolution() -> Optional[str]:
+                    observation = ledger.observe(claim.binding_key)
+                    if observation.status == "answered":
+                        return observation.response or ""
+                    if observation.status in ("superseded", "failed"):
+                        return CANCELLED
+                    return None
+
+                if not set_resolution_probe(clarify_id, _probe_resolution):
+                    if claim.action == "send":
+                        ledger.fail(claim.card_id)
+                    return SendResult(success=False, error="Approval waiter expired before delivery")
+                if claim.action == "superseded":
+                    resolve_gateway_clarify(clarify_id, CANCELLED, persist=False)
+                    return SendResult(success=True)
+                while (
+                    claim.action == "wait_predecessor"
+                    or (
+                        claim.action == "reuse_active"
+                        and claim.message_id is None
+                        and claim.owner_instance_id != self._approval_instance_id
+                    )
+                ):
+                    if claim.owner_instance_id != self._approval_instance_id:
+                        recovery_timeout = float(get_clarify_timeout())
+                        recovery_expires_at = (
+                            time.time() + recovery_timeout if recovery_timeout > 0 else None
+                        )
+                        recovery_continuation = {
+                            "session_chat_id": chat_id,
+                            "delivery": delivery,
+                            "question": question,
+                            "choices": list(choices or []),
+                            "clarify_id": clarify_id,
+                            "session_key": session_key,
+                        }
+                        try:
+                            recovery_claim = ledger.claim_recovery(
+                                claim.card_id,
+                                platform=deliver_type,
+                                chat_id=str(target_chat_id),
+                                continuation=recovery_continuation,
+                                expires_at=recovery_expires_at,
+                            )
+                        except ValueError:
+                            claim = ledger.claim(
+                                binding, platform=deliver_type, chat_id=str(target_chat_id),
+                                clarify_id=clarify_id, session_key=session_key, choices=choices,
+                                is_active=is_registered, expires_at=approval_expires_at)
+                            continue
+                        if recovery_claim.action == "expired":
+                            resolve_gateway_clarify(clarify_id, CANCELLED, persist=False)
+                            return SendResult(
+                                success=False,
+                                error="Approval delivery recovery expired and remains blocked",
+                                raw_response={"ambiguous": True},
+                            )
+                        recovery_id = recovery_claim.clarify_id or f"approval-recovery-{claim.card_id}"
+                        recovery_session = f"{session_key}:delivery-recovery:{claim.card_id}"
+                        recovery_choices = ["Reemitir aprovação", "Manter bloqueado"]
+                        register(
+                            recovery_id,
+                            recovery_session,
+                            "A entrega anterior ficou sem confirmação após reinício. Reemitir a aprovação?",
+                            recovery_choices,
+                        )
+
+                        def _probe_recovery() -> Optional[str]:
+                            observation = ledger.observe_recovery(claim.card_id)
+                            if observation.status == "answered":
+                                return observation.response or ""
+                            if observation.status == "failed":
+                                return CANCELLED
+                            return None
+
+                        set_resolution_probe(recovery_id, _probe_recovery)
+
+                        def _expire_recovery() -> Optional[str]:
+                            ledger.expire_recovery(
+                                claim.card_id,
+                                recovery_claim.delivery_generation,
+                                now=time.time(),
+                            )
+                            observation = ledger.observe_recovery(claim.card_id)
+                            if observation.status == "answered":
+                                return observation.response or ""
+                            if observation.status == "failed":
+                                return CANCELLED
+                            return None
+
+                        if not set_expiry_callback(recovery_id, _expire_recovery):
+                            ledger.fail_recovery(
+                                claim.card_id, recovery_claim.delivery_generation,
+                            )
+                            clear_session(recovery_session)
+                            resolve_gateway_clarify(clarify_id, CANCELLED, persist=False)
+                            return SendResult(
+                                success=False,
+                                error="Approval recovery expiry could not be registered",
+                                raw_response={"ambiguous": True},
+                            )
+
+                        def _record_recovery(response: str) -> bool:
+                            try:
+                                choice_index = recovery_choices.index(response)
+                            except ValueError:
+                                return False
+                            return ledger.answer_choice(recovery_id, choice_index) is not None
+
+                        if not on_resolution(recovery_id, _record_recovery):
+                            clear_session(recovery_session)
+                            resolve_gateway_clarify(clarify_id, CANCELLED, persist=False)
+                            return SendResult(
+                                success=False,
+                                error="Approval recovery waiter could not be registered",
+                                raw_response={"ambiguous": True},
+                            )
+                        if recovery_claim.action == "reuse_answered":
+                            resolve_gateway_clarify(
+                                recovery_id, recovery_claim.response or "", persist=False)
+                            recovery_result = SendResult(
+                                success=True, message_id=recovery_claim.message_id)
+                        elif recovery_claim.action == "reuse_active":
+                            recovery_result = SendResult(
+                                success=True, message_id=recovery_claim.message_id)
+                        else:
+                            recovery_metadata = dict(target_metadata)
+                            recovery_metadata["is_approval_prompt"] = False
+                            recovery_result = await adapter.send_clarify(
+                                chat_id=str(target_chat_id),
+                                question=(
+                                    "A entrega anterior ficou sem confirmação após reinício. "
+                                    "Reemitir a aprovação?"
+                                ),
+                                choices=recovery_choices,
+                                clarify_id=recovery_id,
+                                session_key=recovery_session,
+                                metadata=recovery_metadata or None,
+                            )
+                            if not recovery_result.success or not recovery_result.message_id:
+                                recovery_ambiguous = (
+                                    isinstance(recovery_result.raw_response, dict)
+                                    and recovery_result.raw_response.get("ambiguous") is True
+                                )
+                                if not recovery_ambiguous:
+                                    ledger.fail_recovery(
+                                        claim.card_id, recovery_claim.delivery_generation,
+                                    )
+                                    clear_session(recovery_session)
+                                    resolve_gateway_clarify(clarify_id, CANCELLED, persist=False)
+                                    error = (
+                                        "Approval recovery delivery returned no message_id"
+                                        if recovery_result.success
+                                        else "Approval recovery control could not be delivered"
+                                    )
+                                    return SendResult(
+                                        success=False,
+                                        error=error,
+                                        raw_response={"ambiguous": True},
+                                    )
+                            else:
+                                recovery_activated = ledger.activate_recovery(
+                                    claim.card_id,
+                                    recovery_claim.delivery_generation,
+                                    recovery_result.message_id,
+                                )
+                                if not recovery_activated:
+                                    clear_session(recovery_session)
+                                    resolve_gateway_clarify(recovery_id, CANCELLED, persist=False)
+                                    retired = False
+                                    retire_exact = getattr(adapter, "retire_clarify", None)
+                                    if inspect.iscoroutinefunction(retire_exact):
+                                        try:
+                                            retired = bool(await retire_exact(
+                                                chat_id=str(target_chat_id),
+                                                message_id=recovery_result.message_id,
+                                                reason="superseded",
+                                            ))
+                                        except Exception:
+                                            logger.exception(
+                                                "Failed exact retirement for stale approval recovery %s",
+                                                recovery_id,
+                                            )
+                                    if not retired:
+                                        retire_card = getattr(adapter, "retire_clarify_card", None)
+                                        if inspect.iscoroutinefunction(retire_card):
+                                            try:
+                                                retired = bool(await retire_card(
+                                                    recovery_id,
+                                                    "This recovery control was superseded by a newer delivery.",
+                                                ))
+                                            except Exception:
+                                                logger.exception(
+                                                    "Failed ID retirement for stale approval recovery %s",
+                                                    recovery_id,
+                                                )
+                                    if not retired:
+                                        return SendResult(
+                                            success=False,
+                                            error="Stale approval recovery control could not be retired",
+                                            raw_response={"ambiguous": True},
+                                        )
+                                    return recovery_result
+                        task = asyncio.create_task(self._resume_after_approval_recovery(
+                            adapter=adapter,
+                            recovery_id=recovery_id,
+                            recovery_choices=recovery_choices,
+                            original_chat_id=chat_id,
+                            target_chat_id=str(target_chat_id),
+                            question=question,
+                            choices=choices,
+                            clarify_id=clarify_id,
+                            session_key=session_key,
+                            metadata=metadata,
+                            timeout=(
+                                0.0 if recovery_claim.expires_at is None
+                                else max(0.001, recovery_claim.expires_at - time.time())
+                            ),
+                            wait_for_response=wait_for_response,
+                            resolve_gateway_clarify=resolve_gateway_clarify,
+                            cancelled=CANCELLED,
+                        ))
+                        if not hasattr(self, "_approval_recovery_tasks"):
+                            self._approval_recovery_tasks = set()
+                        self._approval_recovery_tasks.add(task)
+                        task.add_done_callback(self._approval_recovery_tasks.discard)
+                        return recovery_result
+                    # A live local publisher is still closing the send/activate gap.
+                    await asyncio.sleep(0.1)
+                    if not is_registered(clarify_id):
+                        return SendResult(
+                            success=False,
+                            error="Approval waiter ended while predecessor delivery was unsettled",
+                            raw_response={"ambiguous": True},
+                        )
+                    claim = ledger.claim(
+                        binding, platform=deliver_type, chat_id=str(target_chat_id),
+                        clarify_id=clarify_id, session_key=session_key, choices=choices,
+                        is_active=is_registered, expires_at=approval_expires_at)
+                if claim.action == "reuse_answered":
+                    resolve_gateway_clarify(clarify_id, claim.response or "")
+                    return SendResult(success=True, message_id=claim.message_id)
+                if claim.action == "reuse_active":
+                    link_equivalent(claim.clarify_id or "", clarify_id)
+                    return SendResult(success=True, message_id=claim.message_id)
+
+                def _expire_resolution() -> Optional[str]:
+                    ledger.fail_clarify(clarify_id)
+                    observation = ledger.observe(claim.binding_key)
+                    if observation.status == "answered":
+                        return observation.response or ""
+                    if observation.status in ("superseded", "failed"):
+                        return CANCELLED
+                    return None
+
+                if not set_expiry_callback(clarify_id, _expire_resolution):
+                    ledger.fail(claim.card_id)
+                    return SendResult(success=False, error="Approval waiter expired before delivery")
+                def _record_resolution(response: str) -> bool:
+                    return ledger.answer(clarify_id, response)
+                if not on_resolution(clarify_id, _record_resolution):
+                    ledger.fail(claim.card_id)
+                    return SendResult(success=False, error="Approval waiter expired before delivery")
+                for old_card in claim.superseded:
+                    resolve_gateway_clarify(old_card.clarify_id, CANCELLED)
+                    retired = False
+                    if old_card.message_id and callable(getattr(adapter, "retire_clarify", None)):
+                        retired = bool(await adapter.retire_clarify(
+                            chat_id=old_card.chat_id, message_id=old_card.message_id,
+                            reason="superseded"))
+                    if not retired:
+                        await adapter.send(
+                            old_card.chat_id,
+                            "⚠️ Solicitação de aprovação anterior cancelada/substituída. Use somente a mensagem mais recente.")
+                result = await adapter.send_clarify(
+                    chat_id=str(target_chat_id), question=question, choices=choices,
+                    clarify_id=clarify_id, session_key=session_key,
+                    metadata=target_metadata or None,
+                )
+                if result.success and result.message_id:
+                    activated = ledger.activate(claim.card_id, result.message_id)
+                    if not activated:
+                        # The waiter expired while the remote send was in flight.  The
+                        # backend already rejects this terminal card; retire its newly
+                        # learned coordinates immediately and report a sent outcome so
+                        # the generic layer cannot publish a text fallback.
+                        retired = False
+                        retire_by_coordinates = getattr(adapter, "retire_clarify", None)
+                        if callable(retire_by_coordinates):
+                            retirement = retire_by_coordinates(
+                                chat_id=str(target_chat_id), message_id=result.message_id,
+                                reason="expired")
+                            if inspect.isawaitable(retirement):
+                                retirement = await retirement
+                            retired = bool(retirement)
+                        if not retired:
+                            retire_card = getattr(adapter, "retire_clarify_card", None)
+                            if callable(retire_card):
+                                retirement = retire_card(
+                                    clarify_id,
+                                    "⚠️ Solicitação de aprovação expirada/cancelada.",
+                                )
+                                if inspect.isawaitable(retirement):
+                                    await retirement
+                        return result
+                    if not hasattr(self, "_clarify_delegates"):
+                        self._clarify_delegates = {}
+                    self._clarify_delegates[clarify_id] = (
+                        adapter, clarify_id, ledger, str(target_chat_id), result.message_id)
+                else:
+                    # Keep the binding pending: the generic clarify layer may deliver its
+                    # numbered plain-text fallback, whose response must still persist through
+                    # the same resolution callback. Timeout retirement will fail this card.
+                    if result.success:
+                        return SendResult(success=False, error="Approval card delivery returned no message_id")
+                return result
+
+    async def _resume_after_approval_recovery(
+        self, *, adapter, recovery_id: str, recovery_choices: List[str],
+        original_chat_id: str, target_chat_id: str, question: str,
+        choices: Optional[list], clarify_id: str, session_key: str,
+        metadata: Optional[Dict[str, Any]], timeout: float,
+        wait_for_response, resolve_gateway_clarify, cancelled: str,
+    ) -> None:
+        """Continue a withheld approval only after an explicit delivery-recovery choice."""
+        try:
+            response = await asyncio.to_thread(
+                wait_for_response, recovery_id, timeout=timeout)
+            if response != recovery_choices[0]:
+                resolve_gateway_clarify(clarify_id, cancelled, persist=False)
+                return
+            retire = getattr(adapter, "retire_clarify_card", None)
+            if callable(retire):
+                retirement = retire(
+                    recovery_id,
+                    "⚠️ Recuperação confirmada; o pedido anterior foi invalidado.",
+                )
+                if inspect.isawaitable(retirement):
+                    await retirement
+            await adapter.send(
+                target_chat_id,
+                "⚠️ A tentativa anterior de aprovação foi invalidada. Use somente o novo pedido.",
+            )
+            from tools.clarify_gateway import is_registered
+            if not is_registered(clarify_id):
+                return
+            await self.send_clarify(
+                chat_id=original_chat_id,
+                question=question,
+                choices=choices,
+                clarify_id=clarify_id,
+                session_key=session_key,
+                metadata=metadata,
+            )
+        except Exception:
+            logger.exception("Approval delivery recovery failed for %s", clarify_id)
+            resolve_gateway_clarify(clarify_id, cancelled, persist=False)
+
+    async def retire_clarify_card(self, clarify_id: str, notice: str) -> None:
+        """Forward timeout/cancellation retirement to the adapter that rendered the card."""
+        delegates = getattr(self, "_clarify_delegates", {})
+        delegated = delegates.pop(clarify_id, None)
+        if delegated is None:
+            return
+        adapter, delegated_id, ledger, chat_id, message_id = delegated
+        if ledger is not None and not ledger.fail_clarify(delegated_id):
+            observation = ledger.observe_clarify(delegated_id)
+            if observation.status not in ("failed", "superseded"):
+                return
+        retire = getattr(adapter, "retire_clarify_card", None)
+        if callable(retire):
+            retired = await retire(delegated_id, notice)
+            if retired is True:
+                return
+        retire_by_coordinates = getattr(adapter, "retire_clarify", None)
+        if message_id and asyncio.iscoroutinefunction(retire_by_coordinates):
+            await retire_by_coordinates(chat_id=chat_id, message_id=message_id, reason="expired")
 
     def _prune_delivery_info(self, now: float) -> None:
         """Drop delivery_info entries older than the idempotency TTL (bounds the dict by ``rate_limit * TTL``
@@ -673,6 +1311,11 @@ class WebhookAdapter(BasePlatformAdapter):
                     logger.info("[webhook] script ignored event=%s route=%s", event_type, route_name)
                     return web.json_response({"status": "ignored", "reason": "script", "route": route_name})
                 payload = transformed_payload or payload
+            try:
+                _approval_binding_from_payload(payload)
+            except ValueError as exc:
+                logger.warning("[webhook] Rejected malformed approval payload on route %s: %s", route_name, exc)
+                return _json_error("Invalid approval binding", 422)
             prompt = self._render_prompt(route_config.get("prompt", ""), payload, event_type, route_name)
             # cron_job routes: the job's own skills apply; the rendered prompt is only per-run context.
             if (skills := route_config.get("skills", [])) and not route_config.get("cron_job"):
@@ -720,6 +1363,8 @@ class WebhookAdapter(BasePlatformAdapter):
             "deliver_extra": self._render_delivery_extra(route_config.get("deliver_extra", {}), payload),
             "route": route_name,
             "mirror": route_config.get("mirror_to_session") is True}
+        if approval_binding := _approval_binding_from_payload(payload):
+            self._delivery_info[session_chat_id]["approval_binding"] = approval_binding
         self._delivery_info_created[session_chat_id] = now
         self._delivery_info_order.append((now, session_chat_id))
         self._prune_delivery_info(now)

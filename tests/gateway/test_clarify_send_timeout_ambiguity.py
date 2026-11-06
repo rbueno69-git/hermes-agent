@@ -22,9 +22,10 @@ from gateway.run_turn_runner_clarify_delivery import _clarify_send_disposition, 
 SENTINEL = "[clarify prompt could not be delivered]"
 
 class _Result:
-    def __init__(self, success, error=None):
+    def __init__(self, success, error=None, raw_response=None):
         self.success = success
         self.error = error
+        self.raw_response = raw_response
 
 def test_timeout_keeps_registration_armed_and_proceeds_to_wait():
     fut = MagicMock()
@@ -125,6 +126,27 @@ def test_definitive_failure_never_waits():
         )
         == (SENTINEL, False)
     )
+    clarify_mod.wait_for_response.assert_not_called()
+    clarify_mod.clear_session.assert_called_once_with("sk")
+
+
+def test_approval_policy_rejection_never_uses_plaintext_fallback():
+    fut = MagicMock()
+    fut.result.return_value = _Result(
+        False,
+        "Approval prompt requires closed choices",
+        {"approval_policy_rejected": True},
+    )
+    clarify_mod = MagicMock()
+    fallback = MagicMock()
+
+    response = _clarify_send_then_wait(
+        fut, clarify_id="cid123", session_key="sk", clarify_mod=clarify_mod,
+        fallback=fallback,
+    )
+
+    assert response == ("[clarify prompt rejected by approval policy]", False)
+    fallback.assert_not_called()
     clarify_mod.wait_for_response.assert_not_called()
     clarify_mod.clear_session.assert_called_once_with("sk")
 

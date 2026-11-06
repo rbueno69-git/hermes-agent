@@ -4,6 +4,7 @@ Mirrors test_telegram_approval_buttons.py for the new ``send_clarify`` and
 ``cl:`` callback dispatch added in feat/clarify-gateway-buttons.
 """
 
+import asyncio
 import os
 import sys
 from pathlib import Path
@@ -37,23 +38,116 @@ def _make_adapter(extra=None):
     return adapter
 
 
+@pytest.mark.asyncio
+async def test_retire_clarify_falls_back_to_non_actionable_edit_when_delete_fails():
+    adapter = _make_adapter()
+    adapter._bot.delete_message = AsyncMock(side_effect=RuntimeError("delete window elapsed"))
+    adapter._bot.edit_message_text = AsyncMock(return_value=True)
+
+    retired = await adapter.retire_clarify(chat_id="12345", message_id="100", reason="superseded")
+
+    assert retired is True
+    kwargs = adapter._bot.edit_message_text.await_args.kwargs
+    assert kwargs["chat_id"] == 12345
+    assert kwargs["message_id"] == 100
+    assert kwargs["reply_markup"] is None
+    assert "substituída" in kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_timeout_retirement_uses_persisted_card_coordinates():
+    adapter = _make_adapter()
+    mock_msg = MagicMock()
+    mock_msg.message_id = 100
+    adapter._bot.send_message = AsyncMock(return_value=mock_msg)
+    adapter._bot.edit_message_text = AsyncMock(return_value=True)
+
+    await adapter.send_clarify(
+        chat_id="12345", question="Approve?", choices=["Approve", "Reject"],
+        clarify_id="clarify-timeout", session_key="session-timeout",
+    )
+    await adapter.retire_clarify_card("clarify-timeout", "This approval request expired.")
+
+    kwargs = adapter._bot.edit_message_text.await_args.kwargs
+    assert kwargs == {
+        "chat_id": 12345,
+        "message_id": 100,
+        "text": "This approval request expired.",
+        "reply_markup": None,
+    }
+    assert "clarify-timeout" not in adapter._clarify_state
+
+
 def _clear_clarify_state():
     from tools import clarify_gateway as cm
     with cm._lock:
         cm._entries.clear()
         cm._session_index.clear()
         cm._notify_cbs.clear()
+        cm._linked_entries.clear()
+        cm._resolution_cbs.clear()
+        cm._resolution_probes.clear()
+        if hasattr(cm, "_expiry_cbs"):
+            cm._expiry_cbs.clear()
+        cm._resolving.clear()
 
 
 # ===========================================================================
 # send_clarify — render
 # ===========================================================================
 
+def test_timeout_classifier_traverses_cause_and_context_branches():
+    from plugins.platforms.telegram.adapter import _is_ambiguous_telegram_timeout
+
+    class ReadTimeout(Exception):
+        pass
+
+    outer = RuntimeError("outer")
+    outer.__cause__ = ValueError("non-timeout cause")
+    outer.__context__ = ReadTimeout("late read acknowledgement")
+
+    assert _is_ambiguous_telegram_timeout(outer) is True
+
+
 class TestTelegramSendClarify:
     """Verify the rendered prompt has buttons or none, and stores state."""
 
     def setup_method(self):
         _clear_clarify_state()
+
+    @pytest.mark.asyncio
+    async def test_timeout_after_possible_remote_commit_is_ambiguous(self):
+        adapter = _make_adapter()
+        adapter._send_control_message = AsyncMock(side_effect=asyncio.TimeoutError("late ack"))
+
+        result = await adapter.send_clarify(
+            chat_id="12345",
+            question="Approve?",
+            choices=["Approve", "Reject"],
+            clarify_id="cid-timeout",
+            session_key="sk-timeout",
+        )
+
+        assert result.success is False
+        assert result.raw_response == {"ambiguous": True}
+
+    @pytest.mark.asyncio
+    async def test_python_telegram_bot_timeout_after_dispatch_is_ambiguous(self):
+        from telegram.error import TimedOut
+
+        adapter = _make_adapter()
+        adapter._send_control_message = AsyncMock(side_effect=TimedOut("late ack"))
+
+        result = await adapter.send_clarify(
+            chat_id="12345",
+            question="Approve?",
+            choices=["Approve", "Reject"],
+            clarify_id="cid-ptb-timeout",
+            session_key="sk-ptb-timeout",
+        )
+
+        assert result.success is False
+        assert result.raw_response == {"ambiguous": True}
 
     @pytest.mark.asyncio
     async def test_multi_choice_renders_buttons_and_other(self):
@@ -92,6 +186,36 @@ class TestTelegramSendClarify:
         # The button label should be short ("1"), not the long choice
         # (we can't inspect mock button labels directly, but the send
         # succeeded — old truncation code could raise on edge cases)
+
+    @pytest.mark.asyncio
+    async def test_approval_prompt_has_only_closed_choice_buttons(self):
+        adapter = _make_adapter()
+        mock_msg = MagicMock()
+        mock_msg.message_id = 101
+        adapter._bot.send_message = AsyncMock(return_value=mock_msg)
+
+        with (
+            patch(
+                "plugins.platforms.telegram.adapter.InlineKeyboardButton",
+                side_effect=lambda label, callback_data: (label, callback_data),
+            ),
+            patch(
+                "plugins.platforms.telegram.adapter.InlineKeyboardMarkup",
+                side_effect=lambda rows: rows,
+            ),
+        ):
+            await adapter.send_clarify(
+                chat_id="12345",
+                question="Approve?",
+                choices=["Approve", "Reject"],
+                clarify_id="cid-approval",
+                session_key="sk-approval",
+                metadata={"is_approval_prompt": True},
+            )
+
+        markup = adapter._bot.send_message.call_args[1]["reply_markup"]
+        callbacks = [button[1] for row in markup for button in row]
+        assert callbacks == ["cl:cid-approval:0", "cl:cid-approval:1"]
 
     @pytest.mark.asyncio
     async def test_html_escapes_question(self):
@@ -164,6 +288,61 @@ class TestTelegramClarifyCallback:
         assert entry.event.is_set()
         query.answer.assert_called_once()
         query.edit_message_text.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_persistence_failure_keeps_button_state_for_retry(self):
+        from tools import clarify_gateway as cm
+
+        adapter = _make_adapter()
+        cm.register("cid-durable", "sk-cb", "Pick", ["red", "green"])
+        cm.on_resolution("cid-durable", lambda response: (_ for _ in ()).throw(RuntimeError("locked")))
+        adapter._clarify_state["cid-durable"] = "sk-cb"
+        adapter._clarify_card_state["cid-durable"] = ("12345", "100")
+        query = AsyncMock()
+        query.data = "cl:cid-durable:1"
+        query.message = MagicMock(chat_id=12345, text="Pick")
+        query.from_user = MagicMock(id="777", first_name="Tester")
+        update = MagicMock(callback_query=query)
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            await adapter._handle_callback_query(update, MagicMock())
+
+        assert adapter._clarify_state["cid-durable"] == "sk-cb"
+        assert adapter._clarify_card_state["cid-durable"] == ("12345", "100")
+        assert cm._entries["cid-durable"].event.is_set() is False
+
+    @pytest.mark.asyncio
+    async def test_restart_callback_uses_durable_choices_and_unblocks_replacement_waiter(self, tmp_path):
+        from gateway.approval_card_ledger import ApprovalCardLedger
+        from tools import clarify_gateway as cm
+
+        binding = {
+            "item_key": "owner/repo#1", "head_sha": "1" * 40,
+            "contract_digest_sha256": "2" * 64, "scope": "merge",
+            "decision_digest_sha256": "3" * 64,
+            "selected_executor": "hermes",
+        }
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path), "TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            ledger = ApprovalCardLedger(tmp_path / "approval_cards.db", instance_id="old")
+            claim = ledger.claim(
+                binding, platform="telegram", chat_id="12345", clarify_id="old-card",
+                session_key="old-session", choices=["Approve", "Reject"],
+            )
+            ledger.activate(claim.card_id, "100")
+            cm.register("replacement-wait", "new-session", "Approve?", ["Approve", "Reject"])
+            cm.set_resolution_probe(
+                "replacement-wait", lambda: ledger.response_for_binding(claim.binding_key))
+            adapter = _make_adapter()
+            adapter._hermes_profile_name = "coder"
+            query = AsyncMock()
+            query.data = "cl:old-card:0"
+            query.message = MagicMock(chat_id=12345, text="Approve?")
+            query.from_user = MagicMock(id="777", first_name="Tester")
+
+            await adapter._handle_callback_query(MagicMock(callback_query=query), MagicMock())
+
+            assert ledger.response_for_binding(claim.binding_key) == "Approve"
+            assert cm.wait_for_response("replacement-wait", timeout=3.0) == "Approve"
 
 
     @pytest.mark.asyncio

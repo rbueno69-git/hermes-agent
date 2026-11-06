@@ -20,6 +20,16 @@ def _clear_clarify_state():
         cm._entries.clear()
         cm._session_index.clear()
         cm._notify_cbs.clear()
+        if hasattr(cm, "_linked_entries"):
+            cm._linked_entries.clear()
+        if hasattr(cm, "_resolution_cbs"):
+            cm._resolution_cbs.clear()
+        if hasattr(cm, "_resolution_probes"):
+            cm._resolution_probes.clear()
+        if hasattr(cm, "_expiry_cbs"):
+            cm._expiry_cbs.clear()
+        if hasattr(cm, "_resolving"):
+            cm._resolving.clear()
 
 
 class TestClarifyPrimitive:
@@ -51,6 +61,58 @@ class TestClarifyPrimitive:
         assert cm.resolve_gateway_clarify("id-race", "A") is True
         assert cm.resolve_gateway_clarify("id-race", "") is False
         assert entry.response == "A"
+
+    def test_equivalent_cross_session_entries_share_one_resolution(self):
+        """One native approval card must unblock every equivalent webhook session."""
+        from tools import clarify_gateway as cm
+
+        cm.register("primary", "session-a", "Approve?", ["Approve", "Reject"])
+        cm.register("duplicate", "session-b", "Approve?", ["Approve", "Reject"])
+
+        assert cm.link_equivalent("primary", "duplicate") is True
+        assert cm.resolve_gateway_clarify("primary", "Approve") is True
+        assert cm.wait_for_response("primary", timeout=1.0) == "Approve"
+        assert cm.wait_for_response("duplicate", timeout=1.0) == "Approve"
+
+    def test_resolution_callback_records_the_submitted_decision_once(self):
+        from tools import clarify_gateway as cm
+
+        observed = []
+        cm.register("tracked", "session-a", "Approve?", ["Approve", "Reject"])
+        assert cm.on_resolution("tracked", observed.append) is True
+
+        assert cm.resolve_gateway_clarify("tracked", "Approve") is True
+        assert cm.resolve_gateway_clarify("tracked", "Reject") is False
+        assert observed == ["Approve"]
+
+    def test_resolution_callback_failure_keeps_waiter_pending_for_retry(self):
+        from tools import clarify_gateway as cm
+
+        attempts = []
+
+        def persist(response):
+            attempts.append(response)
+            if len(attempts) == 1:
+                raise RuntimeError("database is locked")
+
+        entry = cm.register("durable", "session-a", "Approve?", ["Approve", "Reject"])
+        assert cm.on_resolution("durable", persist) is True
+
+        assert cm.resolve_gateway_clarify("durable", "Approve") is False
+        assert entry.event.is_set() is False
+        assert entry.response is None
+        assert cm.resolve_gateway_clarify("durable", "Approve") is True
+        assert cm.wait_for_response("durable", timeout=1.0) == "Approve"
+        assert attempts == ["Approve", "Approve"]
+
+    def test_durable_probe_resolves_waiter_after_another_process_records_answer(self):
+        from tools import clarify_gateway as cm
+
+        responses = iter([None, "Approve"])
+        cm.register("remote", "session-a", "Approve?", ["Approve", "Reject"])
+        assert cm.set_resolution_probe("remote", lambda: next(responses, "Approve")) is True
+
+        assert cm.wait_for_response("remote", timeout=3.0) == "Approve"
 
     def test_open_ended_auto_awaits_text(self):
         """Clarify with no choices is in text-capture mode immediately."""

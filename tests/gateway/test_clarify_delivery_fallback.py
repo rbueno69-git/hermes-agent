@@ -215,6 +215,27 @@ def test_card_declined_after_the_ack_window_releases_with_the_declined_notice(lo
     assert adapter.sent_text == []
 
 
+def test_policy_rejection_after_ack_window_never_uses_plaintext_fallback(loop, monkeypatch):
+    from gateway import run_turn_runner_clarify_delivery as delivery
+
+    monkeypatch.setattr(delivery, "SEND_ACK_WINDOW", 0.2)
+
+    async def late_policy_rejection():
+        await asyncio.sleep(0.6)
+        return SendResult(
+            success=False,
+            error="Approval prompt requires closed choices",
+            raw_response={"approval_policy_rejected": True},
+        )
+
+    adapter = _CardAdapter(late_policy_rejection)
+    response, answered = _runner(adapter, loop, monkeypatch, timeout=30)._ask_clarify_question(
+        "Approve?", ["Approve", "Reject"], False)
+
+    assert (response, answered) == (delivery.UNDELIVERED_POLICY, False)
+    assert adapter.sent_text == []
+
+
 # --- Atom: no chat surface at all -----------------------------------------------------------
 
 
