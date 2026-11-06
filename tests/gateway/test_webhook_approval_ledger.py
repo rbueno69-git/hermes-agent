@@ -2,6 +2,8 @@ import multiprocessing
 import sqlite3
 from concurrent.futures import ProcessPoolExecutor
 
+import pytest
+
 from gateway.approval_card_ledger import ApprovalCardLedger
 
 
@@ -479,6 +481,60 @@ def test_recovery_expiry_is_durable_and_generation_fenced(tmp_path):
         old.card_id, recovery.delivery_generation, now=100.0
     ) is True
     assert recovery_ledger.observe_recovery(old.card_id).status == "failed"
+
+    reclaimed = ApprovalCardLedger(path, instance_id="gateway-c").claim_recovery(
+        old.card_id,
+        platform="telegram",
+        chat_id="327791380",
+        continuation={"session_chat_id": "delivery", "delivery": {}},
+        expires_at=1000.0,
+    )
+    assert reclaimed.action == "expired"
+    assert reclaimed.expires_at == 100.0
+    assert recovery_ledger.observe_recovery(old.card_id).status == "failed"
+
+
+def test_nullable_legacy_decision_digest_cannot_reuse_answered_binding(tmp_path):
+    path = tmp_path / "approval-cards.db"
+    binding = _binding()
+    from gateway.approval_card_ledger import canonical_binding_key
+
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE approval_bindings (
+                binding_key TEXT PRIMARY KEY,
+                item_key TEXT NOT NULL,
+                head_sha TEXT NOT NULL,
+                contract_digest_sha256 TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                decision_digest_sha256 TEXT,
+                status TEXT NOT NULL,
+                response TEXT,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO approval_bindings(
+                binding_key, item_key, head_sha, contract_digest_sha256, scope,
+                decision_digest_sha256, status, response, updated_at
+            ) VALUES (?, ?, ?, ?, ?, NULL, 'answered', 'APPROVE-OLD', 1.0)
+            """,
+            (
+                canonical_binding_key(binding), binding["item_key"], binding["head_sha"],
+                binding["contract_digest_sha256"], binding["scope"],
+            ),
+        )
+
+    ledger = ApprovalCardLedger(path, instance_id="gateway-b")
+    with pytest.raises(ValueError, match="canonical identity"):
+        ledger.claim(
+            binding, platform="telegram", chat_id="327791380",
+            clarify_id="clarify-new", session_key="session-new",
+            choices=["Approve", "Reject"],
+        )
 
 
 def test_predecessor_schema_active_recovery_remains_answerable_after_upgrade(tmp_path):

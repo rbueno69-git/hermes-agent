@@ -40,6 +40,20 @@ def _redact_telegram_error_text(error: object) -> str:
         return "<telegram error redacted>"
 
 
+def _is_ambiguous_telegram_timeout(error: BaseException) -> bool:
+    """Conservatively classify timeouts that may follow a committed Telegram send."""
+    current: Optional[BaseException] = error
+    seen: Set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, asyncio.TimeoutError) or type(current).__name__ in {
+            "TimedOut", "ReadTimeout", "WriteTimeout",
+        }:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def _consume_abandoned_task(task: asyncio.Task) -> None:
     """Observe a detached task's terminal exception to avoid noisy loop logs."""
     try:
@@ -4209,6 +4223,14 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                 raw_response={"ambiguous": True},
             )
         except Exception as e:
+            if _is_ambiguous_telegram_timeout(e):
+                logger.warning("[%s] %s delivery acknowledgement timed out: %s", self.name, what,
+                               _redact_telegram_error_text(e))
+                return SendResult(
+                    success=False,
+                    error=_redact_telegram_error_text(e),
+                    raw_response={"ambiguous": True},
+                )
             logger.warning("[%s] %s failed: %s", self.name, what, _redact_telegram_error_text(e))
             return SendResult(success=False, error=_redact_telegram_error_text(e))
 

@@ -119,6 +119,24 @@ class TestTelegramSendClarify:
         assert result.raw_response == {"ambiguous": True}
 
     @pytest.mark.asyncio
+    async def test_python_telegram_bot_timeout_after_dispatch_is_ambiguous(self):
+        from telegram.error import TimedOut
+
+        adapter = _make_adapter()
+        adapter._send_control_message = AsyncMock(side_effect=TimedOut("late ack"))
+
+        result = await adapter.send_clarify(
+            chat_id="12345",
+            question="Approve?",
+            choices=["Approve", "Reject"],
+            clarify_id="cid-ptb-timeout",
+            session_key="sk-ptb-timeout",
+        )
+
+        assert result.success is False
+        assert result.raw_response == {"ambiguous": True}
+
+    @pytest.mark.asyncio
     async def test_multi_choice_renders_buttons_and_other(self):
         adapter = _make_adapter()
         mock_msg = MagicMock()

@@ -516,6 +516,13 @@ class WebhookAdapter(BasePlatformAdapter):
                                 clarify_id=clarify_id, session_key=session_key, choices=choices,
                                 is_active=is_registered)
                             continue
+                        if recovery_claim.action == "expired":
+                            resolve_gateway_clarify(clarify_id, CANCELLED, persist=False)
+                            return SendResult(
+                                success=False,
+                                error="Approval delivery recovery expired and remains blocked",
+                                raw_response={"ambiguous": True},
+                            )
                         recovery_id = recovery_claim.clarify_id or f"approval-recovery-{claim.card_id}"
                         recovery_session = f"{session_key}:delivery-recovery:{claim.card_id}"
                         recovery_choices = ["Reemitir aprovação", "Manter bloqueado"]
