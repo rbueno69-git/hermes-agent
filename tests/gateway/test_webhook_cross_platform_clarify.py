@@ -456,6 +456,108 @@ async def test_material_successor_waits_until_ambiguous_predecessor_is_recorded(
 
 
 @pytest.mark.asyncio
+async def test_crashed_predecessor_requires_explicit_recovery_before_successor(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway.approval_card_ledger import ApprovalCardLedger
+    from tools import clarify_gateway as cm
+
+    old_binding = {
+        "item_key": "owner/repo#161", "head_sha": "1" * 40,
+        "contract_digest_sha256": "2" * 64, "scope": "merge",
+    }
+    crashed = ApprovalCardLedger(tmp_path / "approval_cards.db", instance_id="gateway-a")
+    crashed.claim(
+        old_binding, platform="telegram", chat_id="327791380",
+        clarify_id="old-card", session_key="old-session", choices=["Approve", "Reject"],
+    )
+    sent = []
+    successor_sent = asyncio.Event()
+
+    async def send_card(**kwargs):
+        sent.append(kwargs)
+        if kwargs["clarify_id"].startswith("approval-recovery-"):
+            asyncio.get_running_loop().call_soon(
+                cm.resolve_gateway_clarify,
+                kwargs["clarify_id"],
+                "Reemitir aprovação",
+            )
+            return SendResult(success=True, message_id="600")
+        successor_sent.set()
+        return SendResult(success=True, message_id="601")
+
+    target = MagicMock()
+    target.send_clarify = AsyncMock(side_effect=send_card)
+    target.retire_clarify_card = AsyncMock(return_value=True)
+    target.send = AsyncMock(return_value=SendResult(success=True, message_id="notice"))
+    runner = MagicMock()
+    runner._authorization_adapter.return_value = target
+    adapter = object.__new__(WebhookAdapter)
+    adapter.gateway_runner = runner
+    adapter._delivery_info = {
+        "new": {"deliver": "telegram", "deliver_extra": {"chat_id": "327791380"},
+                "approval_binding": {**old_binding, "contract_digest_sha256": "3" * 64}},
+    }
+    cm.register("new-card", "new-session", "New?", ["Approve", "Reject"])
+
+    result = await asyncio.wait_for(adapter.send_clarify(
+        chat_id="new", question="New?", choices=["Approve", "Reject"],
+        clarify_id="new-card", session_key="new-session",
+    ), timeout=3.0)
+
+    assert result.success is True
+    assert result.message_id == "600"
+    await asyncio.wait_for(successor_sent.wait(), timeout=3.0)
+    assert len(sent) == 2
+    assert sent[0]["clarify_id"].startswith("approval-recovery-")
+    assert sent[0]["choices"] == ["Reemitir aprovação", "Manter bloqueado"]
+    assert sent[1]["clarify_id"] == "new-card"
+    target.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_recovery_delivery_without_message_id_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway.approval_card_ledger import ApprovalCardLedger
+    from tools import clarify_gateway as cm
+
+    old_binding = {
+        "item_key": "owner/repo#161", "head_sha": "1" * 40,
+        "contract_digest_sha256": "2" * 64, "scope": "merge",
+    }
+    crashed = ApprovalCardLedger(tmp_path / "approval_cards.db", instance_id="gateway-a")
+    old = crashed.claim(
+        old_binding, platform="telegram", chat_id="327791380",
+        clarify_id="old-card", session_key="old-session", choices=["Approve", "Reject"],
+    )
+    target = MagicMock()
+
+    async def send_without_identity(**kwargs):
+        asyncio.get_running_loop().call_soon(
+            cm.resolve_gateway_clarify, kwargs["clarify_id"], "Manter bloqueado")
+        return SendResult(success=True, message_id=None)
+
+    target.send_clarify = AsyncMock(side_effect=send_without_identity)
+    runner = MagicMock()
+    runner._authorization_adapter.return_value = target
+    adapter = object.__new__(WebhookAdapter)
+    adapter.gateway_runner = runner
+    adapter._delivery_info = {
+        "new": {"deliver": "telegram", "deliver_extra": {"chat_id": "327791380"},
+                "approval_binding": {**old_binding, "contract_digest_sha256": "3" * 64}},
+    }
+    cm.register("new-card", "new-session", "New?", ["Approve", "Reject"])
+
+    result = await adapter.send_clarify(
+        chat_id="new", question="New?", choices=["Approve", "Reject"],
+        clarify_id="new-card", session_key="new-session",
+    )
+
+    assert result.success is False
+    assert "message_id" in (result.error or "")
+    assert crashed.observe_recovery(old.card_id).status == "failed"
+
+
+@pytest.mark.asyncio
 async def test_timeout_expires_durable_card_before_waiter_returns(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     from gateway.approval_card_ledger import ApprovalCardLedger, canonical_binding_key

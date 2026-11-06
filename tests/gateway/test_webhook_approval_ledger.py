@@ -22,6 +22,13 @@ def _claim_in_process(path, instance_id, clarify_id):
     return claim.action
 
 
+def _claim_recovery_in_process(path, instance_id, card_id):
+    ledger = ApprovalCardLedger(path, instance_id=instance_id)
+    return ledger.claim_recovery(
+        card_id, platform="telegram", chat_id="327791380"
+    ).action
+
+
 def test_equivalent_claim_reuses_active_card_in_same_gateway(tmp_path):
     ledger = ApprovalCardLedger(tmp_path / "approval-cards.db", instance_id="gateway-a")
     first = ledger.claim(
@@ -172,6 +179,99 @@ def test_material_change_waits_for_ambiguous_delivery_before_replacement(tmp_pat
     )
     assert replacement.action == "send"
     assert [card.clarify_id for card in replacement.superseded] == ["clarify-old"]
+
+
+def test_explicit_recovery_choice_unblocks_crashed_delivering_predecessor(tmp_path):
+    path = tmp_path / "approval-cards.db"
+    crashed = ApprovalCardLedger(path, instance_id="gateway-a")
+    old = crashed.claim(
+        _binding(), platform="telegram", chat_id="327791380",
+        clarify_id="clarify-old", session_key="session-old", choices=["Approve", "Reject"],
+    )
+    restarted = ApprovalCardLedger(path, instance_id="gateway-b")
+    waiting = restarted.claim(
+        _binding(digest="3" * 64), platform="telegram", chat_id="327791380",
+        clarify_id="clarify-new", session_key="session-new", choices=["Approve", "Reject"],
+    )
+
+    assert waiting.action == "wait_predecessor"
+    assert waiting.owner_instance_id == "gateway-a"
+    recovery = restarted.claim_recovery(
+        old.card_id, platform="telegram", chat_id="327791380"
+    )
+    assert recovery.action == "send"
+    recovery_id = f"approval-recovery-{old.card_id}"
+    assert restarted.answer_choice(recovery_id, 0) == "Reemitir aprovação"
+    assert restarted.observe(old.binding_key).status == "failed"
+    replacement = restarted.claim(
+        _binding(digest="3" * 64), platform="telegram", chat_id="327791380",
+        clarify_id="clarify-new", session_key="session-new", choices=["Approve", "Reject"],
+    )
+    assert replacement.action == "send"
+
+
+def test_concurrent_gateways_publish_exactly_one_recovery_control(tmp_path):
+    path = tmp_path / "approval-cards.db"
+    crashed = ApprovalCardLedger(path, instance_id="gateway-a")
+    old = crashed.claim(
+        _binding(), platform="telegram", chat_id="327791380",
+        clarify_id="clarify-old", session_key="session-old", choices=["Approve", "Reject"],
+    )
+
+    context = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=2, mp_context=context) as pool:
+        actions = [
+            future.result(timeout=20)
+            for future in (
+                pool.submit(_claim_recovery_in_process, path, "gateway-b", old.card_id),
+                pool.submit(_claim_recovery_in_process, path, "gateway-c", old.card_id),
+            )
+        ]
+
+    assert sorted(actions) == ["reuse_active", "send"]
+
+
+def test_stale_recovery_delivery_is_safely_reissued_without_authorizing_item(tmp_path):
+    path = tmp_path / "approval-cards.db"
+    crashed = ApprovalCardLedger(path, instance_id="gateway-a")
+    old = crashed.claim(
+        _binding(), platform="telegram", chat_id="327791380",
+        clarify_id="clarify-old", session_key="session-old", choices=["Approve", "Reject"],
+    )
+    first_recovery = ApprovalCardLedger(path, instance_id="gateway-b").claim_recovery(
+        old.card_id, platform="telegram", chat_id="327791380"
+    )
+    assert first_recovery.action == "send"
+
+    takeover = ApprovalCardLedger(
+        path, instance_id="gateway-c", recovery_lease_seconds=0
+    ).claim_recovery(old.card_id, platform="telegram", chat_id="327791380")
+
+    assert takeover.action == "send"
+    assert takeover.owner_instance_id == "gateway-c"
+    assert crashed.observe(old.binding_key).status == "pending"
+
+
+def test_recovery_keep_blocked_choice_preserves_unknown_delivery(tmp_path):
+    path = tmp_path / "approval-cards.db"
+    crashed = ApprovalCardLedger(path, instance_id="gateway-a")
+    old = crashed.claim(
+        _binding(), platform="telegram", chat_id="327791380",
+        clarify_id="clarify-old", session_key="session-old", choices=["Approve", "Reject"],
+    )
+    restarted = ApprovalCardLedger(path, instance_id="gateway-b")
+    restarted.claim_recovery(
+        old.card_id, platform="telegram", chat_id="327791380"
+    )
+
+    assert restarted.answer_choice(
+        f"approval-recovery-{old.card_id}", 1
+    ) == "Manter bloqueado"
+    assert restarted.observe(old.binding_key).status == "pending"
+    assert restarted.claim(
+        _binding(digest="3" * 64), platform="telegram", chat_id="327791380",
+        clarify_id="clarify-new", session_key="session-new", choices=["Approve", "Reject"],
+    ).action == "wait_predecessor"
 
 
 def test_observe_exposes_terminal_supersession(tmp_path):

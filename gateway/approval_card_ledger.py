@@ -31,6 +31,7 @@ class ApprovalClaim:
     clarify_id: Optional[str] = None
     message_id: Optional[str] = None
     response: Optional[str] = None
+    owner_instance_id: Optional[str] = None
     superseded: Tuple[ApprovalCard, ...] = ()
 
 
@@ -53,11 +54,14 @@ def canonical_binding_key(binding: Dict[str, str]) -> str:
 class ApprovalCardLedger:
     """SQLite-backed approval/card lifecycle shared across sessions and restarts."""
 
-    def __init__(self, path: Path, *, instance_id: str):
+    def __init__(self, path: Path, *, instance_id: str, recovery_lease_seconds: float = 30.0):
         self.path = Path(path)
         self.instance_id = str(instance_id)
         if not self.instance_id:
             raise ValueError("instance_id is required")
+        self.recovery_lease_seconds = float(recovery_lease_seconds)
+        if self.recovery_lease_seconds < 0:
+            raise ValueError("recovery_lease_seconds must be non-negative")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
@@ -99,6 +103,17 @@ class ApprovalCardLedger:
                     ON approval_cards(binding_key, status);
                 CREATE INDEX IF NOT EXISTS approval_bindings_item_status
                     ON approval_bindings(item_key, status);
+                CREATE TABLE IF NOT EXISTS approval_recoveries (
+                    card_id INTEGER PRIMARY KEY REFERENCES approval_cards(card_id),
+                    clarify_id TEXT NOT NULL UNIQUE,
+                    instance_id TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    message_id TEXT,
+                    status TEXT NOT NULL CHECK(status IN ('delivering','active','answered','failed')),
+                    response TEXT,
+                    updated_at REAL NOT NULL
+                );
                 """
             )
             columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(approval_cards)")}
@@ -172,6 +187,7 @@ class ApprovalCardLedger:
                     card_id=int(active["card_id"]),
                     clarify_id=str(active["clarify_id"]),
                     message_id=str(active["message_id"]) if active["message_id"] is not None else None,
+                    owner_instance_id=str(active["instance_id"]),
                 )
 
             old_rows = connection.execute(
@@ -191,6 +207,7 @@ class ApprovalCardLedger:
                     binding_key=binding_key,
                     card_id=int(delivering["card_id"]),
                     clarify_id=str(delivering["clarify_id"]),
+                    owner_instance_id=str(delivering["instance_id"]),
                 )
             if old_rows:
                 old_ids = [int(row["card_id"]) for row in old_rows]
@@ -242,6 +259,130 @@ class ApprovalCardLedger:
                 clarify_id=clarify_id,
                 superseded=tuple(self._card(row, status="superseded") for row in old_rows),
             )
+
+    def claim_recovery(self, card_id: Optional[int], *, platform: str, chat_id: str) -> ApprovalClaim:
+        """Elect exactly one publisher for a non-authorizing delivery recovery control."""
+        if card_id is None:
+            raise ValueError("card_id is required")
+        clarify_id = f"approval-recovery-{int(card_id)}"
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            card = connection.execute(
+                "SELECT binding_key, instance_id, status FROM approval_cards WHERE card_id = ?",
+                (int(card_id),),
+            ).fetchone()
+            if (
+                card is None or card["status"] != "delivering"
+                or str(card["instance_id"]) == self.instance_id
+            ):
+                connection.rollback()
+                raise ValueError("approval card is not an orphaned foreign delivery")
+            existing = connection.execute(
+                "SELECT * FROM approval_recoveries WHERE card_id = ?", (int(card_id),)
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["status"] == "delivering"
+                    and str(existing["instance_id"]) != self.instance_id
+                    and time.time() - float(existing["updated_at"]) >= self.recovery_lease_seconds
+                ):
+                    connection.execute(
+                        """
+                        UPDATE approval_recoveries SET instance_id = ?, platform = ?, chat_id = ?,
+                            message_id = NULL, updated_at = ?
+                        WHERE card_id = ? AND status = 'delivering'
+                        """,
+                        (self.instance_id, str(platform), str(chat_id), time.time(), int(card_id)),
+                    )
+                    connection.commit()
+                    return ApprovalClaim(
+                        action="send", binding_key=str(card["binding_key"]),
+                        card_id=int(card_id), clarify_id=clarify_id,
+                        owner_instance_id=self.instance_id,
+                    )
+                if existing["status"] == "failed":
+                    connection.execute(
+                        """
+                        UPDATE approval_recoveries SET instance_id = ?, platform = ?, chat_id = ?,
+                            message_id = NULL, status = 'delivering', response = NULL, updated_at = ?
+                        WHERE card_id = ? AND status = 'failed'
+                        """,
+                        (self.instance_id, str(platform), str(chat_id), time.time(), int(card_id)),
+                    )
+                    connection.commit()
+                    return ApprovalClaim(
+                        action="send", binding_key=str(card["binding_key"]),
+                        card_id=int(card_id), clarify_id=clarify_id,
+                        owner_instance_id=self.instance_id,
+                    )
+                connection.commit()
+                action = "reuse_answered" if existing["status"] == "answered" else "reuse_active"
+                return ApprovalClaim(
+                    action=action,
+                    binding_key=str(card["binding_key"]),
+                    card_id=int(card_id),
+                    clarify_id=str(existing["clarify_id"]),
+                    message_id=(str(existing["message_id"]) if existing["message_id"] is not None else None),
+                    response=(str(existing["response"]) if existing["response"] is not None else None),
+                    owner_instance_id=str(existing["instance_id"]),
+                )
+            connection.execute(
+                """
+                INSERT INTO approval_recoveries(
+                    card_id, clarify_id, instance_id, platform, chat_id,
+                    message_id, status, response, updated_at
+                ) VALUES (?, ?, ?, ?, ?, NULL, 'delivering', NULL, ?)
+                """,
+                (int(card_id), clarify_id, self.instance_id, str(platform), str(chat_id), time.time()),
+            )
+            connection.commit()
+            return ApprovalClaim(
+                action="send", binding_key=str(card["binding_key"]),
+                card_id=int(card_id), clarify_id=clarify_id,
+                owner_instance_id=self.instance_id,
+            )
+
+    def activate_recovery(self, card_id: Optional[int], message_id: str) -> bool:
+        if card_id is None:
+            return False
+        with self._connect() as connection:
+            changed = connection.execute(
+                """
+                UPDATE approval_recoveries SET
+                    status = CASE WHEN status = 'answered' THEN 'answered' ELSE 'active' END,
+                    message_id = ?, updated_at = ?
+                WHERE card_id = ? AND status IN ('delivering','answered')
+                """,
+                (str(message_id), time.time(), int(card_id)),
+            ).rowcount
+            return changed == 1
+
+    def fail_recovery(self, card_id: Optional[int]) -> None:
+        if card_id is None:
+            return
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE approval_recoveries SET status = 'failed', updated_at = ?
+                WHERE card_id = ? AND status IN ('delivering','active')
+                """,
+                (time.time(), int(card_id)),
+            )
+
+    def observe_recovery(self, card_id: Optional[int]) -> ApprovalObservation:
+        if card_id is None:
+            return ApprovalObservation(status="missing")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT status, response FROM approval_recoveries WHERE card_id = ?",
+                (int(card_id),),
+            ).fetchone()
+        if row is None:
+            return ApprovalObservation(status="missing")
+        return ApprovalObservation(
+            status=str(row["status"]),
+            response=(str(row["response"]) if row["response"] is not None else None),
+        )
 
     def activate(self, card_id: Optional[int], message_id: str) -> bool:
         if card_id is None:
@@ -342,6 +483,59 @@ class ApprovalCardLedger:
             return None
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            recovery_prefix = "approval-recovery-"
+            if clarify_id.startswith(recovery_prefix):
+                card_token = clarify_id[len(recovery_prefix):]
+                if not card_token.isdigit() or choice_index not in (0, 1):
+                    connection.commit()
+                    return None
+                recovery = connection.execute(
+                    """
+                    SELECT r.card_id, c.binding_key, c.status AS card_status,
+                           r.status AS recovery_status, r.response
+                    FROM approval_recoveries r
+                    JOIN approval_cards c ON c.card_id = r.card_id
+                    WHERE r.card_id = ?
+                    """,
+                    (int(card_token),),
+                ).fetchone()
+                if recovery is None:
+                    connection.commit()
+                    return None
+                if recovery["recovery_status"] == "answered":
+                    connection.commit()
+                    return str(recovery["response"] or "") or None
+                if recovery["recovery_status"] not in ("delivering", "active"):
+                    connection.commit()
+                    return None
+                response = "Reemitir aprovação" if choice_index == 0 else "Manter bloqueado"
+                now = time.time()
+                connection.execute(
+                    """
+                    UPDATE approval_recoveries SET status = 'answered', response = ?, updated_at = ?
+                    WHERE card_id = ? AND status IN ('delivering','active')
+                    """,
+                    (response, now, int(recovery["card_id"])),
+                )
+                if choice_index == 1:
+                    connection.commit()
+                    return response
+                if recovery["card_status"] == "delivering":
+                    connection.execute(
+                        "UPDATE approval_cards SET status = 'failed', updated_at = ? WHERE card_id = ?",
+                        (now, int(recovery["card_id"])),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE approval_bindings SET status = 'failed', updated_at = ?
+                        WHERE binding_key = ? AND status = 'pending'
+                        """,
+                        (now, str(recovery["binding_key"])),
+                    )
+                    connection.commit()
+                    return response
+                connection.rollback()
+                return None
             row = connection.execute(
                 "SELECT card_id, binding_key, status, choices_json FROM approval_cards WHERE clarify_id = ?",
                 (clarify_id,),

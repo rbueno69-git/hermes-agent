@@ -418,12 +418,16 @@ class WebhookAdapter(BasePlatformAdapter):
                         get_hermes_home() / "approval_cards.db", instance_id=self._approval_instance_id)
                 from tools.clarify_gateway import (
                     CANCELLED,
+                    clear_session,
+                    get_clarify_timeout,
                     is_registered,
                     link_equivalent,
                     on_resolution,
+                    register,
                     resolve_gateway_clarify,
                     set_expiry_callback,
                     set_resolution_probe,
+                    wait_for_response,
                 )
                 claim = ledger.claim(
                     binding, platform=deliver_type, chat_id=str(target_chat_id),
@@ -442,10 +446,121 @@ class WebhookAdapter(BasePlatformAdapter):
                     if claim.action == "send":
                         ledger.fail(claim.card_id)
                     return SendResult(success=False, error="Approval waiter expired before delivery")
-                while claim.action == "wait_predecessor":
-                    # The predecessor may already be visible remotely while its message id is
-                    # not committed.  Keep this send future pending (therefore ambiguous to the
-                    # generic delivery layer) until activation/failure makes retirement safe.
+                while (
+                    claim.action == "wait_predecessor"
+                    or (
+                        claim.action == "reuse_active"
+                        and claim.message_id is None
+                        and claim.owner_instance_id != self._approval_instance_id
+                    )
+                ):
+                    if claim.owner_instance_id != self._approval_instance_id:
+                        try:
+                            recovery_claim = ledger.claim_recovery(
+                                claim.card_id,
+                                platform=deliver_type,
+                                chat_id=str(target_chat_id),
+                            )
+                        except ValueError:
+                            claim = ledger.claim(
+                                binding, platform=deliver_type, chat_id=str(target_chat_id),
+                                clarify_id=clarify_id, session_key=session_key, choices=choices,
+                                is_active=is_registered)
+                            continue
+                        recovery_id = recovery_claim.clarify_id or f"approval-recovery-{claim.card_id}"
+                        recovery_session = f"{session_key}:delivery-recovery:{claim.card_id}"
+                        recovery_choices = ["Reemitir aprovação", "Manter bloqueado"]
+                        register(
+                            recovery_id,
+                            recovery_session,
+                            "A entrega anterior ficou sem confirmação após reinício. Reemitir a aprovação?",
+                            recovery_choices,
+                        )
+
+                        def _probe_recovery() -> Optional[str]:
+                            observation = ledger.observe_recovery(claim.card_id)
+                            if observation.status == "answered":
+                                return observation.response or ""
+                            if observation.status == "failed":
+                                return CANCELLED
+                            return None
+
+                        set_resolution_probe(recovery_id, _probe_recovery)
+
+                        def _record_recovery(response: str) -> bool:
+                            try:
+                                choice_index = recovery_choices.index(response)
+                            except ValueError:
+                                return False
+                            return ledger.answer_choice(recovery_id, choice_index) is not None
+
+                        if not on_resolution(recovery_id, _record_recovery):
+                            clear_session(recovery_session)
+                            resolve_gateway_clarify(clarify_id, CANCELLED, persist=False)
+                            return SendResult(
+                                success=False,
+                                error="Approval recovery waiter could not be registered",
+                                raw_response={"ambiguous": True},
+                            )
+                        if recovery_claim.action == "reuse_answered":
+                            resolve_gateway_clarify(
+                                recovery_id, recovery_claim.response or "", persist=False)
+                            recovery_result = SendResult(
+                                success=True, message_id=recovery_claim.message_id)
+                        elif recovery_claim.action == "reuse_active":
+                            recovery_result = SendResult(
+                                success=True, message_id=recovery_claim.message_id)
+                        else:
+                            recovery_metadata = dict(target_metadata)
+                            recovery_metadata["is_approval_prompt"] = False
+                            recovery_result = await adapter.send_clarify(
+                                chat_id=str(target_chat_id),
+                                question=(
+                                    "A entrega anterior ficou sem confirmação após reinício. "
+                                    "Reemitir a aprovação?"
+                                ),
+                                choices=recovery_choices,
+                                clarify_id=recovery_id,
+                                session_key=recovery_session,
+                                metadata=recovery_metadata or None,
+                            )
+                            if not recovery_result.success or not recovery_result.message_id:
+                                ledger.fail_recovery(claim.card_id)
+                                clear_session(recovery_session)
+                                resolve_gateway_clarify(clarify_id, CANCELLED, persist=False)
+                                error = (
+                                    "Approval recovery delivery returned no message_id"
+                                    if recovery_result.success
+                                    else "Approval recovery control could not be delivered"
+                                )
+                                return SendResult(
+                                    success=False,
+                                    error=error,
+                                    raw_response={"ambiguous": True},
+                                )
+                            ledger.activate_recovery(claim.card_id, recovery_result.message_id)
+                        task = asyncio.create_task(self._resume_after_approval_recovery(
+                            adapter=adapter,
+                            recovery_id=recovery_id,
+                            recovery_choices=recovery_choices,
+                            original_chat_id=chat_id,
+                            target_chat_id=str(target_chat_id),
+                            question=question,
+                            choices=choices,
+                            clarify_id=clarify_id,
+                            session_key=session_key,
+                            metadata=metadata,
+                            timeout=float(get_clarify_timeout()),
+                            wait_for_response=wait_for_response,
+                            resolve_gateway_clarify=resolve_gateway_clarify,
+                            cancelled=CANCELLED,
+                        ))
+                        if not hasattr(self, "_approval_recovery_tasks"):
+                            self._approval_recovery_tasks = set()
+                        self._approval_recovery_tasks.add(task)
+                        task.add_done_callback(self._approval_recovery_tasks.discard)
+                        return recovery_result
+                    # A live local publisher is still closing the send/activate gap.
                     await asyncio.sleep(0.1)
                     if not is_registered(clarify_id):
                         return SendResult(
@@ -532,6 +647,47 @@ class WebhookAdapter(BasePlatformAdapter):
                     if result.success:
                         return SendResult(success=False, error="Approval card delivery returned no message_id")
                 return result
+
+    async def _resume_after_approval_recovery(
+        self, *, adapter, recovery_id: str, recovery_choices: List[str],
+        original_chat_id: str, target_chat_id: str, question: str,
+        choices: Optional[list], clarify_id: str, session_key: str,
+        metadata: Optional[Dict[str, Any]], timeout: float,
+        wait_for_response, resolve_gateway_clarify, cancelled: str,
+    ) -> None:
+        """Continue a withheld approval only after an explicit delivery-recovery choice."""
+        try:
+            response = await asyncio.to_thread(
+                wait_for_response, recovery_id, timeout=timeout)
+            if response != recovery_choices[0]:
+                resolve_gateway_clarify(clarify_id, cancelled, persist=False)
+                return
+            retire = getattr(adapter, "retire_clarify_card", None)
+            if callable(retire):
+                retirement = retire(
+                    recovery_id,
+                    "⚠️ Recuperação confirmada; o pedido anterior foi invalidado.",
+                )
+                if inspect.isawaitable(retirement):
+                    await retirement
+            await adapter.send(
+                target_chat_id,
+                "⚠️ A tentativa anterior de aprovação foi invalidada. Use somente o novo pedido.",
+            )
+            from tools.clarify_gateway import is_registered
+            if not is_registered(clarify_id):
+                return
+            await self.send_clarify(
+                chat_id=original_chat_id,
+                question=question,
+                choices=choices,
+                clarify_id=clarify_id,
+                session_key=session_key,
+                metadata=metadata,
+            )
+        except Exception:
+            logger.exception("Approval delivery recovery failed for %s", clarify_id)
+            resolve_gateway_clarify(clarify_id, cancelled, persist=False)
 
     async def retire_clarify_card(self, clarify_id: str, notice: str) -> None:
         """Forward timeout/cancellation retirement to the adapter that rendered the card."""
