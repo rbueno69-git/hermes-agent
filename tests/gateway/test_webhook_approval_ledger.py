@@ -5,12 +5,13 @@ from concurrent.futures import ProcessPoolExecutor
 from gateway.approval_card_ledger import ApprovalCardLedger
 
 
-def _binding(digest="2" * 64, head="1" * 40):
+def _binding(digest="2" * 64, head="1" * 40, decision="4" * 64):
     return {
         "item_key": "rbueno69-git/carteira-investimentos#160",
         "head_sha": head,
         "contract_digest_sha256": digest,
         "scope": "Somente leitura; merge e deploy autorizados.",
+        "decision_digest_sha256": decision,
     }
 
 
@@ -153,6 +154,24 @@ def test_stale_send_failure_cannot_erase_answered_decision(tmp_path):
     )
     assert replay.action == "reuse_answered"
     assert replay.response == "Approve"
+
+
+def test_changed_decision_semantics_never_reuses_answered_binding(tmp_path):
+    ledger = ApprovalCardLedger(tmp_path / "approval-cards.db", instance_id="gateway-a")
+    first = ledger.claim(
+        _binding(), platform="telegram", chat_id="327791380",
+        clarify_id="clarify-a", session_key="session-a", choices=["Approve", "Reject"],
+    )
+    assert ledger.activate(first.card_id, "501") is True
+    assert ledger.answer_choice("clarify-a", 0) == "Approve"
+
+    changed = ledger.claim(
+        _binding(decision="5" * 64), platform="telegram", chat_id="327791380",
+        clarify_id="clarify-b", session_key="session-b", choices=["Approve", "Reject"],
+    )
+
+    assert changed.action == "send"
+    assert changed.response is None
 
 
 def test_material_change_waits_for_ambiguous_delivery_before_replacement(tmp_path):
@@ -393,6 +412,73 @@ def test_expired_in_memory_wait_reuses_durable_card_instead_of_duplicating_it(tm
     assert duplicate.action == "reuse_active"
     assert duplicate.clarify_id == "clarify-expired"
     assert duplicate.message_id == "501"
+
+
+def test_recovery_continuation_survives_restart_for_delivery_hydration(tmp_path):
+    path = tmp_path / "approval-cards.db"
+    crashed = ApprovalCardLedger(path, instance_id="gateway-a")
+    old = crashed.claim(
+        _binding(), platform="telegram", chat_id="327791380",
+        clarify_id="clarify-old", session_key="session-old", choices=["Approve", "Reject"],
+    )
+    continuation = {
+        "session_chat_id": "webhook-delivery",
+        "delivery": {
+            "deliver": "telegram",
+            "deliver_extra": {"chat_id": "327791380"},
+            "approval_binding": {
+                "item_key": "owner/repo#161",
+                "head_sha": "1" * 40,
+                "contract_digest_sha256": "2" * 64,
+                "scope": "merge",
+            },
+        },
+        "question": "Approve?",
+        "choices": ["Approve", "Reject"],
+        "clarify_id": "clarify-new",
+        "session_key": "session-new",
+    }
+    recovery = ApprovalCardLedger(path, instance_id="gateway-b").claim_recovery(
+        old.card_id,
+        platform="telegram",
+        chat_id="327791380",
+        continuation=continuation,
+        expires_at=200.0,
+    )
+
+    contexts = ApprovalCardLedger(
+        path, instance_id="gateway-c"
+    ).recoverable_delivery_contexts(now=100.0)
+
+    assert recovery.action == "send"
+    assert contexts == [continuation]
+
+
+def test_recovery_expiry_is_durable_and_generation_fenced(tmp_path):
+    path = tmp_path / "approval-cards.db"
+    crashed = ApprovalCardLedger(path, instance_id="gateway-a")
+    old = crashed.claim(
+        _binding(), platform="telegram", chat_id="327791380",
+        clarify_id="clarify-old", session_key="session-old", choices=["Approve", "Reject"],
+    )
+    recovery_ledger = ApprovalCardLedger(path, instance_id="gateway-b")
+    recovery = recovery_ledger.claim_recovery(
+        old.card_id,
+        platform="telegram",
+        chat_id="327791380",
+        continuation={"session_chat_id": "delivery", "delivery": {}},
+        expires_at=100.0,
+    )
+    assert recovery_ledger.activate_recovery(
+        old.card_id, recovery.delivery_generation, "600") is True
+
+    assert recovery_ledger.expire_recovery(
+        old.card_id, "0" * 32, now=100.0
+    ) is False
+    assert recovery_ledger.expire_recovery(
+        old.card_id, recovery.delivery_generation, now=100.0
+    ) is True
+    assert recovery_ledger.observe_recovery(old.card_id).status == "failed"
 
 
 def test_predecessor_schema_active_recovery_remains_answerable_after_upgrade(tmp_path):

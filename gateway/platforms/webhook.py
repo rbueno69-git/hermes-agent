@@ -272,6 +272,26 @@ class WebhookAdapter(BasePlatformAdapter):
 
     # --- Lifecycle ---
 
+    def _approval_ledger(self) -> ApprovalCardLedger:
+        ledger_path = str(get_hermes_home() / "approval_cards.db")
+        ledger = self._approval_ledgers.get(ledger_path)
+        if ledger is None:
+            ledger = self._approval_ledgers[ledger_path] = ApprovalCardLedger(
+                get_hermes_home() / "approval_cards.db", instance_id=self._approval_instance_id)
+        return ledger
+
+    def _hydrate_approval_delivery_info(self) -> None:
+        """Restore webhook routing needed by interrupted approval turns after restart."""
+        now = time.time()
+        for context in self._approval_ledger().recoverable_delivery_contexts(now=now):
+            session_chat_id = context.get("session_chat_id")
+            delivery = context.get("delivery")
+            if not isinstance(session_chat_id, str) or not session_chat_id or type(delivery) is not dict:
+                continue
+            self._delivery_info[session_chat_id] = delivery
+            self._delivery_info_created[session_chat_id] = now
+            self._delivery_info_order.append((now, session_chat_id))
+
     def _validate_route(self, name: str, route: dict) -> None:
         """Startup validation: secret required; INSECURE_NO_AUTH only on loopback (crash early on a public footgun)."""
         secret = route.get("secret", self._global_secret)
@@ -296,6 +316,7 @@ class WebhookAdapter(BasePlatformAdapter):
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         self._reload_dynamic_routes()
+        self._hydrate_approval_delivery_info()
         for name, route in self._routes.items():
             self._validate_route(name, route)
         # client_max_size enforces the cap on every read path, including chunked bodies without
@@ -394,6 +415,24 @@ class WebhookAdapter(BasePlatformAdapter):
                 target_metadata["thread_id"] = thread_id
             target_metadata["is_approval_prompt"] = True
             binding = delivery.get("approval_binding")
+            if isinstance(binding, dict):
+                decision_semantics = {
+                    "executor": "hermes",
+                    "action_type": "approval",
+                    "item_key": binding.get("item_key"),
+                    "question": question,
+                    "choices": list(choices or []),
+                }
+                decision_bytes = json.dumps(
+                    decision_semantics,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                binding = {
+                    **binding,
+                    "decision_digest_sha256": hashlib.sha256(decision_bytes).hexdigest(),
+                }
             if not isinstance(binding, dict):
                 result = await adapter.send_clarify(
                     chat_id=str(target_chat_id), question=question, choices=choices,
@@ -411,11 +450,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 self._approval_instance_id = uuid.uuid4().hex
                 self._approval_ledgers = {}
             async with self._approval_prompt_lock:
-                ledger_path = str(get_hermes_home() / "approval_cards.db")
-                ledger = self._approval_ledgers.get(ledger_path)
-                if ledger is None:
-                    ledger = self._approval_ledgers[ledger_path] = ApprovalCardLedger(
-                        get_hermes_home() / "approval_cards.db", instance_id=self._approval_instance_id)
+                ledger = self._approval_ledger()
                 from tools.clarify_gateway import (
                     CANCELLED,
                     clear_session,
@@ -455,11 +490,25 @@ class WebhookAdapter(BasePlatformAdapter):
                     )
                 ):
                     if claim.owner_instance_id != self._approval_instance_id:
+                        recovery_timeout = float(get_clarify_timeout())
+                        recovery_expires_at = (
+                            time.time() + recovery_timeout if recovery_timeout > 0 else None
+                        )
+                        recovery_continuation = {
+                            "session_chat_id": chat_id,
+                            "delivery": delivery,
+                            "question": question,
+                            "choices": list(choices or []),
+                            "clarify_id": clarify_id,
+                            "session_key": session_key,
+                        }
                         try:
                             recovery_claim = ledger.claim_recovery(
                                 claim.card_id,
                                 platform=deliver_type,
                                 chat_id=str(target_chat_id),
+                                continuation=recovery_continuation,
+                                expires_at=recovery_expires_at,
                             )
                         except ValueError:
                             claim = ledger.claim(
@@ -486,6 +535,31 @@ class WebhookAdapter(BasePlatformAdapter):
                             return None
 
                         set_resolution_probe(recovery_id, _probe_recovery)
+
+                        def _expire_recovery() -> Optional[str]:
+                            ledger.expire_recovery(
+                                claim.card_id,
+                                recovery_claim.delivery_generation,
+                                now=time.time(),
+                            )
+                            observation = ledger.observe_recovery(claim.card_id)
+                            if observation.status == "answered":
+                                return observation.response or ""
+                            if observation.status == "failed":
+                                return CANCELLED
+                            return None
+
+                        if not set_expiry_callback(recovery_id, _expire_recovery):
+                            ledger.fail_recovery(
+                                claim.card_id, recovery_claim.delivery_generation,
+                            )
+                            clear_session(recovery_session)
+                            resolve_gateway_clarify(clarify_id, CANCELLED, persist=False)
+                            return SendResult(
+                                success=False,
+                                error="Approval recovery expiry could not be registered",
+                                raw_response={"ambiguous": True},
+                            )
 
                         def _record_recovery(response: str) -> bool:
                             try:
@@ -593,7 +667,10 @@ class WebhookAdapter(BasePlatformAdapter):
                             clarify_id=clarify_id,
                             session_key=session_key,
                             metadata=metadata,
-                            timeout=float(get_clarify_timeout()),
+                            timeout=(
+                                0.0 if recovery_claim.expires_at is None
+                                else max(0.001, recovery_claim.expires_at - time.time())
+                            ),
                             wait_for_response=wait_for_response,
                             resolve_gateway_clarify=resolve_gateway_clarify,
                             cancelled=CANCELLED,
@@ -686,7 +763,13 @@ class WebhookAdapter(BasePlatformAdapter):
                     self._clarify_delegates[clarify_id] = (
                         adapter, clarify_id, ledger, str(target_chat_id), result.message_id)
                 else:
-                    ledger.fail(claim.card_id)
+                    raw_response = result.raw_response
+                    ambiguous = (
+                        isinstance(raw_response, dict)
+                        and raw_response.get("ambiguous") is True
+                    )
+                    if not ambiguous:
+                        ledger.fail(claim.card_id)
                     if result.success:
                         return SendResult(success=False, error="Approval card delivery returned no message_id")
                 return result

@@ -4200,6 +4200,14 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             if on_sent is not None:
                 on_sent(msg)
             return SendResult(success=True, message_id=str(msg.message_id))
+        except asyncio.TimeoutError as e:
+            logger.warning("[%s] %s delivery acknowledgement timed out: %s", self.name, what,
+                           _redact_telegram_error_text(e))
+            return SendResult(
+                success=False,
+                error=_redact_telegram_error_text(e),
+                raw_response={"ambiguous": True},
+            )
         except Exception as e:
             logger.warning("[%s] %s failed: %s", self.name, what, _redact_telegram_error_text(e))
             return SendResult(success=False, error=_redact_telegram_error_text(e))

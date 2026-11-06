@@ -4,6 +4,7 @@ Mirrors test_telegram_approval_buttons.py for the new ``send_clarify`` and
 ``cl:`` callback dispatch added in feat/clarify-gateway-buttons.
 """
 
+import asyncio
 import os
 import sys
 from pathlib import Path
@@ -100,6 +101,22 @@ class TestTelegramSendClarify:
 
     def setup_method(self):
         _clear_clarify_state()
+
+    @pytest.mark.asyncio
+    async def test_timeout_after_possible_remote_commit_is_ambiguous(self):
+        adapter = _make_adapter()
+        adapter._send_control_message = AsyncMock(side_effect=asyncio.TimeoutError("late ack"))
+
+        result = await adapter.send_clarify(
+            chat_id="12345",
+            question="Approve?",
+            choices=["Approve", "Reject"],
+            clarify_id="cid-timeout",
+            session_key="sk-timeout",
+        )
+
+        assert result.success is False
+        assert result.raw_response == {"ambiguous": True}
 
     @pytest.mark.asyncio
     async def test_multi_choice_renders_buttons_and_other(self):
@@ -241,6 +258,7 @@ class TestTelegramClarifyCallback:
         binding = {
             "item_key": "owner/repo#1", "head_sha": "1" * 40,
             "contract_digest_sha256": "2" * 64, "scope": "merge",
+            "decision_digest_sha256": "3" * 64,
         }
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path), "TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
             ledger = ApprovalCardLedger(tmp_path / "approval_cards.db", instance_id="old")

@@ -38,6 +38,7 @@ class ApprovalClaim:
     response: Optional[str] = None
     owner_instance_id: Optional[str] = None
     delivery_generation: Optional[str] = None
+    expires_at: Optional[float] = None
     superseded: Tuple[ApprovalCard, ...] = ()
 
 
@@ -48,7 +49,10 @@ class ApprovalObservation:
 
 
 def canonical_binding_key(binding: Dict[str, str]) -> str:
-    required = {"item_key", "head_sha", "contract_digest_sha256", "scope"}
+    required = {
+        "item_key", "head_sha", "contract_digest_sha256", "scope",
+        "decision_digest_sha256",
+    }
     if type(binding) is not dict or set(binding) != required:
         raise ValueError("approval binding must contain the exact canonical fields")
     if any(not isinstance(binding[key], str) or not binding[key] for key in required):
@@ -87,6 +91,7 @@ class ApprovalCardLedger:
                     head_sha TEXT NOT NULL,
                     contract_digest_sha256 TEXT NOT NULL,
                     scope TEXT NOT NULL,
+                    decision_digest_sha256 TEXT NOT NULL,
                     status TEXT NOT NULL CHECK(status IN ('pending','answered','superseded','failed')),
                     response TEXT,
                     updated_at REAL NOT NULL
@@ -119,10 +124,23 @@ class ApprovalCardLedger:
                     generation TEXT NOT NULL,
                     status TEXT NOT NULL CHECK(status IN ('delivering','active','answered','failed')),
                     response TEXT,
+                    continuation_json TEXT,
+                    expires_at REAL,
                     updated_at REAL NOT NULL
                 );
                 """
             )
+            binding_columns = {
+                str(row[1]) for row in connection.execute("PRAGMA table_info(approval_bindings)")
+            }
+            if "decision_digest_sha256" not in binding_columns:
+                connection.execute(
+                    "ALTER TABLE approval_bindings ADD COLUMN decision_digest_sha256 TEXT"
+                )
+                connection.execute(
+                    "UPDATE approval_bindings SET decision_digest_sha256 = 'legacy:' || binding_key "
+                    "WHERE decision_digest_sha256 IS NULL"
+                )
             columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(approval_cards)")}
             if "choices_json" not in columns:
                 connection.execute("ALTER TABLE approval_cards ADD COLUMN choices_json TEXT")
@@ -135,6 +153,10 @@ class ApprovalCardLedger:
                     "UPDATE approval_recoveries SET generation = lower(hex(randomblob(16))) "
                     "WHERE generation IS NULL"
                 )
+            if "continuation_json" not in recovery_columns:
+                connection.execute("ALTER TABLE approval_recoveries ADD COLUMN continuation_json TEXT")
+            if "expires_at" not in recovery_columns:
+                connection.execute("ALTER TABLE approval_recoveries ADD COLUMN expires_at REAL")
         os.chmod(self.path, 0o600)
 
     @staticmethod
@@ -240,8 +262,9 @@ class ApprovalCardLedger:
             connection.execute(
                 """
                 INSERT INTO approval_bindings(
-                    binding_key, item_key, head_sha, contract_digest_sha256, scope, status, response, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 'pending', NULL, ?)
+                    binding_key, item_key, head_sha, contract_digest_sha256, scope,
+                    decision_digest_sha256, status, response, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, ?)
                 ON CONFLICT(binding_key) DO UPDATE SET
                     status = 'pending', response = NULL, updated_at = excluded.updated_at
                 """,
@@ -251,6 +274,7 @@ class ApprovalCardLedger:
                     binding["head_sha"],
                     binding["contract_digest_sha256"],
                     binding["scope"],
+                    binding["decision_digest_sha256"],
                     now,
                 ),
             )
@@ -276,12 +300,44 @@ class ApprovalCardLedger:
                 superseded=tuple(self._card(row, status="superseded") for row in old_rows),
             )
 
-    def claim_recovery(self, card_id: Optional[int], *, platform: str, chat_id: str) -> ApprovalClaim:
+    @staticmethod
+    def _continuation_json(continuation: Optional[dict]) -> Optional[str]:
+        if continuation is None:
+            return None
+        if type(continuation) is not dict:
+            raise ValueError("approval recovery continuation must be a dictionary")
+        session_chat_id = continuation.get("session_chat_id")
+        if not isinstance(session_chat_id, str) or not session_chat_id:
+            raise ValueError("approval recovery continuation requires session_chat_id")
+        if type(continuation.get("delivery")) is not dict:
+            raise ValueError("approval recovery continuation requires delivery")
+        try:
+            encoded = json.dumps(
+                continuation, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("approval recovery continuation must be JSON-safe") from exc
+        if len(encoded.encode("utf-8")) > 32768:
+            raise ValueError("approval recovery continuation is too large")
+        return encoded
+
+    def claim_recovery(
+        self,
+        card_id: Optional[int],
+        *,
+        platform: str,
+        chat_id: str,
+        continuation: Optional[dict] = None,
+        expires_at: Optional[float] = None,
+    ) -> ApprovalClaim:
         """Elect exactly one publisher for a non-authorizing delivery recovery control."""
         if card_id is None:
             raise ValueError("card_id is required")
         generation = secrets.token_hex(16)
         clarify_id = f"{RECOVERY_PREFIX}{generation}"
+        continuation_json = self._continuation_json(continuation)
+        if expires_at is not None:
+            expires_at = float(expires_at)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             card = connection.execute(
@@ -318,17 +374,18 @@ class ApprovalCardLedger:
                         card_id=int(card_id), clarify_id=clarify_id,
                         owner_instance_id=self.instance_id,
                         delivery_generation=generation,
+                        expires_at=(float(existing["expires_at"]) if existing["expires_at"] is not None else None),
                     )
                 if existing["status"] == "failed":
                     connection.execute(
                         """
                         UPDATE approval_recoveries SET instance_id = ?, platform = ?, chat_id = ?,
                             clarify_id = ?, message_id = NULL, generation = ?, status = 'delivering',
-                            response = NULL, updated_at = ?
+                            response = NULL, continuation_json = ?, expires_at = ?, updated_at = ?
                         WHERE card_id = ? AND status = 'failed'
                         """,
                         (self.instance_id, str(platform), str(chat_id), clarify_id, generation,
-                         time.time(), int(card_id)),
+                         continuation_json, expires_at, time.time(), int(card_id)),
                     )
                     connection.commit()
                     return ApprovalClaim(
@@ -336,6 +393,7 @@ class ApprovalCardLedger:
                         card_id=int(card_id), clarify_id=clarify_id,
                         owner_instance_id=self.instance_id,
                         delivery_generation=generation,
+                        expires_at=expires_at,
                     )
                 connection.commit()
                 action = "reuse_answered" if existing["status"] == "answered" else "reuse_active"
@@ -348,16 +406,17 @@ class ApprovalCardLedger:
                     response=(str(existing["response"]) if existing["response"] is not None else None),
                     owner_instance_id=str(existing["instance_id"]),
                     delivery_generation=str(existing["generation"]),
+                    expires_at=(float(existing["expires_at"]) if existing["expires_at"] is not None else None),
                 )
             connection.execute(
                 """
                 INSERT INTO approval_recoveries(
                     card_id, clarify_id, instance_id, platform, chat_id,
-                    message_id, generation, status, response, updated_at
-                ) VALUES (?, ?, ?, ?, ?, NULL, ?, 'delivering', NULL, ?)
+                    message_id, generation, status, response, continuation_json, expires_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, NULL, ?, 'delivering', NULL, ?, ?, ?)
                 """,
                 (int(card_id), clarify_id, self.instance_id, str(platform), str(chat_id),
-                 generation, time.time()),
+                 generation, continuation_json, expires_at, time.time()),
             )
             connection.commit()
             return ApprovalClaim(
@@ -365,6 +424,7 @@ class ApprovalCardLedger:
                 card_id=int(card_id), clarify_id=clarify_id,
                 owner_instance_id=self.instance_id,
                 delivery_generation=generation,
+                expires_at=expires_at,
             )
 
     def activate_recovery(
@@ -395,6 +455,55 @@ class ApprovalCardLedger:
                 """,
                 (time.time(), int(card_id), str(generation)),
             )
+
+    def expire_recovery(
+        self, card_id: Optional[int], generation: Optional[str], *, now: Optional[float] = None,
+    ) -> bool:
+        if card_id is None or not generation:
+            return False
+        observed_at = time.time() if now is None else float(now)
+        with self._connect() as connection:
+            changed = connection.execute(
+                """
+                UPDATE approval_recoveries SET status = 'failed', updated_at = ?
+                WHERE card_id = ? AND generation = ?
+                  AND status IN ('delivering','active')
+                  AND expires_at IS NOT NULL AND expires_at <= ?
+                """,
+                (observed_at, int(card_id), str(generation), observed_at),
+            ).rowcount
+        return changed == 1
+
+    def recoverable_delivery_contexts(self, *, now: Optional[float] = None) -> List[dict]:
+        observed_at = time.time() if now is None else float(now)
+        contexts: List[dict] = []
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                UPDATE approval_recoveries SET status = 'failed', updated_at = ?
+                WHERE status IN ('delivering','active')
+                  AND expires_at IS NOT NULL AND expires_at <= ?
+                """,
+                (observed_at, observed_at),
+            )
+            rows = connection.execute(
+                """
+                SELECT continuation_json FROM approval_recoveries
+                WHERE status IN ('delivering','active','answered')
+                  AND continuation_json IS NOT NULL
+                ORDER BY card_id
+                """
+            ).fetchall()
+            connection.commit()
+        for row in rows:
+            try:
+                context = json.loads(str(row["continuation_json"]))
+                self._continuation_json(context)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            contexts.append(context)
+        return contexts
 
     def observe_recovery(self, card_id: Optional[int]) -> ApprovalObservation:
         if card_id is None:

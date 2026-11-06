@@ -1,4 +1,6 @@
 import asyncio
+import sqlite3
+from collections import deque
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -93,6 +95,7 @@ async def test_timeout_does_not_retire_a_durably_answered_card(tmp_path, monkeyp
     binding = {
         "item_key": "owner/repo#161", "head_sha": "1" * 40,
         "contract_digest_sha256": "2" * 64, "scope": "merge",
+        "decision_digest_sha256": "3" * 64,
     }
     target = MagicMock()
     target.send_clarify = AsyncMock(return_value=SendResult(success=True, message_id="501"))
@@ -189,6 +192,7 @@ async def test_originating_publisher_observes_answer_committed_by_another_gatewa
     binding = {
         "item_key": "owner/repo#161", "head_sha": "1" * 40,
         "contract_digest_sha256": "2" * 64, "scope": "merge",
+        "decision_digest_sha256": "3" * 64,
     }
     target = MagicMock()
     target.send_clarify = AsyncMock(return_value=SendResult(success=True, message_id="501"))
@@ -221,6 +225,7 @@ async def test_originating_publisher_observes_remote_supersession(tmp_path, monk
     binding = {
         "item_key": "owner/repo#161", "head_sha": "1" * 40,
         "contract_digest_sha256": "2" * 64, "scope": "merge",
+        "decision_digest_sha256": "3" * 64,
     }
     target = MagicMock()
     target.send_clarify = AsyncMock(return_value=SendResult(success=True, message_id="501"))
@@ -361,6 +366,7 @@ async def test_active_card_from_previous_gateway_is_reused_and_polled(tmp_path, 
     binding = {
         "item_key": "owner/repo#1", "head_sha": "1" * 40,
         "contract_digest_sha256": "2" * 64, "scope": "merge",
+        "decision_digest_sha256": "3" * 64,
     }
     target = MagicMock()
     target.send_clarify = AsyncMock(return_value=SendResult(success=True, message_id="501"))
@@ -405,6 +411,7 @@ async def test_material_successor_waits_until_ambiguous_predecessor_is_recorded(
     old_binding = {
         "item_key": "owner/repo#161", "head_sha": "1" * 40,
         "contract_digest_sha256": "2" * 64, "scope": "merge",
+        "decision_digest_sha256": "3" * 64,
     }
     first_started = asyncio.Event()
     release_first = asyncio.Event()
@@ -464,6 +471,7 @@ async def test_crashed_predecessor_requires_explicit_recovery_before_successor(t
     old_binding = {
         "item_key": "owner/repo#161", "head_sha": "1" * 40,
         "contract_digest_sha256": "2" * 64, "scope": "merge",
+        "decision_digest_sha256": "3" * 64,
     }
     crashed = ApprovalCardLedger(tmp_path / "approval_cards.db", instance_id="gateway-a")
     crashed.claim(
@@ -515,6 +523,52 @@ async def test_crashed_predecessor_requires_explicit_recovery_before_successor(t
 
 
 @pytest.mark.asyncio
+async def test_recovery_timeout_durably_expires_before_waiter_disappears(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway.approval_card_ledger import ApprovalCardLedger
+    from tools import clarify_gateway as cm
+
+    monkeypatch.setattr(cm, "get_clarify_timeout", lambda: 0.05)
+    old_binding = {
+        "item_key": "owner/repo#161", "head_sha": "1" * 40,
+        "contract_digest_sha256": "2" * 64, "scope": "merge",
+        "decision_digest_sha256": "3" * 64,
+    }
+    crashed = ApprovalCardLedger(tmp_path / "approval_cards.db", instance_id="gateway-a")
+    old = crashed.claim(
+        old_binding, platform="telegram", chat_id="327791380",
+        clarify_id="old-card", session_key="old-session", choices=["Approve", "Reject"],
+    )
+    target = MagicMock()
+    target.send_clarify = AsyncMock(return_value=SendResult(success=True, message_id="600"))
+    runner = MagicMock()
+    runner._authorization_adapter.return_value = target
+    adapter = object.__new__(WebhookAdapter)
+    adapter.gateway_runner = runner
+    adapter._delivery_info = {
+        "new": {
+            "deliver": "telegram", "deliver_extra": {"chat_id": "327791380"},
+            "approval_binding": {
+                "item_key": "owner/repo#161", "head_sha": "1" * 40,
+                "contract_digest_sha256": "4" * 64, "scope": "merge",
+            },
+        },
+    }
+    cm.register("new-card", "new-session", "New?", ["Approve", "Reject"])
+
+    result = await adapter.send_clarify(
+        chat_id="new", question="New?", choices=["Approve", "Reject"],
+        clarify_id="new-card", session_key="new-session",
+    )
+    assert result.success is True
+    recovery_id = target.send_clarify.await_args.kwargs["clarify_id"]
+    await asyncio.sleep(0.2)
+
+    assert crashed.observe_recovery(old.card_id).status == "failed"
+    assert cm.is_registered(recovery_id) is False
+
+
+@pytest.mark.asyncio
 async def test_recovery_delivery_without_message_id_fails_closed(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     from gateway.approval_card_ledger import ApprovalCardLedger
@@ -523,6 +577,7 @@ async def test_recovery_delivery_without_message_id_fails_closed(tmp_path, monke
     old_binding = {
         "item_key": "owner/repo#161", "head_sha": "1" * 40,
         "contract_digest_sha256": "2" * 64, "scope": "merge",
+        "decision_digest_sha256": "3" * 64,
     }
     crashed = ApprovalCardLedger(tmp_path / "approval_cards.db", instance_id="gateway-a")
     old = crashed.claim(
@@ -568,6 +623,7 @@ async def test_late_recovery_sender_retires_control_after_losing_generation(
     old_binding = {
         "item_key": "owner/repo#161", "head_sha": "1" * 40,
         "contract_digest_sha256": "2" * 64, "scope": "merge",
+        "decision_digest_sha256": "3" * 64,
     }
     crashed = ApprovalCardLedger(tmp_path / "approval_cards.db", instance_id="gateway-a")
     old = crashed.claim(
@@ -617,6 +673,7 @@ async def test_late_recovery_sender_fails_closed_when_exact_retirement_fails(
     old_binding = {
         "item_key": "owner/repo#161", "head_sha": "1" * 40,
         "contract_digest_sha256": "2" * 64, "scope": "merge",
+        "decision_digest_sha256": "3" * 64,
     }
     crashed = ApprovalCardLedger(tmp_path / "approval_cards.db", instance_id="gateway-a")
     crashed.claim(
@@ -651,14 +708,97 @@ async def test_late_recovery_sender_fails_closed_when_exact_retirement_fails(
 
 
 @pytest.mark.asyncio
-async def test_timeout_expires_durable_card_before_waiter_returns(tmp_path, monkeypatch):
+async def test_restart_hydrates_webhook_delivery_from_recovery_continuation(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    from gateway.approval_card_ledger import ApprovalCardLedger, canonical_binding_key
+    from gateway.approval_card_ledger import ApprovalCardLedger
+
+    crashed = ApprovalCardLedger(tmp_path / "approval_cards.db", instance_id="gateway-a")
+    old = crashed.claim(
+        {
+            "item_key": "owner/repo#161", "head_sha": "1" * 40,
+            "contract_digest_sha256": "2" * 64, "scope": "merge",
+            "decision_digest_sha256": "3" * 64,
+        },
+        platform="telegram", chat_id="327791380", clarify_id="old-card",
+        session_key="old-session", choices=["Approve", "Reject"],
+    )
+    delivery = {
+        "deliver": "telegram",
+        "deliver_extra": {"chat_id": "327791380"},
+        "approval_binding": {
+            "item_key": "owner/repo#161", "head_sha": "1" * 40,
+            "contract_digest_sha256": "2" * 64, "scope": "merge",
+        },
+    }
+    ApprovalCardLedger(tmp_path / "approval_cards.db", instance_id="gateway-b").claim_recovery(
+        old.card_id, platform="telegram", chat_id="327791380",
+        continuation={
+            "session_chat_id": "webhook-delivery", "delivery": delivery,
+            "question": "Approve?", "choices": ["Approve", "Reject"],
+            "clarify_id": "new-card", "session_key": "new-session",
+        },
+        expires_at=10**12,
+    )
+    restarted = object.__new__(WebhookAdapter)
+    restarted._approval_instance_id = "gateway-c"
+    restarted._approval_ledgers = {}
+    restarted._delivery_info = {}
+    restarted._delivery_info_created = {}
+    restarted._delivery_info_order = deque()
+
+    restarted._hydrate_approval_delivery_info()
+
+    assert restarted._delivery_info["webhook-delivery"] == delivery
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_approval_send_remains_durably_delivering(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     from tools import clarify_gateway as cm
 
     binding = {
         "item_key": "owner/repo#161", "head_sha": "1" * 40,
         "contract_digest_sha256": "2" * 64, "scope": "merge",
+        "decision_digest_sha256": "3" * 64,
+    }
+    target = MagicMock()
+    target.send_clarify = AsyncMock(return_value=SendResult(
+        success=False, error="late ack", raw_response={"ambiguous": True}))
+    runner = MagicMock()
+    runner._authorization_adapter.return_value = target
+    adapter = object.__new__(WebhookAdapter)
+    adapter.gateway_runner = runner
+    adapter._delivery_info = {
+        "delivery": {"deliver": "telegram", "deliver_extra": {"chat_id": "327791380"},
+                     "approval_binding": binding}
+    }
+    cm.register("ambiguous-card", "ambiguous-session", "Approve?", ["Approve", "Reject"])
+
+    result = await adapter.send_clarify(
+        chat_id="delivery", question="Approve?", choices=["Approve", "Reject"],
+        clarify_id="ambiguous-card", session_key="ambiguous-session",
+    )
+
+    assert result.raw_response == {"ambiguous": True}
+    with sqlite3.connect(tmp_path / "approval_cards.db") as connection:
+        assert connection.execute(
+            "SELECT status FROM approval_cards WHERE clarify_id = 'ambiguous-card'"
+        ).fetchone()[0] == "delivering"
+        assert connection.execute(
+            "SELECT status FROM approval_bindings"
+        ).fetchone()[0] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_timeout_expires_durable_card_before_waiter_returns(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway.approval_card_ledger import ApprovalCardLedger
+    from tools import clarify_gateway as cm
+
+    binding = {
+        "item_key": "owner/repo#161", "head_sha": "1" * 40,
+        "contract_digest_sha256": "2" * 64, "scope": "merge",
+        "decision_digest_sha256": "3" * 64,
     }
     target = MagicMock()
     target.send_clarify = AsyncMock(return_value=SendResult(success=True, message_id="501"))
@@ -682,7 +822,7 @@ async def test_timeout_expires_durable_card_before_waiter_returns(tmp_path, monk
     target.retire_clarify_card.assert_awaited_once_with("timeout-card", "Expired")
     remote = ApprovalCardLedger(tmp_path / "approval_cards.db", instance_id="gateway-b")
     assert remote.answer_choice("timeout-card", 0) is None
-    assert remote.observe(canonical_binding_key(binding)).status == "failed"
+    assert remote.observe_clarify("timeout-card").status == "failed"
 
 
 @pytest.mark.asyncio
@@ -693,6 +833,7 @@ async def test_late_send_success_is_retired_after_durable_timeout(tmp_path, monk
     binding = {
         "item_key": "owner/repo#161", "head_sha": "1" * 40,
         "contract_digest_sha256": "2" * 64, "scope": "merge",
+        "decision_digest_sha256": "3" * 64,
     }
     started = asyncio.Event()
     release = asyncio.Event()
