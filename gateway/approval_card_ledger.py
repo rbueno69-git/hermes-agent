@@ -126,6 +126,8 @@ class ApprovalCardLedger:
                     response TEXT,
                     continuation_json TEXT,
                     expires_at REAL,
+                    continuation_claim_id TEXT,
+                    continuation_claimed_at REAL,
                     updated_at REAL NOT NULL
                 );
                 """
@@ -149,14 +151,38 @@ class ApprovalCardLedger:
             }
             if "generation" not in recovery_columns:
                 connection.execute("ALTER TABLE approval_recoveries ADD COLUMN generation TEXT")
+            missing_generations = connection.execute(
+                "SELECT card_id, clarify_id FROM approval_recoveries WHERE generation IS NULL"
+            ).fetchall()
+            for row in missing_generations:
+                persisted_id = str(row["clarify_id"])
+                token = (
+                    persisted_id[len(RECOVERY_PREFIX):]
+                    if persisted_id.startswith(RECOVERY_PREFIX)
+                    else ""
+                )
+                generation = (
+                    token
+                    if len(token) == 32 and all(char in "0123456789abcdef" for char in token)
+                    else secrets.token_hex(16)
+                )
                 connection.execute(
-                    "UPDATE approval_recoveries SET generation = lower(hex(randomblob(16))) "
-                    "WHERE generation IS NULL"
+                    "UPDATE approval_recoveries SET generation = ? "
+                    "WHERE card_id = ? AND generation IS NULL",
+                    (generation, int(row["card_id"])),
                 )
             if "continuation_json" not in recovery_columns:
                 connection.execute("ALTER TABLE approval_recoveries ADD COLUMN continuation_json TEXT")
             if "expires_at" not in recovery_columns:
                 connection.execute("ALTER TABLE approval_recoveries ADD COLUMN expires_at REAL")
+            if "continuation_claim_id" not in recovery_columns:
+                connection.execute(
+                    "ALTER TABLE approval_recoveries ADD COLUMN continuation_claim_id TEXT"
+                )
+            if "continuation_claimed_at" not in recovery_columns:
+                connection.execute(
+                    "ALTER TABLE approval_recoveries ADD COLUMN continuation_claimed_at REAL"
+                )
         os.chmod(self.path, 0o600)
 
     @staticmethod
@@ -373,14 +399,18 @@ class ApprovalCardLedger:
                 )
                 now = time.time()
                 if (
+                    existing["status"] == "failed"
+                    and existing["response"] == "__expired__"
+                ) or (
                     existing["status"] in ("delivering", "active", "failed")
                     and existing_expires_at is not None
                     and existing_expires_at <= now
                 ):
                     connection.execute(
                         """
-                        UPDATE approval_recoveries SET status = 'failed', updated_at = ?
-                        WHERE card_id = ? AND status IN ('delivering','active')
+                        UPDATE approval_recoveries
+                        SET status = 'failed', response = '__expired__', updated_at = ?
+                        WHERE card_id = ? AND status IN ('delivering','active','failed')
                         """,
                         (now, int(card_id)),
                     )
@@ -457,19 +487,25 @@ class ApprovalCardLedger:
                     delivery_generation=str(existing["generation"]),
                     expires_at=(float(existing["expires_at"]) if existing["expires_at"] is not None else None),
                 )
+            now = time.time()
+            initial_status = (
+                "failed" if expires_at is not None and expires_at <= now else "delivering"
+            )
             connection.execute(
                 """
                 INSERT INTO approval_recoveries(
                     card_id, clarify_id, instance_id, platform, chat_id,
                     message_id, generation, status, response, continuation_json, expires_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, NULL, ?, 'delivering', NULL, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)
                 """,
                 (int(card_id), clarify_id, self.instance_id, str(platform), str(chat_id),
-                 generation, continuation_json, expires_at, time.time()),
+                 generation, initial_status,
+                 "__expired__" if initial_status == "failed" else None,
+                 continuation_json, expires_at, now),
             )
             connection.commit()
             return ApprovalClaim(
-                action="send", binding_key=str(card["binding_key"]),
+                action="expired" if initial_status == "failed" else "send", binding_key=str(card["binding_key"]),
                 card_id=int(card_id), clarify_id=clarify_id,
                 owner_instance_id=self.instance_id,
                 delivery_generation=generation,
@@ -481,16 +517,30 @@ class ApprovalCardLedger:
     ) -> bool:
         if card_id is None or not generation:
             return False
+        now = time.time()
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                UPDATE approval_recoveries
+                SET status = 'failed', response = '__expired__', updated_at = ?
+                WHERE card_id = ? AND generation = ?
+                  AND status IN ('delivering','active')
+                  AND expires_at IS NOT NULL AND expires_at <= ?
+                """,
+                (now, int(card_id), str(generation), now),
+            )
             changed = connection.execute(
                 """
                 UPDATE approval_recoveries SET
                     status = CASE WHEN status = 'answered' THEN 'answered' ELSE 'active' END,
                     message_id = ?, updated_at = ?
                 WHERE card_id = ? AND generation = ? AND status IN ('delivering','answered')
+                  AND (expires_at IS NULL OR expires_at > ?)
                 """,
-                (str(message_id), time.time(), int(card_id), str(generation)),
+                (str(message_id), now, int(card_id), str(generation), now),
             ).rowcount
+            connection.commit()
             return changed == 1
 
     def fail_recovery(self, card_id: Optional[int], generation: Optional[str]) -> None:
@@ -514,7 +564,8 @@ class ApprovalCardLedger:
         with self._connect() as connection:
             changed = connection.execute(
                 """
-                UPDATE approval_recoveries SET status = 'failed', updated_at = ?
+                UPDATE approval_recoveries
+                SET status = 'failed', response = '__expired__', updated_at = ?
                 WHERE card_id = ? AND generation = ?
                   AND status IN ('delivering','active')
                   AND expires_at IS NOT NULL AND expires_at <= ?
@@ -553,6 +604,88 @@ class ApprovalCardLedger:
                 continue
             contexts.append(context)
         return contexts
+
+    def claim_answered_recovery_continuations(
+        self, *, now: Optional[float] = None, lease_seconds: float = 30.0, limit: int = 16,
+    ) -> List[dict]:
+        observed_at = time.time() if now is None else float(now)
+        stale_before = observed_at - max(0.0, float(lease_seconds))
+        claimed: List[dict] = []
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT card_id, clarify_id, generation, response, continuation_json
+                FROM approval_recoveries
+                WHERE status = 'answered' AND continuation_json IS NOT NULL
+                  AND (continuation_claim_id IS NULL OR continuation_claimed_at <= ?)
+                ORDER BY card_id LIMIT ?
+                """,
+                (stale_before, max(1, int(limit))),
+            ).fetchall()
+            for row in rows:
+                claim_id = secrets.token_hex(16)
+                changed = connection.execute(
+                    """
+                    UPDATE approval_recoveries
+                    SET continuation_claim_id = ?, continuation_claimed_at = ?
+                    WHERE card_id = ? AND generation = ? AND status = 'answered'
+                      AND continuation_json IS NOT NULL
+                      AND (continuation_claim_id IS NULL OR continuation_claimed_at <= ?)
+                    """,
+                    (
+                        claim_id, observed_at, int(row["card_id"]), str(row["generation"]),
+                        stale_before,
+                    ),
+                ).rowcount
+                if changed != 1:
+                    continue
+                try:
+                    context = json.loads(str(row["continuation_json"]))
+                    self._continuation_json(context)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                claimed.append({
+                    "card_id": int(row["card_id"]),
+                    "clarify_id": str(row["clarify_id"]),
+                    "generation": str(row["generation"]),
+                    "response": str(row["response"] or ""),
+                    "claim_id": claim_id,
+                    "context": context,
+                })
+            connection.commit()
+        return claimed
+
+    def complete_recovery_continuation(
+        self, card_id: int, generation: str, claim_id: str,
+    ) -> bool:
+        with self._connect() as connection:
+            changed = connection.execute(
+                """
+                UPDATE approval_recoveries
+                SET continuation_json = NULL, continuation_claim_id = NULL,
+                    continuation_claimed_at = NULL, updated_at = ?
+                WHERE card_id = ? AND generation = ? AND continuation_claim_id = ?
+                  AND status = 'answered'
+                """,
+                (time.time(), int(card_id), str(generation), str(claim_id)),
+            ).rowcount
+        return changed == 1
+
+    def release_recovery_continuation_claim(
+        self, card_id: int, generation: str, claim_id: str,
+    ) -> bool:
+        with self._connect() as connection:
+            changed = connection.execute(
+                """
+                UPDATE approval_recoveries
+                SET continuation_claim_id = NULL, continuation_claimed_at = NULL
+                WHERE card_id = ? AND generation = ? AND continuation_claim_id = ?
+                  AND status = 'answered'
+                """,
+                (int(card_id), str(generation), str(claim_id)),
+            ).rowcount
+        return changed == 1
 
     def observe_recovery(self, card_id: Optional[int]) -> ApprovalObservation:
         if card_id is None:
@@ -703,7 +836,7 @@ class ApprovalCardLedger:
                     return None
                 recovery = connection.execute(
                     """
-                    SELECT r.card_id, r.generation, c.binding_key,
+                    SELECT r.card_id, r.generation, r.expires_at, c.binding_key,
                            c.status AS card_status, r.status AS recovery_status, r.response
                     FROM approval_recoveries r
                     JOIN approval_cards c ON c.card_id = r.card_id
@@ -730,16 +863,35 @@ class ApprovalCardLedger:
                 if recovery["recovery_status"] not in ("delivering", "active"):
                     connection.commit()
                     return None
-                response = "Reemitir aprovação" if choice_index == 0 else "Manter bloqueado"
                 now = time.time()
-                connection.execute(
+                if (
+                    recovery["expires_at"] is not None
+                    and float(recovery["expires_at"]) <= now
+                ):
+                    connection.execute(
+                        """
+                        UPDATE approval_recoveries
+                        SET status = 'failed', response = '__expired__', updated_at = ?
+                        WHERE card_id = ? AND generation = ? AND clarify_id = ?
+                          AND status IN ('delivering','active')
+                        """,
+                        (now, int(recovery["card_id"]), generation, clarify_id),
+                    )
+                    connection.commit()
+                    return None
+                response = "Reemitir aprovação" if choice_index == 0 else "Manter bloqueado"
+                changed = connection.execute(
                     """
                     UPDATE approval_recoveries SET status = 'answered', response = ?, updated_at = ?
                     WHERE card_id = ? AND generation = ? AND clarify_id = ?
                       AND status IN ('delivering','active')
+                      AND (expires_at IS NULL OR expires_at > ?)
                     """,
-                    (response, now, int(recovery["card_id"]), generation, clarify_id),
-                )
+                    (response, now, int(recovery["card_id"]), generation, clarify_id, now),
+                ).rowcount
+                if changed != 1:
+                    connection.rollback()
+                    return None
                 if choice_index == 1:
                     connection.commit()
                     return response

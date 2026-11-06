@@ -1,5 +1,6 @@
 import asyncio
 import sqlite3
+import time
 from collections import deque
 from unittest.mock import AsyncMock, MagicMock
 
@@ -749,6 +750,119 @@ async def test_restart_hydrates_webhook_delivery_from_recovery_continuation(tmp_
     restarted._hydrate_approval_delivery_info()
 
     assert restarted._delivery_info["webhook-delivery"] == delivery
+
+
+def test_answered_recovery_continuation_has_one_lease_owner_and_fenced_completion(tmp_path):
+    from gateway.approval_card_ledger import ApprovalCardLedger
+
+    binding = {
+        "item_key": "owner/repo#161", "head_sha": "1" * 40,
+        "contract_digest_sha256": "2" * 64, "scope": "merge",
+        "decision_digest_sha256": "3" * 64,
+    }
+    path = tmp_path / "approval-cards.db"
+    crashed = ApprovalCardLedger(path, instance_id="gateway-a")
+    old = crashed.claim(
+        binding, platform="telegram", chat_id="327791380",
+        clarify_id="clarify-old", session_key="session-old", choices=["Approve", "Reject"],
+    )
+    continuation = {
+        "session_chat_id": "delivery", "delivery": {}, "question": "Approve?",
+        "choices": ["Approve", "Reject"], "clarify_id": "clarify-new",
+        "session_key": "session-new",
+    }
+    ledger = ApprovalCardLedger(path, instance_id="gateway-b")
+    recovery = ledger.claim_recovery(
+        old.card_id, platform="telegram", chat_id="327791380",
+        continuation=continuation, expires_at=time.time() + 60.0,
+    )
+    assert ledger.activate_recovery(old.card_id, recovery.delivery_generation, "600")
+    assert ledger.answer_choice(recovery.clarify_id, 0) == "Reemitir aprovação"
+
+    first = ApprovalCardLedger(path, instance_id="gateway-c").claim_answered_recovery_continuations(
+        now=100.0, lease_seconds=30.0,
+    )
+    assert len(first) == 1
+    assert ApprovalCardLedger(
+        path, instance_id="gateway-d"
+    ).claim_answered_recovery_continuations(now=100.0, lease_seconds=30.0) == []
+    takeover = ApprovalCardLedger(
+        path, instance_id="gateway-d"
+    ).claim_answered_recovery_continuations(now=131.0, lease_seconds=30.0)
+
+    assert len(takeover) == 1
+    assert takeover[0]["claim_id"] != first[0]["claim_id"]
+    assert ledger.complete_recovery_continuation(
+        old.card_id, recovery.delivery_generation, first[0]["claim_id"]
+    ) is False
+    assert ledger.complete_recovery_continuation(
+        old.card_id, recovery.delivery_generation, takeover[0]["claim_id"]
+    ) is True
+    assert ledger.claim_answered_recovery_continuations(now=200.0) == []
+
+
+@pytest.mark.asyncio
+async def test_restart_worker_reissues_answered_recovery_without_webhook_replay(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway.approval_card_ledger import ApprovalCardLedger
+    from tools import clarify_gateway as cm
+
+    old_binding = {
+        "item_key": "owner/repo#161", "head_sha": "1" * 40,
+        "contract_digest_sha256": "2" * 64, "scope": "merge",
+        "decision_digest_sha256": "3" * 64,
+    }
+    crashed = ApprovalCardLedger(tmp_path / "approval_cards.db", instance_id="gateway-a")
+    old = crashed.claim(
+        old_binding, platform="telegram", chat_id="327791380",
+        clarify_id="old-card", session_key="old-session", choices=["Approve", "Reject"],
+    )
+    delivery = {
+        "deliver": "telegram",
+        "deliver_extra": {"chat_id": "327791380"},
+        "approval_binding": {
+            "item_key": "owner/repo#161", "head_sha": "1" * 40,
+            "contract_digest_sha256": "4" * 64, "scope": "merge",
+        },
+    }
+    ledger = ApprovalCardLedger(tmp_path / "approval_cards.db", instance_id="gateway-b")
+    recovery = ledger.claim_recovery(
+        old.card_id, platform="telegram", chat_id="327791380",
+        continuation={
+            "session_chat_id": "new", "delivery": delivery,
+            "question": "New?", "choices": ["Approve", "Reject"],
+            "clarify_id": "new-card", "session_key": "new-session",
+        },
+        expires_at=10**12,
+    )
+    assert ledger.activate_recovery(old.card_id, recovery.delivery_generation, "600") is True
+    assert ledger.answer_choice(recovery.clarify_id, 0) == "Reemitir aprovação"
+    with cm._lock:
+        cm._entries.clear()
+        cm._session_index.clear()
+        cm._resolution_cbs.clear()
+        cm._resolution_probes.clear()
+        cm._expiry_cbs.clear()
+
+    target = MagicMock()
+    target.send_clarify = AsyncMock(return_value=SendResult(success=True, message_id="601"))
+    runner = MagicMock()
+    runner._authorization_adapter.return_value = target
+    restarted = object.__new__(WebhookAdapter)
+    restarted.gateway_runner = runner
+    restarted._approval_instance_id = "gateway-c"
+    restarted._approval_ledgers = {}
+    restarted._delivery_info = {}
+    restarted._delivery_info_created = {}
+    restarted._delivery_info_order = deque()
+    restarted._hydrate_approval_delivery_info()
+
+    await restarted._drain_approval_recovery_continuations_once()
+    await restarted._drain_approval_recovery_continuations_once()
+
+    assert target.send_clarify.await_count == 1
+    assert target.send_clarify.await_args.kwargs["clarify_id"] == "new-card"
+    assert cm.is_registered("new-card") is True
 
 
 @pytest.mark.asyncio

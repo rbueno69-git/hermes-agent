@@ -292,6 +292,69 @@ class WebhookAdapter(BasePlatformAdapter):
             self._delivery_info_created[session_chat_id] = now
             self._delivery_info_order.append((now, session_chat_id))
 
+    async def _drain_approval_recovery_continuations_once(self) -> None:
+        from tools.clarify_gateway import clear_session, is_registered, register
+
+        ledger = self._approval_ledger()
+        for claimed in ledger.claim_answered_recovery_continuations():
+            context = claimed["context"]
+            response = claimed["response"]
+            if response != "Reemitir aprovação":
+                ledger.complete_recovery_continuation(
+                    claimed["card_id"], claimed["generation"], claimed["claim_id"])
+                continue
+            question = context.get("question")
+            choices = context.get("choices")
+            clarify_id = context.get("clarify_id")
+            session_key = context.get("session_key")
+            session_chat_id = context.get("session_chat_id")
+            valid = (
+                isinstance(question, str) and bool(question)
+                and type(choices) is list and bool(choices)
+                and all(isinstance(choice, str) and choice for choice in choices)
+                and isinstance(clarify_id, str) and bool(clarify_id)
+                and isinstance(session_key, str) and bool(session_key)
+                and isinstance(session_chat_id, str) and bool(session_chat_id)
+            )
+            if not valid or is_registered(clarify_id):
+                ledger.release_recovery_continuation_claim(
+                    claimed["card_id"], claimed["generation"], claimed["claim_id"])
+                continue
+            register(clarify_id, session_key, question, choices)
+            try:
+                result = await self.send_clarify(
+                    chat_id=session_chat_id,
+                    question=question,
+                    choices=choices,
+                    clarify_id=clarify_id,
+                    session_key=session_key,
+                )
+            except Exception:
+                logger.exception("Durable approval recovery continuation failed for %s", clarify_id)
+                clear_session(session_key)
+                ledger.release_recovery_continuation_claim(
+                    claimed["card_id"], claimed["generation"], claimed["claim_id"])
+                continue
+            ambiguous = (
+                isinstance(result.raw_response, dict)
+                and result.raw_response.get("ambiguous") is True
+            )
+            if result.success or ambiguous:
+                ledger.complete_recovery_continuation(
+                    claimed["card_id"], claimed["generation"], claimed["claim_id"])
+            else:
+                clear_session(session_key)
+                ledger.release_recovery_continuation_claim(
+                    claimed["card_id"], claimed["generation"], claimed["claim_id"])
+
+    async def _approval_recovery_continuation_worker(self) -> None:
+        while self._runner is not None:
+            try:
+                await self._drain_approval_recovery_continuations_once()
+            except Exception:
+                logger.exception("Durable approval recovery worker failed")
+            await asyncio.sleep(1.0)
+
     def _validate_route(self, name: str, route: dict) -> None:
         """Startup validation: secret required; INSECURE_NO_AUTH only on loopback (crash early on a public footgun)."""
         secret = route.get("secret", self._global_secret)
@@ -344,9 +407,19 @@ class WebhookAdapter(BasePlatformAdapter):
         logger.info("[webhook] Listening on %s:%d — routes: %s", self._host or "* (all interfaces, IPv4+IPv6)",
                     self._port, ", ".join(self._routes.keys()) or "(none configured)")
         self._wire_plugin_handlers(None)
+        continuation_task = getattr(self, "_approval_continuation_worker_task", None)
+        if continuation_task is None or continuation_task.done():
+            self._approval_continuation_worker_task = asyncio.create_task(
+                self._approval_recovery_continuation_worker())
         return True
 
     async def disconnect(self) -> None:
+        continuation_task = getattr(self, "_approval_continuation_worker_task", None)
+        if continuation_task is not None and not continuation_task.done():
+            continuation_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await continuation_task
+        self._approval_continuation_worker_task = None
         await self._coalescer.flush()  # buffered events are dispatched, not dropped, on shutdown/reconnect
         if self._runner:
             await self._runner.cleanup()

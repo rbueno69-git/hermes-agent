@@ -1,5 +1,6 @@
 import multiprocessing
 import sqlite3
+import time
 from concurrent.futures import ProcessPoolExecutor
 
 import pytest
@@ -440,17 +441,18 @@ def test_recovery_continuation_survives_restart_for_delivery_hydration(tmp_path)
         "clarify_id": "clarify-new",
         "session_key": "session-new",
     }
+    deadline = time.time() + 60.0
     recovery = ApprovalCardLedger(path, instance_id="gateway-b").claim_recovery(
         old.card_id,
         platform="telegram",
         chat_id="327791380",
         continuation=continuation,
-        expires_at=200.0,
+        expires_at=deadline,
     )
 
     contexts = ApprovalCardLedger(
         path, instance_id="gateway-c"
-    ).recoverable_delivery_contexts(now=100.0)
+    ).recoverable_delivery_contexts(now=time.time())
 
     assert recovery.action == "send"
     assert contexts == [continuation]
@@ -464,21 +466,22 @@ def test_recovery_expiry_is_durable_and_generation_fenced(tmp_path):
         clarify_id="clarify-old", session_key="session-old", choices=["Approve", "Reject"],
     )
     recovery_ledger = ApprovalCardLedger(path, instance_id="gateway-b")
+    deadline = time.time() + 60.0
     recovery = recovery_ledger.claim_recovery(
         old.card_id,
         platform="telegram",
         chat_id="327791380",
         continuation={"session_chat_id": "delivery", "delivery": {}},
-        expires_at=100.0,
+        expires_at=deadline,
     )
     assert recovery_ledger.activate_recovery(
         old.card_id, recovery.delivery_generation, "600") is True
 
     assert recovery_ledger.expire_recovery(
-        old.card_id, "0" * 32, now=100.0
+        old.card_id, "0" * 32, now=deadline
     ) is False
     assert recovery_ledger.expire_recovery(
-        old.card_id, recovery.delivery_generation, now=100.0
+        old.card_id, recovery.delivery_generation, now=deadline
     ) is True
     assert recovery_ledger.observe_recovery(old.card_id).status == "failed"
 
@@ -487,11 +490,97 @@ def test_recovery_expiry_is_durable_and_generation_fenced(tmp_path):
         platform="telegram",
         chat_id="327791380",
         continuation={"session_chat_id": "delivery", "delivery": {}},
-        expires_at=1000.0,
+        expires_at=deadline + 900.0,
     )
     assert reclaimed.action == "expired"
-    assert reclaimed.expires_at == 100.0
+    assert reclaimed.expires_at == deadline
     assert recovery_ledger.observe_recovery(old.card_id).status == "failed"
+
+
+def test_recovery_answer_and_activation_expire_atomically_at_deadline(tmp_path):
+    path = tmp_path / "approval-cards.db"
+    crashed = ApprovalCardLedger(path, instance_id="gateway-a")
+    old = crashed.claim(
+        _binding(), platform="telegram", chat_id="327791380",
+        clarify_id="clarify-old", session_key="session-old", choices=["Approve", "Reject"],
+    )
+    ledger = ApprovalCardLedger(path, instance_id="gateway-b")
+    recovery = ledger.claim_recovery(
+        old.card_id, platform="telegram", chat_id="327791380",
+        continuation={"session_chat_id": "delivery", "delivery": {}},
+        expires_at=time.time() + 60.0,
+    )
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE approval_recoveries SET expires_at = ? WHERE card_id = ?",
+            (time.time() - 1.0, old.card_id),
+        )
+
+    assert ledger.activate_recovery(
+        old.card_id, recovery.delivery_generation, "600"
+    ) is False
+    assert ledger.answer_choice(recovery.clarify_id, 0) is None
+    assert ledger.observe_recovery(old.card_id).status == "failed"
+    assert ledger.observe(old.binding_key).status == "pending"
+
+
+def test_nullable_existing_recovery_generation_is_repaired_before_callback(tmp_path):
+    path = tmp_path / "approval-cards.db"
+    crashed = ApprovalCardLedger(path, instance_id="gateway-a")
+    old = crashed.claim(
+        _binding(), platform="telegram", chat_id="327791380",
+        clarify_id="clarify-old", session_key="session-old", choices=["Approve", "Reject"],
+    )
+    ledger = ApprovalCardLedger(path, instance_id="gateway-b")
+    recovery = ledger.claim_recovery(
+        old.card_id, platform="telegram", chat_id="327791380",
+        expires_at=time.time() + 60.0,
+    )
+    legacy_id = f"approval-recovery-{old.card_id}"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            ALTER TABLE approval_recoveries RENAME TO approval_recoveries_current;
+            CREATE TABLE approval_recoveries (
+                card_id INTEGER PRIMARY KEY REFERENCES approval_cards(card_id),
+                clarify_id TEXT NOT NULL UNIQUE,
+                instance_id TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                message_id TEXT,
+                generation TEXT,
+                status TEXT NOT NULL,
+                response TEXT,
+                continuation_json TEXT,
+                expires_at REAL,
+                updated_at REAL NOT NULL
+            );
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO approval_recoveries(
+                card_id, clarify_id, instance_id, platform, chat_id, message_id,
+                generation, status, response, continuation_json, expires_at, updated_at
+            )
+            SELECT card_id, ?, instance_id, platform, chat_id, message_id,
+                   NULL, status, response, continuation_json, expires_at, updated_at
+            FROM approval_recoveries_current
+            """,
+            (legacy_id,),
+        )
+        connection.execute("DROP TABLE approval_recoveries_current")
+
+    upgraded = ApprovalCardLedger(path, instance_id="gateway-c")
+
+    assert upgraded.answer_choice(legacy_id, 1) == "Manter bloqueado"
+    with sqlite3.connect(path) as connection:
+        generation, status = connection.execute(
+            "SELECT generation, status FROM approval_recoveries WHERE card_id = ?",
+            (old.card_id,),
+        ).fetchone()
+    assert generation is not None
+    assert status == "answered"
 
 
 def test_nullable_legacy_decision_digest_cannot_reuse_answered_binding(tmp_path):
