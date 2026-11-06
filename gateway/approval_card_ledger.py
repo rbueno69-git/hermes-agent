@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -32,6 +33,7 @@ class ApprovalClaim:
     message_id: Optional[str] = None
     response: Optional[str] = None
     owner_instance_id: Optional[str] = None
+    delivery_generation: Optional[str] = None
     superseded: Tuple[ApprovalCard, ...] = ()
 
 
@@ -110,6 +112,7 @@ class ApprovalCardLedger:
                     platform TEXT NOT NULL,
                     chat_id TEXT NOT NULL,
                     message_id TEXT,
+                    generation TEXT NOT NULL,
                     status TEXT NOT NULL CHECK(status IN ('delivering','active','answered','failed')),
                     response TEXT,
                     updated_at REAL NOT NULL
@@ -119,6 +122,15 @@ class ApprovalCardLedger:
             columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(approval_cards)")}
             if "choices_json" not in columns:
                 connection.execute("ALTER TABLE approval_cards ADD COLUMN choices_json TEXT")
+            recovery_columns = {
+                str(row[1]) for row in connection.execute("PRAGMA table_info(approval_recoveries)")
+            }
+            if "generation" not in recovery_columns:
+                connection.execute("ALTER TABLE approval_recoveries ADD COLUMN generation TEXT")
+                connection.execute(
+                    "UPDATE approval_recoveries SET generation = lower(hex(randomblob(16))) "
+                    "WHERE generation IS NULL"
+                )
         os.chmod(self.path, 0o600)
 
     @staticmethod
@@ -265,6 +277,7 @@ class ApprovalCardLedger:
         if card_id is None:
             raise ValueError("card_id is required")
         clarify_id = f"approval-recovery-{int(card_id)}"
+        generation = secrets.token_hex(16)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             card = connection.execute(
@@ -289,31 +302,36 @@ class ApprovalCardLedger:
                     connection.execute(
                         """
                         UPDATE approval_recoveries SET instance_id = ?, platform = ?, chat_id = ?,
-                            message_id = NULL, updated_at = ?
+                            message_id = NULL, generation = ?, updated_at = ?
                         WHERE card_id = ? AND status = 'delivering'
                         """,
-                        (self.instance_id, str(platform), str(chat_id), time.time(), int(card_id)),
+                        (self.instance_id, str(platform), str(chat_id), generation,
+                         time.time(), int(card_id)),
                     )
                     connection.commit()
                     return ApprovalClaim(
                         action="send", binding_key=str(card["binding_key"]),
                         card_id=int(card_id), clarify_id=clarify_id,
                         owner_instance_id=self.instance_id,
+                        delivery_generation=generation,
                     )
                 if existing["status"] == "failed":
                     connection.execute(
                         """
                         UPDATE approval_recoveries SET instance_id = ?, platform = ?, chat_id = ?,
-                            message_id = NULL, status = 'delivering', response = NULL, updated_at = ?
+                            message_id = NULL, generation = ?, status = 'delivering',
+                            response = NULL, updated_at = ?
                         WHERE card_id = ? AND status = 'failed'
                         """,
-                        (self.instance_id, str(platform), str(chat_id), time.time(), int(card_id)),
+                        (self.instance_id, str(platform), str(chat_id), generation,
+                         time.time(), int(card_id)),
                     )
                     connection.commit()
                     return ApprovalClaim(
                         action="send", binding_key=str(card["binding_key"]),
                         card_id=int(card_id), clarify_id=clarify_id,
                         owner_instance_id=self.instance_id,
+                        delivery_generation=generation,
                     )
                 connection.commit()
                 action = "reuse_answered" if existing["status"] == "answered" else "reuse_active"
@@ -325,25 +343,30 @@ class ApprovalCardLedger:
                     message_id=(str(existing["message_id"]) if existing["message_id"] is not None else None),
                     response=(str(existing["response"]) if existing["response"] is not None else None),
                     owner_instance_id=str(existing["instance_id"]),
+                    delivery_generation=str(existing["generation"]),
                 )
             connection.execute(
                 """
                 INSERT INTO approval_recoveries(
                     card_id, clarify_id, instance_id, platform, chat_id,
-                    message_id, status, response, updated_at
-                ) VALUES (?, ?, ?, ?, ?, NULL, 'delivering', NULL, ?)
+                    message_id, generation, status, response, updated_at
+                ) VALUES (?, ?, ?, ?, ?, NULL, ?, 'delivering', NULL, ?)
                 """,
-                (int(card_id), clarify_id, self.instance_id, str(platform), str(chat_id), time.time()),
+                (int(card_id), clarify_id, self.instance_id, str(platform), str(chat_id),
+                 generation, time.time()),
             )
             connection.commit()
             return ApprovalClaim(
                 action="send", binding_key=str(card["binding_key"]),
                 card_id=int(card_id), clarify_id=clarify_id,
                 owner_instance_id=self.instance_id,
+                delivery_generation=generation,
             )
 
-    def activate_recovery(self, card_id: Optional[int], message_id: str) -> bool:
-        if card_id is None:
+    def activate_recovery(
+        self, card_id: Optional[int], generation: Optional[str], message_id: str,
+    ) -> bool:
+        if card_id is None or not generation:
             return False
         with self._connect() as connection:
             changed = connection.execute(
@@ -351,22 +374,22 @@ class ApprovalCardLedger:
                 UPDATE approval_recoveries SET
                     status = CASE WHEN status = 'answered' THEN 'answered' ELSE 'active' END,
                     message_id = ?, updated_at = ?
-                WHERE card_id = ? AND status IN ('delivering','answered')
+                WHERE card_id = ? AND generation = ? AND status IN ('delivering','answered')
                 """,
-                (str(message_id), time.time(), int(card_id)),
+                (str(message_id), time.time(), int(card_id), str(generation)),
             ).rowcount
             return changed == 1
 
-    def fail_recovery(self, card_id: Optional[int]) -> None:
-        if card_id is None:
+    def fail_recovery(self, card_id: Optional[int], generation: Optional[str]) -> None:
+        if card_id is None or not generation:
             return
         with self._connect() as connection:
             connection.execute(
                 """
                 UPDATE approval_recoveries SET status = 'failed', updated_at = ?
-                WHERE card_id = ? AND status IN ('delivering','active')
+                WHERE card_id = ? AND generation = ? AND status IN ('delivering','active')
                 """,
-                (time.time(), int(card_id)),
+                (time.time(), int(card_id), str(generation)),
             )
 
     def observe_recovery(self, card_id: Optional[int]) -> ApprovalObservation:

@@ -249,6 +249,13 @@ def test_stale_recovery_delivery_is_safely_reissued_without_authorizing_item(tmp
 
     assert takeover.action == "send"
     assert takeover.owner_instance_id == "gateway-c"
+    assert takeover.delivery_generation != first_recovery.delivery_generation
+    assert crashed.activate_recovery(
+        old.card_id, first_recovery.delivery_generation, "600"
+    ) is False
+    assert crashed.activate_recovery(
+        old.card_id, takeover.delivery_generation, "601"
+    ) is True
     assert crashed.observe(old.binding_key).status == "pending"
 
 

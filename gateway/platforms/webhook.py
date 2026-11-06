@@ -525,7 +525,9 @@ class WebhookAdapter(BasePlatformAdapter):
                                 metadata=recovery_metadata or None,
                             )
                             if not recovery_result.success or not recovery_result.message_id:
-                                ledger.fail_recovery(claim.card_id)
+                                ledger.fail_recovery(
+                                    claim.card_id, recovery_claim.delivery_generation,
+                                )
                                 clear_session(recovery_session)
                                 resolve_gateway_clarify(clarify_id, CANCELLED, persist=False)
                                 error = (
@@ -538,7 +540,25 @@ class WebhookAdapter(BasePlatformAdapter):
                                     error=error,
                                     raw_response={"ambiguous": True},
                                 )
-                            ledger.activate_recovery(claim.card_id, recovery_result.message_id)
+                            recovery_activated = ledger.activate_recovery(
+                                claim.card_id,
+                                recovery_claim.delivery_generation,
+                                recovery_result.message_id,
+                            )
+                            if not recovery_activated:
+                                clear_session(recovery_session)
+                                resolve_gateway_clarify(recovery_id, CANCELLED, persist=False)
+                                try:
+                                    await adapter.retire_clarify_card(
+                                        recovery_id,
+                                        "This recovery control was superseded by a newer delivery.",
+                                    )
+                                except Exception:
+                                    logger.exception(
+                                        "Failed to retire stale approval recovery %s",
+                                        recovery_id,
+                                    )
+                                return recovery_result
                         task = asyncio.create_task(self._resume_after_approval_recovery(
                             adapter=adapter,
                             recovery_id=recovery_id,
