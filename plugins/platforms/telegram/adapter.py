@@ -4954,13 +4954,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             # approval ledger still owns the card and its exact choices.
             try:
                 from gateway.approval_card_ledger import ApprovalCardLedger
-                from hermes_constants import get_hermes_home
-                profile_name = getattr(self, "_hermes_profile_name", None)
-                if profile_name and profile_name != "default":
-                    from hermes_cli.profiles import get_profile_dir
-                    ledger_path = get_profile_dir(profile_name) / "approval_cards.db"
-                else:
-                    ledger_path = get_hermes_home() / "approval_cards.db"
+                from hermes_constants import get_process_hermes_home
+                ledger_path = get_process_hermes_home() / "approval_cards.db"
                 if ledger_path.exists():
                     ledger = ApprovalCardLedger(ledger_path, instance_id="telegram-callback")
                     resolved_text = ledger.answer_choice(clarify_id, idx)

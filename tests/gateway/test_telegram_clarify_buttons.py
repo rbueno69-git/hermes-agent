@@ -289,6 +289,7 @@ class TestTelegramClarifyCallback:
             cm.set_resolution_probe(
                 "replacement-wait", lambda: ledger.response_for_binding(claim.binding_key))
             adapter = _make_adapter()
+            adapter._hermes_profile_name = "coder"
             query = AsyncMock()
             query.data = "cl:old-card:0"
             query.message = MagicMock(chat_id=12345, text="Approve?")
