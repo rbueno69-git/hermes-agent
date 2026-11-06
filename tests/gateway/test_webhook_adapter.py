@@ -55,6 +55,33 @@ def test_declared_approval_with_malformed_binding_fails_closed():
         _approval_binding_from_payload(payload)
 
 
+@pytest.mark.parametrize(
+    ("accepted", "recipient_status", "binding_status", "executor"),
+    [
+        (False, "explicit_foreign", "foreign_executor", "openclaw"),
+        (False, "invalid", "not_eligible", "openclaw"),
+        (False, "unknown", "not_eligible", "openclaw"),
+        (False, "absent", "not_eligible", "openclaw"),
+        (False, "explicit_local", "not_eligible", "openclaw"),
+        (None, "explicit_foreign", None, "openclaw"),
+    ],
+)
+def test_foreign_or_invalid_recipient_cannot_fall_through_as_non_approval(
+    accepted, recipient_status, binding_status, executor,
+):
+    payload = {
+        "recipient_status": recipient_status,
+        "executor": executor,
+    }
+    if accepted is not None:
+        payload["contract_accepted"] = accepted
+    if binding_status is not None:
+        payload["executor_binding_status"] = binding_status
+
+    with pytest.raises(ValueError, match="invalid approval binding state"):
+        _approval_binding_from_payload(payload)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -798,6 +825,8 @@ class TestSessionIsolation:
             "contract_scope": "Somente leitura; merge e deploy autorizados.",
             "contract_accepted": True,
             "executor_binding_status": "pending_approval",
+            "recipient_status": "absent",
+            "executor": "",
         }
         task = adapter._spawn_agent_run(
             payload,
@@ -817,6 +846,7 @@ class TestSessionIsolation:
             "head_sha": payload["head_sha"],
             "contract_digest_sha256": payload["contract_digest_sha256"],
             "scope": payload["contract_scope"],
+            "selected_executor": "hermes",
         }
 
 

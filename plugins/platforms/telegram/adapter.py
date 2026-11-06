@@ -4342,7 +4342,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                 text += "\n\n" + "\n".join(f"{i + 1}. {_html.escape(str(c))}" for i, c in enumerate(choices))
                 # Telegram caps callback_data at 64 bytes; keep "cl:<id>:<idx>" short.
                 rows = [[InlineKeyboardButton(str(idx + 1), callback_data=f"cl:{clarify_id}:{idx}")] for idx in range(len(choices))]
-                rows.append([InlineKeyboardButton(t("platform.telegram.prompt.other"), callback_data=f"cl:{clarify_id}:other")])
+                if not (isinstance(metadata, dict) and metadata.get("is_approval_prompt") is True):
+                    rows.append([InlineKeyboardButton(t("platform.telegram.prompt.other"), callback_data=f"cl:{clarify_id}:other")])
                 keyboard = InlineKeyboardMarkup(rows)
             def _record(msg) -> None:
                 self._clarify_state[clarify_id] = session_key

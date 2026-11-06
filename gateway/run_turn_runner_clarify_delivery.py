@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 UNDELIVERED = "[clarify prompt could not be delivered]"
 UNDELIVERED_DECLINED = "[clarify prompt could not be delivered: destination refused]"
+UNDELIVERED_POLICY = "[clarify prompt rejected by approval policy]"
 # No status adapter (a run whose chat surface is gone).
 UNDELIVERED_NO_SURFACE = "[clarify prompt could not be delivered: no chat surface]"
 
@@ -56,6 +57,10 @@ def _abort_for_outcome(outcome: str, *, session_key: str, clarify_mod) -> Option
         )
         clarify_mod.clear_session(session_key)
         return UNDELIVERED_DECLINED
+    if outcome == "policy_rejected":
+        logger.warning("Clarify prompt rejected by approval policy; clearing registration")
+        clarify_mod.clear_session(session_key)
+        return UNDELIVERED_POLICY
     if outcome == "failed":
         # Undeliverable: clear the registration and return the sentinel so the agent falls back, not hangs.
         logger.warning("Clarify send failed definitively; clearing registration")
@@ -164,6 +169,9 @@ class _LateFailureWatch:
             # Refused destination: no text retry (see ``_clarify_send_then_wait``), and the notice
             # says so rather than the generic delivery failure.
             self._release(UNDELIVERED_DECLINED)
+            return
+        if outcome == "policy_rejected":
+            self._release(UNDELIVERED_POLICY)
             return
         fallback_fut = self._fallback() if self._fallback is not None else None
         if fallback_fut is None:

@@ -83,8 +83,16 @@ def _approval_binding_from_payload(payload: Any) -> Optional[Dict[str, str]]:
         return None
     accepted = payload.get("contract_accepted")
     binding_status = payload.get("executor_binding_status")
-    if accepted is not True and binding_status != "pending_approval":
+    recipient_status = payload.get("recipient_status")
+    declared_executor = payload.get("executor")
+    if not any(key in payload for key in ("contract_accepted", "executor_binding_status", "recipient_status")):
         return None
+    if accepted is False and binding_status == "not_eligible":
+        if recipient_status == "absent" and declared_executor == "":
+            return None
+        if recipient_status == "explicit_local" and declared_executor == "hermes":
+            return None
+        raise ValueError("invalid approval binding state")
     if accepted is not True or binding_status != "pending_approval":
         raise ValueError("invalid approval binding state")
     item_key = payload.get("item_key")
@@ -99,7 +107,21 @@ def _approval_binding_from_payload(payload: Any) -> Optional[Dict[str, str]]:
         raise ValueError("invalid approval binding contract_digest_sha256")
     if not isinstance(scope, str) or not scope or len(scope) > 4000:
         raise ValueError("invalid approval binding contract_scope")
-    return {"item_key": item_key, "head_sha": head_sha, "contract_digest_sha256": digest, "scope": scope}
+    if recipient_status == "absent":
+        if declared_executor != "":
+            raise ValueError("unassigned approval binding cannot declare an executor")
+    elif recipient_status == "explicit_local":
+        if declared_executor != "hermes":
+            raise ValueError("local approval binding must declare hermes")
+    else:
+        raise ValueError("invalid recipient status for local approval binding")
+    return {
+        "item_key": item_key,
+        "head_sha": head_sha,
+        "contract_digest_sha256": digest,
+        "scope": scope,
+        "selected_executor": "hermes",
+    }
 
 
 @dataclass(frozen=True)
@@ -487,11 +509,21 @@ class WebhookAdapter(BasePlatformAdapter):
             target_metadata = dict(metadata or {})
             if thread_id:
                 target_metadata["thread_id"] = thread_id
-            target_metadata["is_approval_prompt"] = True
             binding = delivery.get("approval_binding")
             if isinstance(binding, dict):
+                if (
+                    type(choices) is not list
+                    or not choices
+                    or any(type(choice) is not str or not choice for choice in choices)
+                ):
+                    return SendResult(
+                        success=False,
+                        error="Approval prompt requires closed choices",
+                        raw_response={"approval_policy_rejected": True},
+                    )
+                target_metadata["is_approval_prompt"] = True
                 decision_semantics = {
-                    "executor": "hermes",
+                    "executor": binding.get("selected_executor"),
                     "action_type": "approval",
                     "item_key": binding.get("item_key"),
                     "question": question,

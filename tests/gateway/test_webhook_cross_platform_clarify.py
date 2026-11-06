@@ -44,8 +44,41 @@ async def test_webhook_clarify_delegates_to_cross_platform_native_buttons():
         choices=["Yes", "No"],
         clarify_id="clarify-1",
         session_key="webhook-session",
-        metadata={"source": "test", "thread_id": "42", "is_approval_prompt": True},
+        metadata={"source": "test", "thread_id": "42"},
     )
+
+
+@pytest.mark.asyncio
+async def test_approval_binding_without_closed_choices_is_not_published(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    target = MagicMock()
+    target.send_clarify = AsyncMock(return_value=SendResult(success=True))
+    runner = MagicMock()
+    runner._authorization_adapter.return_value = target
+    adapter = object.__new__(WebhookAdapter)
+    adapter.gateway_runner = runner
+    adapter._delivery_info = {
+        "approval-delivery": {
+            "deliver": "telegram",
+            "deliver_extra": {"chat_id": "327791380"},
+            "approval_binding": {
+                "item_key": "owner/repo#1",
+                "head_sha": "1" * 40,
+                "contract_digest_sha256": "2" * 64,
+                "scope": "merge",
+                "selected_executor": "hermes",
+            },
+        }
+    }
+
+    result = await adapter.send_clarify(
+        chat_id="approval-delivery", question="Approve?", choices=None,
+        clarify_id="clarify-empty", session_key="approval-session",
+    )
+
+    assert result.success is False
+    assert result.error == "Approval prompt requires closed choices"
+    target.send_clarify.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -57,6 +90,7 @@ async def test_definitive_native_failure_keeps_plaintext_fallback_answerable(tmp
         "item_key": "owner/repo#161", "head_sha": "1" * 40,
         "contract_digest_sha256": "2" * 64, "scope": "merge",
         "decision_digest_sha256": "3" * 64,
+        "selected_executor": "hermes",
     }
     with cm._lock:
         cm._entries.clear()
@@ -113,6 +147,7 @@ async def test_unlimited_timeout_keeps_durable_approval_answerable(tmp_path, mon
         "item_key": "owner/repo#unlimited", "head_sha": "1" * 40,
         "contract_digest_sha256": "2" * 64, "scope": "merge",
         "decision_digest_sha256": "3" * 64,
+        "selected_executor": "hermes",
     }
     cm.register("clarify-unlimited", "session-unlimited", "Approve?", ["Approve", "Reject"])
     target = MagicMock()
@@ -199,6 +234,7 @@ async def test_timeout_does_not_retire_a_durably_answered_card(tmp_path, monkeyp
         "item_key": "owner/repo#161", "head_sha": "1" * 40,
         "contract_digest_sha256": "2" * 64, "scope": "merge",
         "decision_digest_sha256": "3" * 64,
+        "selected_executor": "hermes",
     }
     target = MagicMock()
     target.send_clarify = AsyncMock(return_value=SendResult(success=True, message_id="501"))
@@ -255,6 +291,7 @@ async def test_equivalent_webhook_approvals_publish_one_card_across_sessions(tmp
         "head_sha": "1" * 40,
         "contract_digest_sha256": "2" * 64,
         "scope": "Somente leitura; merge e deploy autorizados.",
+        "selected_executor": "hermes",
     }
     adapter._delivery_info = {
         "delivery-a": {
@@ -296,6 +333,7 @@ async def test_originating_publisher_observes_answer_committed_by_another_gatewa
         "item_key": "owner/repo#161", "head_sha": "1" * 40,
         "contract_digest_sha256": "2" * 64, "scope": "merge",
         "decision_digest_sha256": "3" * 64,
+        "selected_executor": "hermes",
     }
     target = MagicMock()
     target.send_clarify = AsyncMock(return_value=SendResult(success=True, message_id="501"))
@@ -329,6 +367,7 @@ async def test_originating_publisher_observes_remote_supersession(tmp_path, monk
         "item_key": "owner/repo#161", "head_sha": "1" * 40,
         "contract_digest_sha256": "2" * 64, "scope": "merge",
         "decision_digest_sha256": "3" * 64,
+        "selected_executor": "hermes",
     }
     target = MagicMock()
     target.send_clarify = AsyncMock(return_value=SendResult(success=True, message_id="501"))
@@ -385,6 +424,7 @@ async def test_material_change_retires_old_card_before_publishing_replacement(tm
         "head_sha": "1" * 40,
         "contract_digest_sha256": "2" * 64,
         "scope": "Somente leitura.",
+        "selected_executor": "hermes",
     }
     new_binding = {**old_binding, "contract_digest_sha256": "3" * 64}
     adapter._delivery_info = {
@@ -424,6 +464,7 @@ async def test_submitted_decision_is_reused_after_gateway_restart(tmp_path, monk
         "head_sha": "1" * 40,
         "contract_digest_sha256": "2" * 64,
         "scope": "Somente leitura.",
+        "selected_executor": "hermes",
     }
     target = MagicMock()
     target.send_clarify = AsyncMock(return_value=SendResult(success=True, message_id="501"))
@@ -470,6 +511,7 @@ async def test_active_card_from_previous_gateway_is_reused_and_polled(tmp_path, 
         "item_key": "owner/repo#1", "head_sha": "1" * 40,
         "contract_digest_sha256": "2" * 64, "scope": "merge",
         "decision_digest_sha256": "3" * 64,
+        "selected_executor": "hermes",
     }
     target = MagicMock()
     target.send_clarify = AsyncMock(return_value=SendResult(success=True, message_id="501"))
@@ -515,6 +557,7 @@ async def test_material_successor_waits_until_ambiguous_predecessor_is_recorded(
         "item_key": "owner/repo#161", "head_sha": "1" * 40,
         "contract_digest_sha256": "2" * 64, "scope": "merge",
         "decision_digest_sha256": "3" * 64,
+        "selected_executor": "hermes",
     }
     first_started = asyncio.Event()
     release_first = asyncio.Event()
@@ -575,6 +618,7 @@ async def test_crashed_predecessor_requires_explicit_recovery_before_successor(t
         "item_key": "owner/repo#161", "head_sha": "1" * 40,
         "contract_digest_sha256": "2" * 64, "scope": "merge",
         "decision_digest_sha256": "3" * 64,
+        "selected_executor": "hermes",
     }
     crashed = ApprovalCardLedger(tmp_path / "approval_cards.db", instance_id="gateway-a")
     crashed.claim(
@@ -636,6 +680,7 @@ async def test_recovery_timeout_durably_expires_before_waiter_disappears(tmp_pat
         "item_key": "owner/repo#161", "head_sha": "1" * 40,
         "contract_digest_sha256": "2" * 64, "scope": "merge",
         "decision_digest_sha256": "3" * 64,
+        "selected_executor": "hermes",
     }
     crashed = ApprovalCardLedger(tmp_path / "approval_cards.db", instance_id="gateway-a")
     old = crashed.claim(
@@ -654,6 +699,7 @@ async def test_recovery_timeout_durably_expires_before_waiter_disappears(tmp_pat
             "approval_binding": {
                 "item_key": "owner/repo#161", "head_sha": "1" * 40,
                 "contract_digest_sha256": "4" * 64, "scope": "merge",
+                "selected_executor": "hermes",
             },
         },
     }
@@ -681,6 +727,7 @@ async def test_ambiguous_recovery_control_is_not_reissued(tmp_path, monkeypatch)
         "item_key": "owner/repo#161", "head_sha": "1" * 40,
         "contract_digest_sha256": "2" * 64, "scope": "merge",
         "decision_digest_sha256": "3" * 64,
+        "selected_executor": "hermes",
     }
     crashed = ApprovalCardLedger(tmp_path / "approval_cards.db", instance_id="gateway-a")
     old = crashed.claim(
@@ -728,6 +775,7 @@ async def test_recovery_delivery_without_message_id_fails_closed(tmp_path, monke
         "item_key": "owner/repo#161", "head_sha": "1" * 40,
         "contract_digest_sha256": "2" * 64, "scope": "merge",
         "decision_digest_sha256": "3" * 64,
+        "selected_executor": "hermes",
     }
     crashed = ApprovalCardLedger(tmp_path / "approval_cards.db", instance_id="gateway-a")
     old = crashed.claim(
@@ -774,6 +822,7 @@ async def test_late_recovery_sender_retires_control_after_losing_generation(
         "item_key": "owner/repo#161", "head_sha": "1" * 40,
         "contract_digest_sha256": "2" * 64, "scope": "merge",
         "decision_digest_sha256": "3" * 64,
+        "selected_executor": "hermes",
     }
     crashed = ApprovalCardLedger(tmp_path / "approval_cards.db", instance_id="gateway-a")
     old = crashed.claim(
@@ -824,6 +873,7 @@ async def test_late_recovery_sender_fails_closed_when_exact_retirement_fails(
         "item_key": "owner/repo#161", "head_sha": "1" * 40,
         "contract_digest_sha256": "2" * 64, "scope": "merge",
         "decision_digest_sha256": "3" * 64,
+        "selected_executor": "hermes",
     }
     crashed = ApprovalCardLedger(tmp_path / "approval_cards.db", instance_id="gateway-a")
     crashed.claim(
@@ -868,6 +918,7 @@ async def test_restart_hydrates_webhook_delivery_from_recovery_continuation(tmp_
             "item_key": "owner/repo#161", "head_sha": "1" * 40,
             "contract_digest_sha256": "2" * 64, "scope": "merge",
             "decision_digest_sha256": "3" * 64,
+            "selected_executor": "hermes",
         },
         platform="telegram", chat_id="327791380", clarify_id="old-card",
         session_key="old-session", choices=["Approve", "Reject"],
@@ -878,6 +929,7 @@ async def test_restart_hydrates_webhook_delivery_from_recovery_continuation(tmp_
         "approval_binding": {
             "item_key": "owner/repo#161", "head_sha": "1" * 40,
             "contract_digest_sha256": "2" * 64, "scope": "merge",
+            "selected_executor": "hermes",
         },
     }
     ApprovalCardLedger(tmp_path / "approval_cards.db", instance_id="gateway-b").claim_recovery(
@@ -926,6 +978,7 @@ def test_answered_recovery_continuation_has_one_lease_owner_and_fenced_completio
         "item_key": "owner/repo#161", "head_sha": "1" * 40,
         "contract_digest_sha256": "2" * 64, "scope": "merge",
         "decision_digest_sha256": "3" * 64,
+        "selected_executor": "hermes",
     }
     path = tmp_path / "approval-cards.db"
     crashed = ApprovalCardLedger(path, instance_id="gateway-a")
@@ -978,6 +1031,7 @@ async def test_restart_worker_reissues_answered_recovery_without_webhook_replay(
         "item_key": "owner/repo#161", "head_sha": "1" * 40,
         "contract_digest_sha256": "2" * 64, "scope": "merge",
         "decision_digest_sha256": "3" * 64,
+        "selected_executor": "hermes",
     }
     crashed = ApprovalCardLedger(tmp_path / "approval_cards.db", instance_id="gateway-a")
     old = crashed.claim(
@@ -990,6 +1044,7 @@ async def test_restart_worker_reissues_answered_recovery_without_webhook_replay(
         "approval_binding": {
             "item_key": "owner/repo#161", "head_sha": "1" * 40,
             "contract_digest_sha256": "4" * 64, "scope": "merge",
+            "selected_executor": "hermes",
         },
     }
     ledger = ApprovalCardLedger(tmp_path / "approval_cards.db", instance_id="gateway-b")
@@ -1041,6 +1096,7 @@ async def test_ambiguous_approval_send_remains_durably_delivering(tmp_path, monk
         "item_key": "owner/repo#161", "head_sha": "1" * 40,
         "contract_digest_sha256": "2" * 64, "scope": "merge",
         "decision_digest_sha256": "3" * 64,
+        "selected_executor": "hermes",
     }
     target = MagicMock()
     target.send_clarify = AsyncMock(return_value=SendResult(
@@ -1080,6 +1136,7 @@ async def test_timeout_expires_durable_card_before_waiter_returns(tmp_path, monk
         "item_key": "owner/repo#161", "head_sha": "1" * 40,
         "contract_digest_sha256": "2" * 64, "scope": "merge",
         "decision_digest_sha256": "3" * 64,
+        "selected_executor": "hermes",
     }
     target = MagicMock()
     target.send_clarify = AsyncMock(return_value=SendResult(success=True, message_id="501"))
@@ -1115,6 +1172,7 @@ async def test_late_send_success_is_retired_after_durable_timeout(tmp_path, monk
         "item_key": "owner/repo#161", "head_sha": "1" * 40,
         "contract_digest_sha256": "2" * 64, "scope": "merge",
         "decision_digest_sha256": "3" * 64,
+        "selected_executor": "hermes",
     }
     started = asyncio.Event()
     release = asyncio.Event()

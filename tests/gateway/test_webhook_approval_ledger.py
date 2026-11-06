@@ -16,6 +16,7 @@ def _binding(digest="2" * 64, head="1" * 40, decision="4" * 64):
         "contract_digest_sha256": digest,
         "scope": "Somente leitura; merge e deploy autorizados.",
         "decision_digest_sha256": decision,
+        "selected_executor": "hermes",
     }
 
 
@@ -139,6 +140,18 @@ def test_late_send_ack_cannot_reactivate_expired_card(tmp_path):
     assert ledger.observe_clarify("clarify-a").status == "failed"
 
 
+def test_free_form_answer_outside_persisted_choices_is_rejected(tmp_path):
+    ledger = ApprovalCardLedger(tmp_path / "approval-cards.db", instance_id="gateway-a")
+    claim = ledger.claim(
+        _binding(), platform="telegram", chat_id="327791380",
+        clarify_id="clarify-a", session_key="session-a", choices=["Approve", "Reject"],
+    )
+    assert ledger.activate(claim.card_id, "501") is True
+
+    assert ledger.answer("clarify-a", "Other arbitrary text") is False
+    assert ledger.observe(claim.binding_key).status == "pending"
+
+
 def test_stale_send_failure_cannot_erase_answered_decision(tmp_path):
     ledger = ApprovalCardLedger(tmp_path / "approval-cards.db", instance_id="gateway-a")
     claim = ledger.claim(
@@ -176,6 +189,12 @@ def test_changed_decision_semantics_never_reuses_answered_binding(tmp_path):
 
     assert changed.action == "send"
     assert changed.response is None
+
+    stale_replay = ledger.claim(
+        _binding(), platform="telegram", chat_id="327791380",
+        clarify_id="clarify-stale", session_key="session-stale", choices=["Approve", "Reject"],
+    )
+    assert stale_replay.action == "superseded"
 
 
 def test_material_change_waits_for_ambiguous_delivery_before_replacement(tmp_path):
@@ -344,7 +363,7 @@ def test_answered_binding_is_reused_after_gateway_restart(tmp_path):
     first_gateway = ApprovalCardLedger(path, instance_id="gateway-a")
     first = first_gateway.claim(
         _binding(), platform="telegram", chat_id="327791380",
-        clarify_id="clarify-a", session_key="session-a",
+        clarify_id="clarify-a", session_key="session-a", choices=["Aprovar", "Rejeitar"],
     )
     first_gateway.activate(first.card_id, "501")
     first_gateway.answer("clarify-a", "Aprovar")
@@ -383,7 +402,7 @@ def test_fast_answer_before_send_returns_is_persisted_with_message_id(tmp_path):
     ledger = ApprovalCardLedger(tmp_path / "approval-cards.db", instance_id="gateway-a")
     claim = ledger.claim(
         _binding(), platform="telegram", chat_id="327791380",
-        clarify_id="clarify-fast", session_key="session-fast",
+        clarify_id="clarify-fast", session_key="session-fast", choices=["Aprovar", "Rejeitar"],
     )
 
     assert ledger.answer("clarify-fast", "Aprovar") is True

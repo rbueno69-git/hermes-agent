@@ -52,7 +52,7 @@ class ApprovalObservation:
 def canonical_binding_key(binding: Dict[str, str]) -> str:
     required = {
         "item_key", "head_sha", "contract_digest_sha256", "scope",
-        "decision_digest_sha256",
+        "decision_digest_sha256", "selected_executor",
     }
     if type(binding) is not dict or set(binding) != required:
         raise ValueError("approval binding must contain the exact canonical fields")
@@ -94,6 +94,7 @@ class ApprovalCardLedger:
                     contract_digest_sha256 TEXT NOT NULL,
                     scope TEXT NOT NULL,
                     decision_digest_sha256 TEXT NOT NULL,
+                    selected_executor TEXT NOT NULL,
                     status TEXT NOT NULL CHECK(status IN ('pending','answered','superseded','failed')),
                     response TEXT,
                     updated_at REAL NOT NULL
@@ -145,6 +146,14 @@ class ApprovalCardLedger:
             connection.execute(
                 "UPDATE approval_bindings SET decision_digest_sha256 = 'legacy:' || binding_key "
                 "WHERE decision_digest_sha256 IS NULL"
+            )
+            if "selected_executor" not in binding_columns:
+                connection.execute(
+                    "ALTER TABLE approval_bindings ADD COLUMN selected_executor TEXT"
+                )
+            connection.execute(
+                "UPDATE approval_bindings SET selected_executor = 'hermes' "
+                "WHERE selected_executor IS NULL"
             )
             columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(approval_cards)")}
             if "choices_json" not in columns:
@@ -238,7 +247,7 @@ class ApprovalCardLedger:
             exact = connection.execute(
                 """
                 SELECT item_key, head_sha, contract_digest_sha256, scope,
-                       decision_digest_sha256, status, response
+                       decision_digest_sha256, selected_executor, status, response
                 FROM approval_bindings WHERE binding_key = ?
                 """,
                 (binding_key,),
@@ -247,7 +256,7 @@ class ApprovalCardLedger:
                 exact[field] != binding[field]
                 for field in (
                     "item_key", "head_sha", "contract_digest_sha256", "scope",
-                    "decision_digest_sha256",
+                    "decision_digest_sha256", "selected_executor",
                 )
             ):
                 connection.rollback()
@@ -343,10 +352,18 @@ class ApprovalCardLedger:
 
             connection.execute(
                 """
+                UPDATE approval_bindings
+                SET status = 'superseded', response = NULL, updated_at = ?
+                WHERE item_key = ? AND binding_key != ? AND status != 'superseded'
+                """,
+                (now, binding["item_key"], binding_key),
+            )
+            connection.execute(
+                """
                 INSERT INTO approval_bindings(
                     binding_key, item_key, head_sha, contract_digest_sha256, scope,
-                    decision_digest_sha256, status, response, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, ?)
+                    decision_digest_sha256, selected_executor, status, response, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?)
                 ON CONFLICT(binding_key) DO UPDATE SET
                     status = 'pending', response = NULL, updated_at = excluded.updated_at
                 """,
@@ -357,6 +374,7 @@ class ApprovalCardLedger:
                     binding["contract_digest_sha256"],
                     binding["scope"],
                     binding["decision_digest_sha256"],
+                    binding["selected_executor"],
                     now,
                 ),
             )
@@ -810,7 +828,8 @@ class ApprovalCardLedger:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT card_id, binding_key, status, expires_at FROM approval_cards WHERE clarify_id = ?", (clarify_id,)
+                "SELECT card_id, binding_key, status, choices_json, expires_at "
+                "FROM approval_cards WHERE clarify_id = ?", (clarify_id,)
             ).fetchone()
             if row is None or row["status"] not in ("delivering", "active"):
                 connection.commit()
@@ -823,6 +842,21 @@ class ApprovalCardLedger:
                 )
                 connection.commit()
                 return False
+            if not isinstance(response, str) or not row["choices_json"]:
+                connection.commit()
+                return False
+            try:
+                allowed_choices = json.loads(str(row["choices_json"]))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                connection.commit()
+                return False
+            if (
+                type(allowed_choices) is not list
+                or any(not isinstance(choice, str) or not choice for choice in allowed_choices)
+                or response not in allowed_choices
+            ):
+                connection.commit()
+                return False
             connection.execute(
                 "UPDATE approval_cards SET status = 'answered', updated_at = ? WHERE card_id = ?",
                 (now, int(row["card_id"])),
@@ -832,7 +866,7 @@ class ApprovalCardLedger:
                 UPDATE approval_bindings SET status = 'answered', response = ?, updated_at = ?
                 WHERE binding_key = ?
                 """,
-                (str(response), now, str(row["binding_key"])),
+                (response, now, str(row["binding_key"])),
             )
             connection.commit()
             return True

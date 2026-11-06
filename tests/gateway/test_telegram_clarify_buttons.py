@@ -188,6 +188,36 @@ class TestTelegramSendClarify:
         # succeeded — old truncation code could raise on edge cases)
 
     @pytest.mark.asyncio
+    async def test_approval_prompt_has_only_closed_choice_buttons(self):
+        adapter = _make_adapter()
+        mock_msg = MagicMock()
+        mock_msg.message_id = 101
+        adapter._bot.send_message = AsyncMock(return_value=mock_msg)
+
+        with (
+            patch(
+                "plugins.platforms.telegram.adapter.InlineKeyboardButton",
+                side_effect=lambda label, callback_data: (label, callback_data),
+            ),
+            patch(
+                "plugins.platforms.telegram.adapter.InlineKeyboardMarkup",
+                side_effect=lambda rows: rows,
+            ),
+        ):
+            await adapter.send_clarify(
+                chat_id="12345",
+                question="Approve?",
+                choices=["Approve", "Reject"],
+                clarify_id="cid-approval",
+                session_key="sk-approval",
+                metadata={"is_approval_prompt": True},
+            )
+
+        markup = adapter._bot.send_message.call_args[1]["reply_markup"]
+        callbacks = [button[1] for row in markup for button in row]
+        assert callbacks == ["cl:cid-approval:0", "cl:cid-approval:1"]
+
+    @pytest.mark.asyncio
     async def test_html_escapes_question(self):
         adapter = _make_adapter()
         mock_msg = MagicMock()
@@ -290,6 +320,7 @@ class TestTelegramClarifyCallback:
             "item_key": "owner/repo#1", "head_sha": "1" * 40,
             "contract_digest_sha256": "2" * 64, "scope": "merge",
             "decision_digest_sha256": "3" * 64,
+            "selected_executor": "hermes",
         }
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path), "TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
             ledger = ApprovalCardLedger(tmp_path / "approval_cards.db", instance_id="old")

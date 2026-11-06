@@ -803,6 +803,9 @@ def _approval_send_outcome(future, timeout: float) -> str:
         # rather than the boolean the shared helper answers.
         logger.warning("Prompt send AMBIGUOUS (lost ack): %s", _raw.get("error"))
         return "ambiguous"
+    if isinstance(_raw, dict) and _raw.get("approval_policy_rejected") is True:
+        logger.warning("Prompt send rejected by approval policy")
+        return "policy_rejected"
     if declined_send(result):
         # Both shapes, one classifier: a structured body, or the uniform
         # decline sentence from an older connector.
