@@ -76,14 +76,14 @@ class ApprovalCardLedger:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=5.0)
+    def _connect(self, *, timeout: float = 5.0) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path, timeout=timeout)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
     def _initialize(self) -> None:
-        with self._connect() as connection:
+        with self._connect(timeout=30.0) as connection:
             connection.executescript(
                 """
                 BEGIN IMMEDIATE;

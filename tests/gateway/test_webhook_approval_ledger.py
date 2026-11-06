@@ -749,6 +749,24 @@ def test_concurrent_legacy_schema_migration_is_serialized(tmp_path, monkeypatch)
     assert "decision_digest_sha256" in columns
 
 
+def test_startup_migration_waits_through_normal_writer_contention(tmp_path):
+    path = tmp_path / "approval-cards.db"
+    ApprovalCardLedger(path, instance_id="gateway-a")
+    writer = sqlite3.connect(path)
+    writer.execute("BEGIN IMMEDIATE")
+    writer.execute(
+        "UPDATE approval_bindings SET updated_at = updated_at WHERE 0"
+    )
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(ApprovalCardLedger, path, instance_id="gateway-b")
+        time.sleep(5.25)
+        writer.commit()
+        restarted = future.result(timeout=10)
+    writer.close()
+
+    assert restarted.instance_id == "gateway-b"
+
+
 def test_recovery_callback_data_fits_telegram_limit_at_maximum_card_id(tmp_path):
     path = tmp_path / "approval-cards.db"
     ledger = ApprovalCardLedger(path, instance_id="gateway-a")
