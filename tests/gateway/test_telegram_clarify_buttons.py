@@ -96,6 +96,19 @@ def _clear_clarify_state():
 # send_clarify — render
 # ===========================================================================
 
+def test_timeout_classifier_traverses_cause_and_context_branches():
+    from plugins.platforms.telegram.adapter import _is_ambiguous_telegram_timeout
+
+    class ReadTimeout(Exception):
+        pass
+
+    outer = RuntimeError("outer")
+    outer.__cause__ = ValueError("non-timeout cause")
+    outer.__context__ = ReadTimeout("late read acknowledgement")
+
+    assert _is_ambiguous_telegram_timeout(outer) is True
+
+
 class TestTelegramSendClarify:
     """Verify the rendered prompt has buttons or none, and stores state."""
 

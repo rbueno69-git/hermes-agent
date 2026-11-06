@@ -42,15 +42,20 @@ def _redact_telegram_error_text(error: object) -> str:
 
 def _is_ambiguous_telegram_timeout(error: BaseException) -> bool:
     """Conservatively classify timeouts that may follow a committed Telegram send."""
-    current: Optional[BaseException] = error
+    pending: List[BaseException] = [error]
     seen: Set[int] = set()
-    while current is not None and id(current) not in seen:
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
         seen.add(id(current))
         if isinstance(current, asyncio.TimeoutError) or type(current).__name__ in {
             "TimedOut", "ReadTimeout", "WriteTimeout",
         }:
             return True
-        current = current.__cause__ or current.__context__
+        for linked in (current.__cause__, current.__context__):
+            if isinstance(linked, BaseException) and id(linked) not in seen:
+                pending.append(linked)
     return False
 
 

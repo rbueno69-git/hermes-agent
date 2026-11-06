@@ -15,6 +15,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 RECOVERY_PREFIX = "approval-rcv-"
 LEGACY_RECOVERY_PREFIX = "approval-recovery-"
+_DEFAULT_EXPIRY = object()
 
 
 @dataclass(frozen=True)
@@ -149,10 +150,10 @@ class ApprovalCardLedger:
                 connection.execute("ALTER TABLE approval_cards ADD COLUMN choices_json TEXT")
             if "expires_at" not in columns:
                 connection.execute("ALTER TABLE approval_cards ADD COLUMN expires_at REAL")
-            connection.execute(
-                "UPDATE approval_cards SET status = 'failed' "
-                "WHERE expires_at IS NULL AND status IN ('delivering','active')"
-            )
+                connection.execute(
+                    "UPDATE approval_cards SET status = 'failed' "
+                    "WHERE expires_at IS NULL AND status IN ('delivering','active')"
+                )
             recovery_columns = {
                 str(row[1]) for row in connection.execute("PRAGMA table_info(approval_recoveries)")
             }
@@ -214,11 +215,17 @@ class ApprovalCardLedger:
         session_key: str,
         choices: Optional[List[str]] = None,
         is_active: Optional[Callable[[str], bool]] = None,
-        expires_at: Optional[float] = None,
+        expires_at: object = _DEFAULT_EXPIRY,
     ) -> ApprovalClaim:
         binding_key = canonical_binding_key(binding)
         now = time.time()
-        expires_at = now + 28800.0 if expires_at is None else float(expires_at)
+        if expires_at is _DEFAULT_EXPIRY:
+            normalized_expires_at: Optional[float] = now + 28800.0
+        elif expires_at is None:
+            normalized_expires_at = None
+        else:
+            normalized_expires_at = float(expires_at)
+        expires_at = normalized_expires_at
         if choices is not None and (
             type(choices) is not list or not choices
             or any(not isinstance(choice, str) or not choice for choice in choices)
@@ -736,7 +743,7 @@ class ApprovalCardLedger:
                     message_id = ?, updated_at = ?
                 WHERE card_id = ?
                   AND (status = 'answered' OR (
-                      status = 'delivering' AND expires_at IS NOT NULL AND expires_at > ?
+                      status = 'delivering' AND (expires_at IS NULL OR expires_at > ?)
                   ))
                 """,
                 (str(message_id), now, int(card_id), now),
@@ -808,7 +815,7 @@ class ApprovalCardLedger:
                 connection.commit()
                 return False
             now = time.time()
-            if row["expires_at"] is None or float(row["expires_at"]) <= now:
+            if row["expires_at"] is not None and float(row["expires_at"]) <= now:
                 connection.execute(
                     "UPDATE approval_cards SET status = 'failed', updated_at = ? WHERE card_id = ?",
                     (now, int(row["card_id"])),
@@ -954,7 +961,7 @@ class ApprovalCardLedger:
                 connection.commit()
                 return None
             now = time.time()
-            if row["expires_at"] is None or float(row["expires_at"]) <= now:
+            if row["expires_at"] is not None and float(row["expires_at"]) <= now:
                 connection.execute(
                     "UPDATE approval_cards SET status = 'failed', updated_at = ? WHERE card_id = ?",
                     (now, int(row["card_id"])),

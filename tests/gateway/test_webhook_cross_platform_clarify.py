@@ -96,6 +96,61 @@ async def test_definitive_native_failure_keeps_plaintext_fallback_answerable(tmp
 
 
 @pytest.mark.asyncio
+async def test_unlimited_timeout_keeps_durable_approval_answerable(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools import clarify_gateway as cm
+
+    monkeypatch.setattr(cm, "get_clarify_timeout", lambda: 0)
+    with cm._lock:
+        cm._entries.clear()
+        cm._session_index.clear()
+        cm._linked_entries.clear()
+        cm._resolution_cbs.clear()
+        cm._resolution_probes.clear()
+        cm._expiry_cbs.clear()
+        cm._resolving.clear()
+    binding = {
+        "item_key": "owner/repo#unlimited", "head_sha": "1" * 40,
+        "contract_digest_sha256": "2" * 64, "scope": "merge",
+        "decision_digest_sha256": "3" * 64,
+    }
+    cm.register("clarify-unlimited", "session-unlimited", "Approve?", ["Approve", "Reject"])
+    target = MagicMock()
+    target.send_clarify = AsyncMock(return_value=SendResult(success=True, message_id="701"))
+    runner = MagicMock()
+    runner._authorization_adapter.return_value = target
+    adapter = object.__new__(WebhookAdapter)
+    adapter.gateway_runner = runner
+    adapter._approval_instance_id = "gateway-unlimited"
+    adapter._approval_ledgers = {}
+    adapter._approval_prompt_lock = asyncio.Lock()
+    adapter._delivery_info = {
+        "delivery": {"deliver": "telegram", "deliver_extra": {"chat_id": "327791380"},
+                     "approval_binding": binding}
+    }
+
+    result = await adapter.send_clarify(
+        chat_id="delivery", question="Approve?", choices=["Approve", "Reject"],
+        clarify_id="clarify-unlimited", session_key="session-unlimited",
+    )
+
+    assert result.success is True
+    ledger = adapter._approval_ledger()
+    with ledger._connect() as connection:
+        row = connection.execute(
+            "SELECT status, expires_at FROM approval_cards WHERE clarify_id = ?",
+            ("clarify-unlimited",),
+        ).fetchone()
+    assert tuple(row) == ("active", None)
+    assert cm.resolve_gateway_clarify("clarify-unlimited", "Approve") is True
+    with ledger._connect() as connection:
+        status = connection.execute(
+            "SELECT status FROM approval_bindings"
+        ).fetchone()[0]
+    assert status == "answered"
+
+
+@pytest.mark.asyncio
 async def test_webhook_clarify_without_interactive_destination_fails_before_wait():
     adapter = object.__new__(WebhookAdapter)
     adapter.gateway_runner = MagicMock()

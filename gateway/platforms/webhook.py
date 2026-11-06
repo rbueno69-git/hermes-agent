@@ -540,7 +540,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 )
                 approval_timeout = float(get_clarify_timeout())
                 approval_expires_at = (
-                    time.time() + approval_timeout if approval_timeout > 0 else time.time()
+                    time.time() + approval_timeout if approval_timeout > 0 else None
                 )
                 claim = ledger.claim(
                     binding, platform=deliver_type, chat_id=str(target_chat_id),
