@@ -106,6 +106,7 @@ class ApprovalCardLedger:
                     chat_id TEXT NOT NULL,
                     message_id TEXT,
                     choices_json TEXT,
+                    expires_at REAL,
                     status TEXT NOT NULL CHECK(status IN ('delivering','active','answered','superseded','failed')),
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
@@ -146,6 +147,12 @@ class ApprovalCardLedger:
             columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(approval_cards)")}
             if "choices_json" not in columns:
                 connection.execute("ALTER TABLE approval_cards ADD COLUMN choices_json TEXT")
+            if "expires_at" not in columns:
+                connection.execute("ALTER TABLE approval_cards ADD COLUMN expires_at REAL")
+            connection.execute(
+                "UPDATE approval_cards SET status = 'failed' "
+                "WHERE expires_at IS NULL AND status IN ('delivering','active')"
+            )
             recovery_columns = {
                 str(row[1]) for row in connection.execute("PRAGMA table_info(approval_recoveries)")
             }
@@ -207,15 +214,17 @@ class ApprovalCardLedger:
         session_key: str,
         choices: Optional[List[str]] = None,
         is_active: Optional[Callable[[str], bool]] = None,
+        expires_at: Optional[float] = None,
     ) -> ApprovalClaim:
         binding_key = canonical_binding_key(binding)
+        now = time.time()
+        expires_at = now + 28800.0 if expires_at is None else float(expires_at)
         if choices is not None and (
             type(choices) is not list or not choices
             or any(not isinstance(choice, str) or not choice for choice in choices)
         ):
             raise ValueError("approval choices must be a non-empty list of strings")
         choices_json = json.dumps(choices, ensure_ascii=False, separators=(",", ":")) if choices else None
-        now = time.time()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             exact = connection.execute(
@@ -235,6 +244,9 @@ class ApprovalCardLedger:
             ):
                 connection.rollback()
                 raise ValueError("persisted approval binding does not match canonical identity")
+            if exact is not None and exact["status"] == "superseded":
+                connection.commit()
+                return ApprovalClaim(action="superseded", binding_key=binding_key)
             if exact is not None and exact["status"] == "answered":
                 card = connection.execute(
                     "SELECT * FROM approval_cards WHERE binding_key = ? ORDER BY card_id DESC LIMIT 1",
@@ -257,6 +269,16 @@ class ApprovalCardLedger:
                 """,
                 (binding_key,),
             ).fetchone()
+            if (
+                active is not None
+                and active["expires_at"] is not None
+                and float(active["expires_at"]) <= now
+            ):
+                connection.execute(
+                    "UPDATE approval_cards SET status = 'failed', updated_at = ? WHERE card_id = ?",
+                    (now, int(active["card_id"])),
+                )
+                active = None
             if active is not None:
                 connection.commit()
                 return ApprovalClaim(
@@ -268,6 +290,18 @@ class ApprovalCardLedger:
                     owner_instance_id=str(active["instance_id"]),
                 )
 
+            connection.execute(
+                """
+                UPDATE approval_cards SET status = 'failed', updated_at = ?
+                WHERE card_id IN (
+                    SELECT c.card_id FROM approval_cards c
+                    JOIN approval_bindings b ON b.binding_key = c.binding_key
+                    WHERE b.item_key = ? AND c.status IN ('delivering','active')
+                      AND c.expires_at IS NOT NULL AND c.expires_at <= ?
+                )
+                """,
+                (now, binding["item_key"], now),
+            )
             old_rows = connection.execute(
                 """
                 SELECT c.* FROM approval_cards c
@@ -322,11 +356,11 @@ class ApprovalCardLedger:
                 """
                 INSERT INTO approval_cards(
                     binding_key, clarify_id, session_key, instance_id, platform, chat_id,
-                    message_id, choices_json, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'delivering', ?, ?)
+                    message_id, choices_json, expires_at, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, 'delivering', ?, ?)
                 """,
                 (binding_key, clarify_id, session_key, self.instance_id, platform, chat_id,
-                 choices_json, now, now),
+                 choices_json, expires_at, now, now),
             )
             if cursor.lastrowid is None:
                 raise RuntimeError("approval card insert returned no identity")
@@ -337,6 +371,7 @@ class ApprovalCardLedger:
                 binding_key=binding_key,
                 card_id=card_id,
                 clarify_id=clarify_id,
+                expires_at=expires_at,
                 superseded=tuple(self._card(row, status="superseded") for row in old_rows),
             )
 
@@ -425,28 +460,6 @@ class ApprovalCardLedger:
                         owner_instance_id=str(existing["instance_id"]),
                         delivery_generation=str(existing["generation"]),
                         expires_at=existing_expires_at,
-                    )
-                if (
-                    existing["status"] == "delivering"
-                    and str(existing["instance_id"]) != self.instance_id
-                    and time.time() - float(existing["updated_at"]) >= self.recovery_lease_seconds
-                ):
-                    connection.execute(
-                        """
-                        UPDATE approval_recoveries SET instance_id = ?, platform = ?, chat_id = ?,
-                            clarify_id = ?, message_id = NULL, generation = ?, updated_at = ?
-                        WHERE card_id = ? AND status = 'delivering'
-                        """,
-                        (self.instance_id, str(platform), str(chat_id), clarify_id, generation,
-                         time.time(), int(card_id)),
-                    )
-                    connection.commit()
-                    return ApprovalClaim(
-                        action="send", binding_key=str(card["binding_key"]),
-                        card_id=int(card_id), clarify_id=clarify_id,
-                        owner_instance_id=self.instance_id,
-                        delivery_generation=generation,
-                        expires_at=(float(existing["expires_at"]) if existing["expires_at"] is not None else None),
                     )
                 if existing["status"] == "failed":
                     persisted_continuation = (
@@ -705,16 +718,30 @@ class ApprovalCardLedger:
     def activate(self, card_id: Optional[int], message_id: str) -> bool:
         if card_id is None:
             raise ValueError("card_id is required")
+        now = time.time()
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                UPDATE approval_cards SET status = 'failed', updated_at = ?
+                WHERE card_id = ? AND status = 'delivering'
+                  AND expires_at IS NOT NULL AND expires_at <= ?
+                """,
+                (now, int(card_id), now),
+            )
             changed = connection.execute(
                 """
                 UPDATE approval_cards SET
                     status = CASE WHEN status = 'answered' THEN 'answered' ELSE 'active' END,
                     message_id = ?, updated_at = ?
-                WHERE card_id = ? AND status IN ('delivering', 'answered')
+                WHERE card_id = ?
+                  AND (status = 'answered' OR (
+                      status = 'delivering' AND expires_at IS NOT NULL AND expires_at > ?
+                  ))
                 """,
-                (str(message_id), time.time(), int(card_id)),
+                (str(message_id), now, int(card_id), now),
             ).rowcount
+            connection.commit()
             return changed == 1
 
     def fail(self, card_id: Optional[int]) -> None:
@@ -775,12 +802,19 @@ class ApprovalCardLedger:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT card_id, binding_key, status FROM approval_cards WHERE clarify_id = ?", (clarify_id,)
+                "SELECT card_id, binding_key, status, expires_at FROM approval_cards WHERE clarify_id = ?", (clarify_id,)
             ).fetchone()
             if row is None or row["status"] not in ("delivering", "active"):
                 connection.commit()
                 return False
             now = time.time()
+            if row["expires_at"] is None or float(row["expires_at"]) <= now:
+                connection.execute(
+                    "UPDATE approval_cards SET status = 'failed', updated_at = ? WHERE card_id = ?",
+                    (now, int(row["card_id"])),
+                )
+                connection.commit()
+                return False
             connection.execute(
                 "UPDATE approval_cards SET status = 'answered', updated_at = ? WHERE card_id = ?",
                 (now, int(row["card_id"])),
@@ -912,10 +946,19 @@ class ApprovalCardLedger:
                 connection.rollback()
                 return None
             row = connection.execute(
-                "SELECT card_id, binding_key, status, choices_json FROM approval_cards WHERE clarify_id = ?",
+                "SELECT card_id, binding_key, status, choices_json, expires_at "
+                "FROM approval_cards WHERE clarify_id = ?",
                 (clarify_id,),
             ).fetchone()
             if row is None or row["status"] not in ("delivering", "active") or not row["choices_json"]:
+                connection.commit()
+                return None
+            now = time.time()
+            if row["expires_at"] is None or float(row["expires_at"]) <= now:
+                connection.execute(
+                    "UPDATE approval_cards SET status = 'failed', updated_at = ? WHERE card_id = ?",
+                    (now, int(row["card_id"])),
+                )
                 connection.commit()
                 return None
             try:
@@ -930,7 +973,6 @@ class ApprovalCardLedger:
             if not isinstance(response, str) or not response:
                 connection.rollback()
                 return None
-            now = time.time()
             connection.execute(
                 "UPDATE approval_cards SET status = 'answered', updated_at = ? WHERE card_id = ?",
                 (now, int(row["card_id"])),

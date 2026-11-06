@@ -43,7 +43,7 @@ from gateway.platforms.tcp_site import start_tcp_site
 from gateway.platforms.webhook_coalesce import WebhookCoalescer, validate_coalesce_config
 from gateway.platforms.webhook_filters import DEFAULT_SCRIPT_TIMEOUT_SECONDS, WebhookRouteProcessor
 from gateway.response_filters import is_autonomous_silence_response
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, get_process_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -273,11 +273,12 @@ class WebhookAdapter(BasePlatformAdapter):
     # --- Lifecycle ---
 
     def _approval_ledger(self) -> ApprovalCardLedger:
-        ledger_path = str(get_hermes_home() / "approval_cards.db")
+        home = get_process_hermes_home()
+        ledger_path = str(home / "approval_cards.db")
         ledger = self._approval_ledgers.get(ledger_path)
         if ledger is None:
             ledger = self._approval_ledgers[ledger_path] = ApprovalCardLedger(
-                get_hermes_home() / "approval_cards.db", instance_id=self._approval_instance_id)
+                home / "approval_cards.db", instance_id=self._approval_instance_id)
         return ledger
 
     def _hydrate_approval_delivery_info(self) -> None:
@@ -537,10 +538,14 @@ class WebhookAdapter(BasePlatformAdapter):
                     set_resolution_probe,
                     wait_for_response,
                 )
+                approval_timeout = float(get_clarify_timeout())
+                approval_expires_at = (
+                    time.time() + approval_timeout if approval_timeout > 0 else time.time()
+                )
                 claim = ledger.claim(
                     binding, platform=deliver_type, chat_id=str(target_chat_id),
                     clarify_id=clarify_id, session_key=session_key, choices=choices,
-                    is_active=is_registered)
+                    is_active=is_registered, expires_at=approval_expires_at)
 
                 def _probe_resolution() -> Optional[str]:
                     observation = ledger.observe(claim.binding_key)
@@ -554,6 +559,9 @@ class WebhookAdapter(BasePlatformAdapter):
                     if claim.action == "send":
                         ledger.fail(claim.card_id)
                     return SendResult(success=False, error="Approval waiter expired before delivery")
+                if claim.action == "superseded":
+                    resolve_gateway_clarify(clarify_id, CANCELLED, persist=False)
+                    return SendResult(success=True)
                 while (
                     claim.action == "wait_predecessor"
                     or (
@@ -587,7 +595,7 @@ class WebhookAdapter(BasePlatformAdapter):
                             claim = ledger.claim(
                                 binding, platform=deliver_type, chat_id=str(target_chat_id),
                                 clarify_id=clarify_id, session_key=session_key, choices=choices,
-                                is_active=is_registered)
+                                is_active=is_registered, expires_at=approval_expires_at)
                             continue
                         if recovery_claim.action == "expired":
                             resolve_gateway_clarify(clarify_id, CANCELLED, persist=False)
@@ -679,63 +687,69 @@ class WebhookAdapter(BasePlatformAdapter):
                                 metadata=recovery_metadata or None,
                             )
                             if not recovery_result.success or not recovery_result.message_id:
-                                ledger.fail_recovery(
-                                    claim.card_id, recovery_claim.delivery_generation,
+                                recovery_ambiguous = (
+                                    isinstance(recovery_result.raw_response, dict)
+                                    and recovery_result.raw_response.get("ambiguous") is True
                                 )
-                                clear_session(recovery_session)
-                                resolve_gateway_clarify(clarify_id, CANCELLED, persist=False)
-                                error = (
-                                    "Approval recovery delivery returned no message_id"
-                                    if recovery_result.success
-                                    else "Approval recovery control could not be delivered"
+                                if not recovery_ambiguous:
+                                    ledger.fail_recovery(
+                                        claim.card_id, recovery_claim.delivery_generation,
+                                    )
+                                    clear_session(recovery_session)
+                                    resolve_gateway_clarify(clarify_id, CANCELLED, persist=False)
+                                    error = (
+                                        "Approval recovery delivery returned no message_id"
+                                        if recovery_result.success
+                                        else "Approval recovery control could not be delivered"
+                                    )
+                                    return SendResult(
+                                        success=False,
+                                        error=error,
+                                        raw_response={"ambiguous": True},
+                                    )
+                            else:
+                                recovery_activated = ledger.activate_recovery(
+                                    claim.card_id,
+                                    recovery_claim.delivery_generation,
+                                    recovery_result.message_id,
                                 )
-                                return SendResult(
-                                    success=False,
-                                    error=error,
-                                    raw_response={"ambiguous": True},
-                                )
-                            recovery_activated = ledger.activate_recovery(
-                                claim.card_id,
-                                recovery_claim.delivery_generation,
-                                recovery_result.message_id,
-                            )
-                            if not recovery_activated:
-                                clear_session(recovery_session)
-                                resolve_gateway_clarify(recovery_id, CANCELLED, persist=False)
-                                retired = False
-                                retire_exact = getattr(adapter, "retire_clarify", None)
-                                if inspect.iscoroutinefunction(retire_exact):
-                                    try:
-                                        retired = bool(await retire_exact(
-                                            chat_id=str(target_chat_id),
-                                            message_id=recovery_result.message_id,
-                                            reason="superseded",
-                                        ))
-                                    except Exception:
-                                        logger.exception(
-                                            "Failed exact retirement for stale approval recovery %s",
-                                            recovery_id,
-                                        )
-                                if not retired:
-                                    retire_card = getattr(adapter, "retire_clarify_card", None)
-                                    if inspect.iscoroutinefunction(retire_card):
+                                if not recovery_activated:
+                                    clear_session(recovery_session)
+                                    resolve_gateway_clarify(recovery_id, CANCELLED, persist=False)
+                                    retired = False
+                                    retire_exact = getattr(adapter, "retire_clarify", None)
+                                    if inspect.iscoroutinefunction(retire_exact):
                                         try:
-                                            retired = bool(await retire_card(
-                                                recovery_id,
-                                                "This recovery control was superseded by a newer delivery.",
+                                            retired = bool(await retire_exact(
+                                                chat_id=str(target_chat_id),
+                                                message_id=recovery_result.message_id,
+                                                reason="superseded",
                                             ))
                                         except Exception:
                                             logger.exception(
-                                                "Failed ID retirement for stale approval recovery %s",
+                                                "Failed exact retirement for stale approval recovery %s",
                                                 recovery_id,
                                             )
-                                if not retired:
-                                    return SendResult(
-                                        success=False,
-                                        error="Stale approval recovery control could not be retired",
-                                        raw_response={"ambiguous": True},
-                                    )
-                                return recovery_result
+                                    if not retired:
+                                        retire_card = getattr(adapter, "retire_clarify_card", None)
+                                        if inspect.iscoroutinefunction(retire_card):
+                                            try:
+                                                retired = bool(await retire_card(
+                                                    recovery_id,
+                                                    "This recovery control was superseded by a newer delivery.",
+                                                ))
+                                            except Exception:
+                                                logger.exception(
+                                                    "Failed ID retirement for stale approval recovery %s",
+                                                    recovery_id,
+                                                )
+                                    if not retired:
+                                        return SendResult(
+                                            success=False,
+                                            error="Stale approval recovery control could not be retired",
+                                            raw_response={"ambiguous": True},
+                                        )
+                                    return recovery_result
                         task = asyncio.create_task(self._resume_after_approval_recovery(
                             adapter=adapter,
                             recovery_id=recovery_id,
@@ -771,7 +785,7 @@ class WebhookAdapter(BasePlatformAdapter):
                     claim = ledger.claim(
                         binding, platform=deliver_type, chat_id=str(target_chat_id),
                         clarify_id=clarify_id, session_key=session_key, choices=choices,
-                        is_active=is_registered)
+                        is_active=is_registered, expires_at=approval_expires_at)
                 if claim.action == "reuse_answered":
                     resolve_gateway_clarify(clarify_id, claim.response or "")
                     return SendResult(success=True, message_id=claim.message_id)
@@ -843,13 +857,9 @@ class WebhookAdapter(BasePlatformAdapter):
                     self._clarify_delegates[clarify_id] = (
                         adapter, clarify_id, ledger, str(target_chat_id), result.message_id)
                 else:
-                    raw_response = result.raw_response
-                    ambiguous = (
-                        isinstance(raw_response, dict)
-                        and raw_response.get("ambiguous") is True
-                    )
-                    if not ambiguous:
-                        ledger.fail(claim.card_id)
+                    # Keep the binding pending: the generic clarify layer may deliver its
+                    # numbered plain-text fallback, whose response must still persist through
+                    # the same resolution callback. Timeout retirement will fail this card.
                     if result.success:
                         return SendResult(success=False, error="Approval card delivery returned no message_id")
                 return result

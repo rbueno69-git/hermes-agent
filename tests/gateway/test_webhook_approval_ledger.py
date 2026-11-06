@@ -254,7 +254,7 @@ def test_concurrent_gateways_publish_exactly_one_recovery_control(tmp_path):
     assert sorted(actions) == ["reuse_active", "send"]
 
 
-def test_stale_recovery_delivery_is_safely_reissued_without_authorizing_item(tmp_path):
+def test_stale_recovery_delivery_is_never_automatically_reissued(tmp_path):
     path = tmp_path / "approval-cards.db"
     crashed = ApprovalCardLedger(path, instance_id="gateway-a")
     old = crashed.claim(
@@ -266,23 +266,22 @@ def test_stale_recovery_delivery_is_safely_reissued_without_authorizing_item(tmp
     )
     assert first_recovery.action == "send"
 
-    takeover = ApprovalCardLedger(
+    replay = ApprovalCardLedger(
         path, instance_id="gateway-c", recovery_lease_seconds=0
     ).claim_recovery(old.card_id, platform="telegram", chat_id="327791380")
 
-    assert takeover.action == "send"
-    assert takeover.owner_instance_id == "gateway-c"
-    assert takeover.delivery_generation != first_recovery.delivery_generation
-    assert takeover.clarify_id != first_recovery.clarify_id
-    assert crashed.answer_choice(first_recovery.clarify_id or "", 0) is None
-    assert crashed.observe(old.binding_key).status == "pending"
+    assert replay.action == "reuse_active"
+    assert replay.owner_instance_id == "gateway-b"
+    assert replay.delivery_generation == first_recovery.delivery_generation
+    assert replay.clarify_id == first_recovery.clarify_id
+    assert crashed.answer_choice(
+        first_recovery.clarify_id or "", 0
+    ) == "Reemitir aprovação"
+    assert crashed.observe(old.binding_key).status == "failed"
     assert crashed.activate_recovery(
         old.card_id, first_recovery.delivery_generation, "600"
-    ) is False
-    assert crashed.activate_recovery(
-        old.card_id, takeover.delivery_generation, "601"
     ) is True
-    assert crashed.observe(old.binding_key).status == "pending"
+    assert crashed.observe(old.binding_key).status == "failed"
 
 
 def test_recovery_keep_blocked_choice_preserves_unknown_delivery(tmp_path):
@@ -581,6 +580,48 @@ def test_nullable_existing_recovery_generation_is_repaired_before_callback(tmp_p
         ).fetchone()
     assert generation is not None
     assert status == "answered"
+
+
+def test_superseded_binding_cannot_be_resurrected_by_stale_replay(tmp_path):
+    ledger = ApprovalCardLedger(tmp_path / "approval-cards.db", instance_id="gateway-a")
+    old_binding = _binding()
+    old = ledger.claim(
+        old_binding, platform="telegram", chat_id="1", clarify_id="old",
+        session_key="old-session", choices=["Approve", "Reject"],
+    )
+    assert ledger.activate(old.card_id, "10")
+    new_binding = dict(old_binding, head_sha="9" * 40)
+    new = ledger.claim(
+        new_binding, platform="telegram", chat_id="1", clarify_id="new",
+        session_key="new-session", choices=["Approve", "Reject"],
+    )
+    assert ledger.activate(new.card_id, "11")
+
+    stale = ledger.claim(
+        old_binding, platform="telegram", chat_id="1", clarify_id="stale",
+        session_key="stale-session", choices=["Approve", "Reject"],
+    )
+
+    assert stale.action == "superseded"
+    assert ledger.observe(old.binding_key).status == "superseded"
+    assert ledger.observe(new.binding_key).status == "pending"
+    assert ledger.answer_choice("old", 0) is None
+
+
+def test_primary_card_deadline_is_atomic_and_survives_restart(tmp_path):
+    path = tmp_path / "approval-cards.db"
+    ledger = ApprovalCardLedger(path, instance_id="gateway-a")
+    claim = ledger.claim(
+        _binding(), platform="telegram", chat_id="1", clarify_id="deadline-card",
+        session_key="deadline-session", choices=["Approve", "Reject"],
+        expires_at=time.time() - 1.0,
+    )
+
+    assert ledger.activate(claim.card_id, "10") is False
+    restarted = ApprovalCardLedger(path, instance_id="gateway-b")
+    assert restarted.answer_choice("deadline-card", 0) is None
+    assert restarted.observe(claim.binding_key).status == "pending"
+
 
 
 def test_nullable_legacy_decision_digest_cannot_reuse_answered_binding(tmp_path):

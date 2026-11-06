@@ -49,6 +49,53 @@ async def test_webhook_clarify_delegates_to_cross_platform_native_buttons():
 
 
 @pytest.mark.asyncio
+async def test_definitive_native_failure_keeps_plaintext_fallback_answerable(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools import clarify_gateway as cm
+
+    binding = {
+        "item_key": "owner/repo#161", "head_sha": "1" * 40,
+        "contract_digest_sha256": "2" * 64, "scope": "merge",
+        "decision_digest_sha256": "3" * 64,
+    }
+    with cm._lock:
+        cm._entries.clear()
+        cm._session_index.clear()
+        cm._linked_entries.clear()
+        cm._resolution_cbs.clear()
+        cm._resolution_probes.clear()
+        cm._expiry_cbs.clear()
+        cm._resolving.clear()
+    cm.register("clarify-fallback", "session-fallback", "Approve?", ["Approve", "Reject"])
+    target = MagicMock()
+    target.send_clarify = AsyncMock(return_value=SendResult(success=False, error="offline"))
+    runner = MagicMock()
+    runner._authorization_adapter.return_value = target
+    adapter = object.__new__(WebhookAdapter)
+    adapter.gateway_runner = runner
+    adapter._approval_instance_id = "gateway-a"
+    adapter._approval_ledgers = {}
+    adapter._approval_prompt_lock = asyncio.Lock()
+    adapter._delivery_info = {
+        "delivery": {"deliver": "telegram", "deliver_extra": {"chat_id": "327791380"},
+                     "approval_binding": binding}
+    }
+
+    result = await adapter.send_clarify(
+        chat_id="delivery", question="Approve?", choices=["Approve", "Reject"],
+        clarify_id="clarify-fallback", session_key="session-fallback",
+    )
+    assert result.success is False
+    assert cm.resolve_gateway_clarify("clarify-fallback", "Approve") is True
+    ledger = adapter._approval_ledger()
+    with ledger._connect() as connection:
+        durable_status = connection.execute(
+            "SELECT status FROM approval_bindings"
+        ).fetchone()[0]
+    assert durable_status == "answered"
+
+
+@pytest.mark.asyncio
 async def test_webhook_clarify_without_interactive_destination_fails_before_wait():
     adapter = object.__new__(WebhookAdapter)
     adapter.gateway_runner = MagicMock()
@@ -570,6 +617,53 @@ async def test_recovery_timeout_durably_expires_before_waiter_disappears(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_ambiguous_recovery_control_is_not_reissued(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway.approval_card_ledger import ApprovalCardLedger
+    from tools import clarify_gateway as cm
+
+    old_binding = {
+        "item_key": "owner/repo#161", "head_sha": "1" * 40,
+        "contract_digest_sha256": "2" * 64, "scope": "merge",
+        "decision_digest_sha256": "3" * 64,
+    }
+    crashed = ApprovalCardLedger(tmp_path / "approval_cards.db", instance_id="gateway-a")
+    old = crashed.claim(
+        old_binding, platform="telegram", chat_id="327791380",
+        clarify_id="old-card", session_key="old-session", choices=["Approve", "Reject"],
+    )
+    target = MagicMock()
+    target.send_clarify = AsyncMock(return_value=SendResult(
+        success=False, error="timeout", raw_response={"ambiguous": True},
+    ))
+    runner = MagicMock()
+    runner._authorization_adapter.return_value = target
+    adapter = object.__new__(WebhookAdapter)
+    adapter.gateway_runner = runner
+    adapter._delivery_info = {
+        "new": {"deliver": "telegram", "deliver_extra": {"chat_id": "327791380"},
+                "approval_binding": {**old_binding, "contract_digest_sha256": "3" * 64}},
+    }
+    cm.register("new-card", "new-session", "New?", ["Approve", "Reject"])
+
+    result = await adapter.send_clarify(
+        chat_id="new", question="New?", choices=["Approve", "Reject"],
+        clarify_id="new-card", session_key="new-session",
+    )
+    for task in adapter._approval_recovery_tasks:
+        task.cancel()
+    await asyncio.gather(*adapter._approval_recovery_tasks, return_exceptions=True)
+    replay = ApprovalCardLedger(
+        tmp_path / "approval_cards.db", instance_id="gateway-c", recovery_lease_seconds=0,
+    ).claim_recovery(old.card_id, platform="telegram", chat_id="327791380")
+
+    assert result.raw_response == {"ambiguous": True}
+    assert crashed.observe_recovery(old.card_id).status == "delivering"
+    assert replay.action == "reuse_active"
+    assert target.send_clarify.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_recovery_delivery_without_message_id_fails_closed(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     from gateway.approval_card_ledger import ApprovalCardLedger
@@ -750,6 +844,24 @@ async def test_restart_hydrates_webhook_delivery_from_recovery_continuation(tmp_
     restarted._hydrate_approval_delivery_info()
 
     assert restarted._delivery_info["webhook-delivery"] == delivery
+
+
+def test_named_profile_uses_process_global_approval_authority(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "default"))
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    adapter = object.__new__(WebhookAdapter)
+    adapter._approval_instance_id = "gateway-a"
+    adapter._approval_ledgers = {}
+    token = set_hermes_home_override(tmp_path / "profiles" / "coder")
+    try:
+        ledger = adapter._approval_ledger()
+    finally:
+        reset_hermes_home_override(token)
+
+    assert ledger.path == tmp_path / "default" / "approval_cards.db"
+    assert list(adapter._approval_ledgers) == [str(ledger.path)]
+
 
 
 def test_answered_recovery_continuation_has_one_lease_owner_and_fenced_completion(tmp_path):
