@@ -86,6 +86,7 @@ class ApprovalCardLedger:
         with self._connect() as connection:
             connection.executescript(
                 """
+                BEGIN IMMEDIATE;
                 CREATE TABLE IF NOT EXISTS approval_bindings (
                     binding_key TEXT PRIMARY KEY,
                     item_key TEXT NOT NULL,

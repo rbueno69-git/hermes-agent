@@ -1,7 +1,8 @@
 import multiprocessing
 import sqlite3
+import threading
 import time
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 import pytest
 
@@ -694,6 +695,58 @@ def test_predecessor_schema_active_recovery_remains_answerable_after_upgrade(tmp
     assert reused.action == "reuse_active"
     assert reused.clarify_id == legacy_id
     assert upgraded.answer_choice(legacy_id, 1) == "Manter bloqueado"
+
+
+def test_concurrent_legacy_schema_migration_is_serialized(tmp_path, monkeypatch):
+    path = tmp_path / "approval-cards.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE approval_bindings (
+                binding_key TEXT PRIMARY KEY,
+                item_key TEXT NOT NULL,
+                head_sha TEXT NOT NULL,
+                contract_digest_sha256 TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                status TEXT NOT NULL,
+                response TEXT,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+
+    real_connect = sqlite3.connect
+    racers = 8
+    inspection_barrier = threading.Barrier(racers)
+
+    class RacingConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            cursor = super().execute(sql, parameters)
+            if (
+                sql.strip().startswith("PRAGMA table_info(approval_bindings)")
+                and not self.in_transaction
+            ):
+                inspection_barrier.wait(timeout=10)
+            return cursor
+
+    def racing_connect(*args, **kwargs):
+        return real_connect(*args, factory=RacingConnection, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", racing_connect)
+    with ThreadPoolExecutor(max_workers=racers) as pool:
+        futures = [
+            pool.submit(ApprovalCardLedger, path, instance_id=f"gateway-{index}")
+            for index in range(racers)
+        ]
+    failures = [future.exception() for future in futures if future.exception() is not None]
+
+    assert failures == []
+    with real_connect(path) as connection:
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(approval_bindings)")
+        }
+    assert "decision_digest_sha256" in columns
 
 
 def test_recovery_callback_data_fits_telegram_limit_at_maximum_card_id(tmp_path):
