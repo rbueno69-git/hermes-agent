@@ -135,10 +135,6 @@ class ApprovalCardLedger:
                     "UPDATE approval_recoveries SET generation = lower(hex(randomblob(16))) "
                     "WHERE generation IS NULL"
                 )
-                connection.execute(
-                    "UPDATE approval_recoveries SET clarify_id = "
-                    "'approval-rcv-' || card_id || '-' || generation"
-                )
         os.chmod(self.path, 0o600)
 
     @staticmethod
@@ -285,7 +281,7 @@ class ApprovalCardLedger:
         if card_id is None:
             raise ValueError("card_id is required")
         generation = secrets.token_hex(16)
-        clarify_id = f"{RECOVERY_PREFIX}{int(card_id)}-{generation}"
+        clarify_id = f"{RECOVERY_PREFIX}{generation}"
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             card = connection.execute(
@@ -523,7 +519,15 @@ class ApprovalCardLedger:
                 recovery_token = clarify_id[len(matched_prefix):]
                 token_parts = recovery_token.rsplit("-", 1)
                 generation: Optional[str]
-                if recovery_token.isdigit():
+                card_token: Optional[str]
+                is_hex_generation = (
+                    len(recovery_token) == 32
+                    and all(char in "0123456789abcdef" for char in recovery_token)
+                )
+                if matched_prefix == RECOVERY_PREFIX and is_hex_generation:
+                    card_token = None
+                    generation = recovery_token
+                elif recovery_token.isdigit():
                     card_token = recovery_token
                     generation = None
                 elif (
@@ -545,10 +549,17 @@ class ApprovalCardLedger:
                            c.status AS card_status, r.status AS recovery_status, r.response
                     FROM approval_recoveries r
                     JOIN approval_cards c ON c.card_id = r.card_id
-                    WHERE r.card_id = ? AND r.clarify_id = ?
+                    WHERE r.clarify_id = ?
+                      AND (? IS NULL OR r.card_id = ?)
                       AND (? IS NULL OR r.generation = ?)
                     """,
-                    (int(card_token), clarify_id, generation, generation),
+                    (
+                        clarify_id,
+                        card_token,
+                        int(card_token) if card_token is not None else None,
+                        generation,
+                        generation,
+                    ),
                 ).fetchone()
                 if recovery is not None:
                     generation = str(recovery["generation"])
