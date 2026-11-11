@@ -1,5 +1,7 @@
 import asyncio
+import multiprocessing
 import sqlite3
+import time
 from dataclasses import replace
 
 import pytest
@@ -38,6 +40,29 @@ class TelegramStub:
     async def retire_clarify_card(self, clarify_id, notice):
         self.retired.append((clarify_id, notice))
         self._clarify_state.pop(clarify_id, None)
+
+
+def _process_retry(path, barrier, results):
+    async def run():
+        adapter = TelegramStub()
+        broker = GitHubApprovalBroker(path, instance_id=f"worker-{multiprocessing.current_process().pid}")
+        barrier.wait()
+        outcomes = await broker.retry_pending(adapter=adapter)
+        results.put((len(adapter.sent), [outcome.action for outcome in outcomes]))
+    asyncio.run(run())
+
+
+def _process_claim_then_crash(path, entered):
+    async def run():
+        broker = GitHubApprovalBroker(path, instance_id="crashing", delivery_lease_seconds=1)
+
+        async def crash_gap(_key, _adapter):
+            entered.set()
+            await asyncio.sleep(60)
+
+        broker._deliver_claim = crash_gap
+        await broker.retry_pending(adapter=TelegramStub())
+    asyncio.run(run())
 
 
 def proposal(*, head="a" * 40, digest="b" * 64):
@@ -332,3 +357,154 @@ async def test_async_completion_status_cannot_orphan_active_card(tmp_path):
     observed = broker.observe(proposal())
     assert observed["state"] == "active"
     assert observed["origin_status"] == "origin_completed"
+
+
+@pytest.mark.asyncio
+async def test_inflight_supersession_retires_card_sent_after_generation_changed(tmp_path):
+    class BarrierTelegram(TelegramStub):
+        def __init__(self):
+            super().__init__()
+            self.first_entered = asyncio.Event()
+            self.release_first = asyncio.Event()
+
+        async def send_clarify(self, **kwargs):
+            self.sent.append(kwargs)
+            if len(self.sent) == 1:
+                self.first_entered.set()
+                await self.release_first.wait()
+            self._clarify_state[kwargs["clarify_id"]] = kwargs["session_key"]
+            return SendResult(success=True, message_id=str(100 + len(self.sent)))
+
+    adapter = BarrierTelegram()
+    broker = GitHubApprovalBroker(tmp_path / "approvals.db", instance_id="gateway")
+    old = proposal()
+    new = replace(old, head_sha="c" * 40)
+    sending_old = asyncio.create_task(broker.request(
+        old, adapter=adapter, chat_id="42", question="old", session_key="webhook:1",
+        authorized_user_id="7"))
+    await adapter.first_entered.wait()
+    sent_new = await broker.request(
+        new, adapter=adapter, chat_id="42", question="new", session_key="webhook:2",
+        authorized_user_id="7")
+    adapter.release_first.set()
+    stale = await sending_old
+
+    assert sent_new.action == "sent"
+    assert stale.action == "superseded"
+    assert adapter.retired.count((stale.clarify_id, "Superseded during delivery")) == 1
+    assert set(adapter._clarify_state) == {sent_new.clarify_id}
+
+
+@pytest.mark.asyncio
+async def test_terminal_close_during_send_retires_late_card(tmp_path):
+    class BarrierTelegram(TelegramStub):
+        def __init__(self):
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def send_clarify(self, **kwargs):
+            self.sent.append(kwargs)
+            self.entered.set()
+            await self.release.wait()
+            self._clarify_state[kwargs["clarify_id"]] = kwargs["session_key"]
+            return SendResult(success=True, message_id="101")
+
+    adapter = BarrierTelegram()
+    broker = GitHubApprovalBroker(tmp_path / "approvals.db", instance_id="gateway")
+    sending = asyncio.create_task(broker.request(
+        proposal(), adapter=adapter, chat_id="42", question="approve",
+        session_key="webhook:1", authorized_user_id="7"))
+    await adapter.entered.wait()
+    await broker.retire_item(proposal().item_key, status="closed", adapter=adapter)
+    adapter.release.set()
+    outcome = await sending
+
+    assert outcome.action == "superseded"
+    assert adapter.retired[-1] == (outcome.clarify_id, "Superseded during delivery")
+    assert adapter._clarify_state == {}
+
+
+def test_multiprocess_outbox_claim_has_one_transport_sender(tmp_path):
+    path = tmp_path / "approvals.db"
+    broker = GitHubApprovalBroker(path, instance_id="admission")
+    broker.admit(
+        proposal(), adapter=TelegramStub(), chat_id="42", question="approve",
+        session_key="webhook:1", authorized_user_id="7")
+    ctx = multiprocessing.get_context("fork")
+    barrier = ctx.Barrier(2)
+    results = ctx.Queue()
+    workers = [ctx.Process(target=_process_retry, args=(path, barrier, results)) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(10)
+        assert worker.exitcode == 0
+    outcomes = [results.get(timeout=2) for _ in workers]
+    assert sum(sent for sent, _actions in outcomes) == 1
+
+
+def test_crash_after_reservation_before_send_is_reclaimed_after_bounded_lease(tmp_path):
+    path = tmp_path / "approvals.db"
+    broker = GitHubApprovalBroker(path, instance_id="admission", delivery_lease_seconds=1)
+    broker.admit(
+        proposal(), adapter=TelegramStub(), chat_id="42", question="approve",
+        session_key="webhook:1", authorized_user_id="7")
+    ctx = multiprocessing.get_context("fork")
+    entered = ctx.Event()
+    worker = ctx.Process(target=_process_claim_then_crash, args=(path, entered))
+    worker.start()
+    assert entered.wait(5)
+    worker.terminate()
+    worker.join(5)
+    reserved = broker.observe(proposal())
+    assert reserved["state"] == "pending_notification"
+    assert reserved["owner_instance_id"] == "crashing"
+
+    time.sleep(1.1)
+    adapter = TelegramStub()
+    outcomes = asyncio.run(
+        GitHubApprovalBroker(path, instance_id="recovery", delivery_lease_seconds=1)
+        .retry_pending(adapter=adapter))
+    assert [outcome.action for outcome in outcomes] == ["sent"]
+    assert len(adapter.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_terminal_retirement_is_durable_and_retried(tmp_path):
+    class FailingRetire(TelegramStub):
+        async def retire_clarify_card(self, clarify_id, notice):
+            raise TimeoutError("edit failed")
+
+    broker = GitHubApprovalBroker(tmp_path / "approvals.db", instance_id="gateway")
+    publisher = TelegramStub()
+    await broker.request(
+        proposal(), adapter=publisher, chat_id="42", question="approve",
+        session_key="webhook:1", authorized_user_id="7")
+    await broker.retire_item(proposal().item_key, status="closed", adapter=FailingRetire())
+    assert broker.observe(proposal())["retirement_pending"] == 1
+
+    assert await broker.retry_retirements(adapter=publisher) == 1
+    assert broker.observe(proposal())["retirement_pending"] == 0
+
+
+@pytest.mark.asyncio
+async def test_failed_supersession_retirement_is_durable(tmp_path):
+    class FailSecondRetire(TelegramStub):
+        async def retire_clarify_card(self, clarify_id, notice):
+            raise TimeoutError("edit failed")
+
+    broker = GitHubApprovalBroker(tmp_path / "approvals.db", instance_id="gateway")
+    publisher = TelegramStub()
+    await broker.request(
+        proposal(), adapter=publisher, chat_id="42", question="old",
+        session_key="webhook:1", authorized_user_id="7")
+    changed = replace(proposal(), head_sha="c" * 40)
+    failing = FailSecondRetire()
+    outcome = await broker.request(
+        changed, adapter=failing, chat_id="42",
+        question="new", session_key="webhook:2", authorized_user_id="7")
+    assert outcome.action == "pending_retry"
+    assert failing.sent == []
+    assert broker.observe(proposal())["retirement_pending"] == 1
+    assert broker.observe(changed)["state"] == "pending_notification"

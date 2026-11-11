@@ -72,6 +72,7 @@ _TEMPLATE_KEY_RE = re.compile(r"\{([a-zA-Z0-9_.]+)\}")
 _REPO_RE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
 # Credentials `gh` reads; a routed profile's github_comment must use its own, never the process env's.
 _GH_TOKEN_VARS = ("GH_TOKEN", "GITHUB_TOKEN")
+_GITHUB_APPROVAL_SCHEMA = "hermes.github-intake.v2"
 
 
 def _header_delivery_id(headers) -> str:
@@ -242,6 +243,7 @@ class WebhookAdapter(BasePlatformAdapter):
         self._route_processor = WebhookRouteProcessor(script_timeout_seconds=self._script_timeout_seconds)
         # Opt-in per-route debounce of rapid same-entity events (route ``coalesce`` block). #92066
         self._coalescer = WebhookCoalescer(dispatch=self._spawn_agent_run, render=self._render_prompt)
+        self._github_approval_worker_task: Optional[asyncio.Task] = None
 
     @property
     def token(self):
@@ -276,10 +278,13 @@ class WebhookAdapter(BasePlatformAdapter):
         if "github_approval" in route:
             approval = route["github_approval"]
             if (not isinstance(approval, dict)
-                    or set(approval) != {"authorized_user_id"}
+                    or set(approval) != {"authorized_user_id", "schema"}
                     or not isinstance(approval.get("authorized_user_id"), str)
-                    or not approval["authorized_user_id"]):
-                raise ValueError(f"[webhook] Route '{name}' github_approval requires only a non-empty authorized_user_id")
+                    or not approval["authorized_user_id"]
+                    or approval.get("schema") != _GITHUB_APPROVAL_SCHEMA):
+                raise ValueError(
+                    f"[webhook] Route '{name}' github_approval requires schema={_GITHUB_APPROVAL_SCHEMA!r} "
+                    "and only a non-empty authorized_user_id")
             if route.get("deliver") != "telegram":
                 raise ValueError(f"[webhook] Route '{name}' github_approval must deliver to telegram")
         validate_coalesce_config(name, route)
@@ -313,15 +318,64 @@ class WebhookAdapter(BasePlatformAdapter):
         logger.info("[webhook] Listening on %s:%d — routes: %s", self._host or "* (all interfaces, IPv4+IPv6)",
                     self._port, ", ".join(self._routes.keys()) or "(none configured)")
         self._wire_plugin_handlers(None)
+        self._github_approval_worker_task = asyncio.create_task(
+            self._github_approval_worker_loop(), name="github-approval-outbox")
         return True
 
     async def disconnect(self) -> None:
+        if self._github_approval_worker_task is not None:
+            self._github_approval_worker_task.cancel()
+            await asyncio.gather(self._github_approval_worker_task, return_exceptions=True)
+            self._github_approval_worker_task = None
         await self._coalescer.flush()  # buffered events are dispatched, not dropped, on shutdown/reconnect
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
         self._mark_disconnected()
         logger.info("[webhook] Disconnected")
+
+    async def _github_approval_worker_once(self) -> int:
+        """Reconcile one bounded approval-outbox batch for each routed profile."""
+        if self.gateway_runner is None:
+            return 0
+        profiles = {
+            route.get("profile") if isinstance(route.get("profile"), str) else None
+            for route in self._routes.values()
+            if isinstance(route, dict) and "github_approval" in route
+        }
+        completed = 0
+        from gateway.github_approval_broker import default_broker
+        for profile in profiles:
+            with self._profile_scope(profile):
+                target = self._find_adapter(Platform.TELEGRAM, profile)
+                if target is None:
+                    continue
+                broker = default_broker(
+                    instance_id=f"webhook-worker:{profile or 'default'}:{os.getpid()}")
+                if broker is None:
+                    continue
+                broker.recover_callbacks(target)
+                completed += await broker.retry_retirements(adapter=target, limit=16)
+                completed += len(await broker.retry_pending(adapter=target, limit=16))
+                runtime = getattr(self.gateway_runner, "github_approval_runtime", None)
+                github = getattr(runtime, "github", None)
+                executor = getattr(runtime, "executor", None)
+                if github is not None and executor is not None:
+                    completed += len(await broker.resume_approved(
+                        owner=f"webhook-worker:{profile or 'default'}:{os.getpid()}",
+                        github=github, executor=executor, adapter=target, limit=16))
+        return completed
+
+    async def _github_approval_worker_loop(self) -> None:
+        """Startup recovery plus bounded periodic retry; SQLite claims fence peer workers."""
+        while True:
+            try:
+                await self._github_approval_worker_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("[webhook] GitHub approval worker iteration failed")
+            await asyncio.sleep(1.0)
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
                    metadata: Optional[dict[str, Any]] = None) -> SendResult:
@@ -512,6 +566,7 @@ class WebhookAdapter(BasePlatformAdapter):
             return False
         try:
             # Hot-reloaded from the request handler: a malformed block must skip the route, not 500 the request.
+            self._validate_route(name, route)
             validate_coalesce_config(name, route)
         except ValueError as e:
             logger.warning("[webhook] Dynamic route '%s' skipped: %s", name, e)
@@ -784,9 +839,6 @@ class WebhookAdapter(BasePlatformAdapter):
         if not self._route_processor.route_filters_match(route_config, payload, event_type, request.headers):
             logger.info("[webhook] filtered event=%s route=%s", event_type, route_name)
             return web.json_response({"status": "ignored", "reason": "filter", "route": route_name})
-        if "github_approval" in route_config:
-            return await self._handle_github_approval_contract(
-                route_config, payload, event_type, route_name, profile, delivery_id)
         # Script, prompt render and skill lookup read the profile's home (skills/, config); the runner
         # only enters the routed profile's scope later around handle_message, so enter it here.
         # See #67277.
@@ -801,6 +853,9 @@ class WebhookAdapter(BasePlatformAdapter):
                     logger.info("[webhook] script ignored event=%s route=%s", event_type, route_name)
                     return web.json_response({"status": "ignored", "reason": "script", "route": route_name})
                 payload = transformed_payload or payload
+            if "github_approval" in route_config:
+                return await self._handle_github_approval_contract(
+                    route_config, payload, event_type, route_name, profile, delivery_id)
             prompt = (render_mcp_event_prompt(self, route_config, payload, event_type, route_name)
                       or self._render_prompt(route_config.get("prompt", ""), payload, event_type, route_name))
             # cron_job routes: the job's own skills apply; the rendered prompt is only per-run context.
@@ -835,6 +890,63 @@ class WebhookAdapter(BasePlatformAdapter):
         profile: Optional[str], delivery_id: str,
     ) -> web.Response:
         """Produce or retire one approval card from a strict GitHub contract; never run an agent."""
+        if (isinstance(payload, dict) and payload.get("schema") == _GITHUB_APPROVAL_SCHEMA):
+            try:
+                from gateway.github_approval_broker import ApprovalProposal, default_broker
+                required = {"schema", "item_key", "head_sha", "contract_accepted", "digest",
+                            "scope", "limits", "risk", "binding_status"}
+                if set(payload) != required or type(payload.get("contract_accepted")) is not bool:
+                    raise ValueError("unexpected v2 contract fields")
+                if not isinstance(payload.get("scope"), list) or not isinstance(payload.get("limits"), dict):
+                    raise ValueError("invalid scope or limits")
+                if not isinstance(payload.get("risk"), str) or not isinstance(payload.get("binding_status"), str):
+                    raise ValueError("invalid risk or binding status")
+                proposal = ApprovalProposal(
+                    payload.get("item_key"), payload.get("head_sha"), payload.get("digest"), "hermes")
+                proposal.validate()
+                binding_status = payload["binding_status"]
+                terminal_status = binding_status if binding_status in {"closed", "merged", "superseded"} else None
+                if ((binding_status == "pending" and payload["contract_accepted"] is not True)
+                        or (terminal_status is not None and payload["contract_accepted"] is not False)
+                        or (binding_status != "pending" and terminal_status is None)):
+                    raise ValueError("contradictory v2 contract acceptance and binding status")
+                approval = route_config.get("github_approval")
+                if (not isinstance(approval, dict)
+                        or approval.get("schema") != _GITHUB_APPROVAL_SCHEMA):
+                    raise ValueError("route does not own v2 approval schema")
+                authorized_user_id = approval.get("authorized_user_id")
+                if not isinstance(authorized_user_id, str) or not authorized_user_id:
+                    raise ValueError("authorized_user_id is required")
+                with self._profile_scope(profile):
+                    target = self._find_adapter(Platform.TELEGRAM, profile)
+                    if target is None:
+                        return _json_error("Telegram approval destination unavailable", 503)
+                    broker = default_broker(instance_id=f"webhook-producer:{profile or 'default'}:{route_name}")
+                    if terminal_status is not None:
+                        retired = await broker.retire_item(
+                            proposal.item_key, status=terminal_status, adapter=target)
+                        return web.json_response(
+                            {"status": "approval_retired", "action": terminal_status,
+                             "retired": retired, "delivery_id": delivery_id}, status=202)
+                    extra = route_config.get("deliver_extra") or {}
+                    target_chat_id = extra.get("chat_id")
+                    if not target_chat_id:
+                        home = self._delivery_config(profile).get_home_channel(Platform.TELEGRAM)
+                        target_chat_id = home.chat_id if home else None
+                    if not target_chat_id:
+                        return _json_error("Telegram approval chat is not configured", 503)
+                    outcome = broker.admit(
+                        proposal, adapter=target, chat_id=str(target_chat_id),
+                        question=f"Approve {proposal.item_key} at {proposal.head_sha[:12]}?",
+                        session_key=f"github-approval:{profile or 'default'}:{route_name}:{delivery_id}",
+                        authorized_user_id=authorized_user_id,
+                        thread_id=extra.get("message_thread_id") or extra.get("thread_id"))
+                return web.json_response(
+                    {"status": "approval_admitted", "action": outcome.action,
+                     "proposal_key": outcome.proposal_key, "delivery_id": delivery_id}, status=202)
+            except (TypeError, ValueError) as exc:
+                logger.warning("[webhook] Rejected v2 GitHub approval on route %s: %s", route_name, exc)
+                return _json_error("Unrecognized or malformed GitHub approval contract", 400)
         if event_type == "pull_request":
             try:
                 if not isinstance(payload, dict) or payload.get("action") != "closed":

@@ -42,9 +42,11 @@ outcome = await broker.request(
 )
 ```
 
+The public webhook path first commits accepted work with `broker.admit(...)`; it never waits for Telegram. The webhook adapter's startup worker recovers callbacks, retries verified card retirement, claims pending notifications with a bounded pre-send lease, and resumes decisions only when `gateway_runner.github_approval_runtime` supplies both the GitHub reader and receipt-backed executor. SQLite claims prevent duplicate delivery or execution across overlapping worker processes. A crash before the send boundary releases only the reservation after its lease; a crash after dispatch starts remains ambiguous and is not blindly retried.
+
 Only `action == "answered"` with a matching live tuple and unchanged authority binding is reusable. `sent` and `reused` mean the decision is pending. `superseded` rejects replay of an older tuple; a rollback needs a fresh explicit reset rather than resurrection. `binding_conflict` rejects a changed question, authorized user, chat/topic, or Telegram bot for the same tuple. `pending_retry` is limited to an explicit provider rejection before delivery. `operator_reconciliation` means the provider outcome is ambiguous and must never be retried automatically.
 
-Telegram startup calls `retry_pending(adapter=telegram_adapter)` for explicitly retryable rows. Continuation workers call `resume_approved(...)`: it re-reads the exact live head and digest, rejects stale tuples, and accepts only an executor implementing both durable `read_receipt(idempotency_key)` and `execute_idempotent(..., idempotency_key=...)`. A generic executor is marked blocked before any side effect. After a crash, receipt readback settles an already-completed effect without invoking it again.
+The startup worker calls `recover_callbacks`, `retry_retirements`, and `retry_pending` before `resume_approved(...)`. Resumption re-reads the exact live head and digest, rejects stale, closed, or non-current tuples, and accepts only an executor implementing both durable `read_receipt(idempotency_key)` and `execute_idempotent(..., idempotency_key=...)`. A generic executor is marked blocked before any side effect. After a crash, receipt readback settles an already-completed effect without invoking it again.
 
 ## State guarantees
 
@@ -64,12 +66,22 @@ Telegram startup calls `retry_pending(adapter=telegram_adapter)` for explicitly 
 No new credential is introduced. Existing Telegram and webhook credentials remain in the profile secret scope.
 
 1. Confirm the intended profile has Telegram enabled and a home channel or explicit approval `chat_id`.
-2. Configure an authenticated webhook route with `deliver: telegram` and `github_approval: {authorized_user_id: "<telegram-id>"}`. For creation, this lane accepts only GitHub `repository_dispatch` events with action `hermes_contract_approval` and an exact `client_payload` containing `pull_request_number`, `head_sha`, `contract_digest_sha256`, and `executor=hermes`. It also accepts GitHub `pull_request` `closed` events to transactionally retire the matching item's buttons (`merged=true` is recorded as merged). Configure the route's event allowlist for both event types when terminal retirement is required. Neither path admits an agent run.
-3. Change every foreground/local producer to call the broker contract above. Do not also emit a local approval card.
-4. Compose a resumption worker only with a GitHub reader and receipt-backed idempotent executor. If either contract is unavailable, leave the decision blocked; do not substitute a generic callable.
-5. Existing JSONL operational ledgers are not imported automatically. Keep them read-only during evaluation; the new SQLite store is the candidate authority.
+2. In the active profile's `webhook_subscriptions.json`, keep the existing route secret and add this exact non-secret metadata to `github-hermes-intake`:
 
-This candidate does not alter live configuration, execute a GitHub mutation, or compose an executor by itself.
+   ```json
+   "github_approval": {
+     "schema": "hermes.github-intake.v2",
+     "authorized_user_id": "<telegram-user-id>"
+   }
+   ```
+
+   Keep `deliver: "telegram"`, the existing `deliver_extra`, script, and the `issues`, `pull_request`, and `issue_comment` event allowlist. Do not copy, print, or replace the route's `secret`. Missing metadata, extra metadata keys, a foreign schema, a non-string/empty user ID, or a non-Telegram destination makes the dynamic route fail closed. Static routes use the same validator.
+3. The transform output must have exactly `schema`, `item_key`, `head_sha`, `contract_accepted`, `digest`, `scope`, `limits`, `risk`, and `binding_status`. `schema` is `hermes.github-intake.v2`; `item_key` is canonical `owner/repo#number`; `head_sha` and `digest` are lowercase 40/64-character hex; `scope` is an array; `limits` is an object; and `risk` is a string. An accepted pending contract is exactly `contract_accepted: true` plus `binding_status: "pending"`. Terminal output is exactly `contract_accepted: false` plus `binding_status` equal to `closed`, `merged`, or `superseded`. Contradictory or foreign envelopes are rejected before either the broker or agent path. The broker-owned path never admits an LLM turn or plaintext approval producer.
+4. Change every foreground/local producer to call the broker contract above. Do not also emit a local approval card.
+5. Compose `gateway_runner.github_approval_runtime.github` with `read_contract(item_key)` and `.executor` with `read_receipt(key)` plus `execute_idempotent(..., idempotency_key=key)`. If either contract is unavailable, the worker sends/reconciles cards but leaves approved execution pending; it never substitutes a generic callable.
+6. Existing JSONL operational ledgers are not imported automatically. Keep them read-only during evaluation; the new SQLite store is the candidate authority.
+
+This candidate does not alter live configuration, expose or migrate a secret, execute a GitHub mutation without the composed receipt-backed runtime, or restart a service by itself.
 
 ## Rollback
 

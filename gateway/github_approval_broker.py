@@ -116,6 +116,7 @@ class GitHubApprovalBroker:
                     approver TEXT,
                     origin_status TEXT,
                     last_error TEXT,
+                    retirement_pending INTEGER NOT NULL DEFAULT 0 CHECK(retirement_pending IN (0,1)),
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
@@ -140,6 +141,8 @@ class GitHubApprovalBroker:
             columns = {str(row[1]) for row in db.execute("PRAGMA table_info(github_approval_proposals)")}
             if "destination_id" not in columns:
                 db.execute("ALTER TABLE github_approval_proposals ADD COLUMN destination_id TEXT")
+            if "retirement_pending" not in columns:
+                db.execute("ALTER TABLE github_approval_proposals ADD COLUMN retirement_pending INTEGER NOT NULL DEFAULT 0")
         try:
             self.path.chmod(0o600)
         except OSError:
@@ -166,7 +169,7 @@ class GitHubApprovalBroker:
 
     def _claim(self, proposal: ApprovalProposal, *, chat_id: str, question: str, session_key: str,
                thread_id: Optional[str], authorized_user_id: str,
-               destination_id: Optional[str]) -> tuple[RequestOutcome, list[str]]:
+               destination_id: Optional[str], dispatch: bool = True) -> tuple[RequestOutcome, list[str]]:
         key, now = proposal.canonical_key(), time.time()
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -205,26 +208,52 @@ class GitHubApprovalBroker:
                 "SELECT clarify_id FROM github_approval_proposals WHERE item_key=? AND proposal_key!=? "
                 "AND state IN ('pending_notification','dispatching','active','answered')", (proposal.item_key, key)).fetchall()
             retired = [str(row["clarify_id"]) for row in old]
-            db.execute("UPDATE github_approval_proposals SET state='superseded',callback_bound=0,updated_at=? "
+            db.execute("UPDATE github_approval_proposals SET state='superseded',callback_bound=0,"
+                       "retirement_pending=CASE WHEN message_id IS NOT NULL THEN 1 ELSE 0 END,updated_at=? "
                        "WHERE item_key=? AND proposal_key!=? AND state IN "
                        "('pending_notification','dispatching','active','answered')", (now, proposal.item_key, key))
+            db.execute("UPDATE github_approval_decisions SET state='stale',claim_token=NULL,claim_owner=NULL,"
+                       "claim_expires_at=NULL WHERE state IN ('pending','claimed') AND proposal_key IN "
+                       "(SELECT proposal_key FROM github_approval_proposals WHERE item_key=? "
+                       "AND proposal_key!=? AND state='superseded')", (proposal.item_key, key))
             clarify_id = str(exact["clarify_id"]) if exact else f"gha-{key[:24]}"
+            initial_state = "dispatching" if dispatch else "pending_notification"
             db.execute("""INSERT INTO github_approval_proposals(
                     proposal_key,item_key,head_sha,contract_digest_sha256,executor,state,clarify_id,
                     session_key,chat_id,thread_id,authorized_user_id,question,message_id,callback_bound,
                     destination_id,owner_instance_id,lease_expires_at,last_error,created_at,updated_at)
-                VALUES(?,?,?,?,?,'dispatching',?,?,?,?,?,?,NULL,0,?,?,?,?,?,?)
-                ON CONFLICT(proposal_key) DO UPDATE SET state='dispatching',session_key=excluded.session_key,
+                VALUES(?,?,?,?,?,?, ?,?,?,?,?,?,NULL,0,?,?,?,?,?,?)
+                ON CONFLICT(proposal_key) DO UPDATE SET state=excluded.state,session_key=excluded.session_key,
                     chat_id=excluded.chat_id,thread_id=excluded.thread_id,
                     authorized_user_id=excluded.authorized_user_id,question=excluded.question,message_id=NULL,
                     callback_bound=0,owner_instance_id=excluded.owner_instance_id,
                     lease_expires_at=excluded.lease_expires_at,
                     last_error=NULL,updated_at=excluded.updated_at""",
                 (key, proposal.item_key, proposal.head_sha, proposal.contract_digest_sha256, proposal.executor,
+                 initial_state,
                  clarify_id, session_key, chat_id, thread_id, authorized_user_id, question,
-                 destination_id, self.instance_id, now + self.delivery_lease_seconds, None, now, now))
+                 destination_id, self.instance_id if dispatch else None,
+                 now + self.delivery_lease_seconds if dispatch else None, None, now, now))
             db.commit()
         return RequestOutcome("send", key, clarify_id), retired
+
+    def admit(self, proposal: ApprovalProposal, *, adapter: Any, chat_id: str, question: str,
+              session_key: str, authorized_user_id: str,
+              thread_id: Optional[str] = None) -> RequestOutcome:
+        """Commit an approval to the durable delivery outbox without transport I/O."""
+        required = (chat_id, question, session_key, authorized_user_id)
+        if not all(isinstance(value, str) and value for value in required):
+            raise ValueError("chat_id, question, session_key, and authorized_user_id are required")
+        key = proposal.canonical_key()
+        destination_id = self._destination_identity(adapter, f"gha-{key[:24]}")
+        if destination_id is None:
+            raise ValueError("approval destination identity is unavailable")
+        claim, _retired = self._claim(
+            proposal, chat_id=chat_id, question=question, session_key=session_key,
+            thread_id=str(thread_id) if thread_id is not None else None,
+            authorized_user_id=authorized_user_id, destination_id=destination_id, dispatch=False)
+        return RequestOutcome("admitted" if claim.action == "send" else claim.action,
+                              claim.proposal_key, claim.clarify_id, claim.message_id, claim.response)
 
     async def request(self, proposal: ApprovalProposal, *, adapter: Any, chat_id: str, question: str,
                       session_key: str, authorized_user_id: str, thread_id: Optional[str] = None) -> RequestOutcome:
@@ -239,16 +268,40 @@ class GitHubApprovalBroker:
         if claim.action != "send":
             return claim
         retire = getattr(adapter, "retire_clarify_card", None)
+        retirement_failed = bool(retired) and not callable(retire)
         if callable(retire):
             for clarify_id in retired:
                 try:
                     await retire(clarify_id, "Superseded by a newer GitHub contract")
                 except Exception:
+                    retirement_failed = True
                     logger.exception("Could not retire superseded GitHub approval card")
+                else:
+                    with self._connect() as db:
+                        db.execute("UPDATE github_approval_proposals SET retirement_pending=0,updated_at=? "
+                                   "WHERE clarify_id=? AND state='superseded'",
+                                   (time.time(), clarify_id))
+        if retirement_failed:
+            with self._connect() as db:
+                db.execute("UPDATE github_approval_proposals SET state='pending_notification',"
+                           "owner_instance_id=NULL,lease_expires_at=NULL,updated_at=? "
+                           "WHERE proposal_key=? AND state='dispatching' AND owner_instance_id=?",
+                           (time.time(), claim.proposal_key, self.instance_id))
+            return RequestOutcome("pending_retry", claim.proposal_key, claim.clarify_id)
         return await self._deliver_claim(claim.proposal_key, adapter)
 
     async def _deliver_claim(self, proposal_key: str, adapter: Any) -> RequestOutcome:
         with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            reserved = db.execute(
+                "SELECT state,owner_instance_id FROM github_approval_proposals WHERE proposal_key=?",
+                (proposal_key,)).fetchone()
+            if (reserved is not None and reserved["state"] == "pending_notification"
+                    and reserved["owner_instance_id"] == self.instance_id):
+                db.execute("UPDATE github_approval_proposals SET state='dispatching',updated_at=? "
+                           "WHERE proposal_key=? AND state='pending_notification' AND owner_instance_id=?",
+                           (time.time(), proposal_key, self.instance_id))
+            db.commit()
             row = db.execute("SELECT * FROM github_approval_proposals WHERE proposal_key=? AND state='dispatching'",
                              (proposal_key,)).fetchone()
         if row is None:
@@ -261,6 +314,7 @@ class GitHubApprovalBroker:
         if row["thread_id"] is not None:
             metadata["thread_id"] = str(row["thread_id"])
         explicit_failure = False
+        delivered = False
         try:
             result = await adapter.send_clarify(
                 chat_id=str(row["chat_id"]), question=str(row["question"]), choices=list(_CHOICES),
@@ -270,6 +324,7 @@ class GitHubApprovalBroker:
                 error = result.error or "provider rejected delivery"
                 state = "pending_notification"
             else:
+                delivered = True
                 message_id = str(result.message_id) if result.message_id is not None else None
                 bound = self._callback_is_bound(adapter, str(row["clarify_id"]), str(row["session_key"]))
                 destination_id = self._destination_identity(adapter, str(row["clarify_id"]))
@@ -283,12 +338,31 @@ class GitHubApprovalBroker:
         now = time.time()
         with self._connect() as db:
             changed = db.execute("""UPDATE github_approval_proposals SET state=?,message_id=?,callback_bound=?,destination_id=?,
-                    last_error=?,lease_expires_at=NULL,updated_at=?
+                    owner_instance_id=?,last_error=?,lease_expires_at=NULL,updated_at=?
                     WHERE proposal_key=? AND state='dispatching' AND owner_instance_id=?""",
                 (state, message_id if state == "active" else None, 1 if state == "active" else 0,
                  destination_id if state == "active" else row["destination_id"],
+                 None if state == "pending_notification" else self.instance_id,
                  error, now, proposal_key, self.instance_id)).rowcount
         if changed != 1:
+            observed = self.observe_key(proposal_key)
+            if delivered and observed is not None and observed.get("state") == "superseded":
+                with self._connect() as db:
+                    db.execute("UPDATE github_approval_proposals SET message_id=?,retirement_pending=1,updated_at=? "
+                               "WHERE proposal_key=? AND state='superseded'",
+                               (message_id, time.time(), proposal_key))
+                retire = getattr(adapter, "retire_clarify_card", None)
+                if callable(retire):
+                    try:
+                        await _await(retire(str(row["clarify_id"]), "Superseded during delivery"))
+                    except Exception:
+                        logger.exception("Could not retire approval card superseded during delivery")
+                    else:
+                        with self._connect() as db:
+                            db.execute("UPDATE github_approval_proposals SET retirement_pending=0,updated_at=? "
+                                       "WHERE proposal_key=? AND state='superseded'",
+                                       (time.time(), proposal_key))
+                return RequestOutcome("superseded", proposal_key, str(row["clarify_id"]), message_id)
             return RequestOutcome("operator_reconciliation", proposal_key, str(row["clarify_id"]))
         action = "sent" if state == "active" else ("pending_retry" if explicit_failure else "operator_reconciliation")
         return RequestOutcome(action, proposal_key, str(row["clarify_id"]), message_id if state == "active" else None)
@@ -300,18 +374,57 @@ class GitHubApprovalBroker:
         now, claimed = time.time(), []
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            rows = db.execute("SELECT proposal_key FROM github_approval_proposals "
-                              "WHERE state='pending_notification' AND destination_id=? "
-                              "ORDER BY updated_at LIMIT ?", (destination_id, max(1, int(limit)))).fetchall()
+            rows = db.execute("SELECT p.proposal_key FROM github_approval_proposals p "
+                              "WHERE p.state='pending_notification' "
+                              "AND (p.owner_instance_id IS NULL OR p.lease_expires_at<=?) "
+                              "AND p.destination_id=? AND NOT EXISTS (SELECT 1 FROM github_approval_proposals old "
+                              "WHERE old.item_key=p.item_key AND old.proposal_key!=p.proposal_key "
+                              "AND old.state='superseded' AND old.retirement_pending=1) "
+                              "ORDER BY p.updated_at LIMIT ?",
+                              (now, destination_id, max(1, int(limit)))).fetchall()
             for row in rows:
                 key = str(row["proposal_key"])
-                if db.execute("UPDATE github_approval_proposals SET state='dispatching',owner_instance_id=?,"
-                              "lease_expires_at=?,updated_at=? WHERE proposal_key=? "
-                              "AND state='pending_notification'",
-                              (self.instance_id, now + self.delivery_lease_seconds, now, key)).rowcount == 1:
+                if db.execute("UPDATE github_approval_proposals SET owner_instance_id=?,"
+                              "lease_expires_at=?,updated_at=? WHERE proposal_key=? AND "
+                              "state='pending_notification' AND (owner_instance_id IS NULL OR lease_expires_at<=?)",
+                              (self.instance_id, now + self.delivery_lease_seconds, now, key, now)).rowcount == 1:
                     claimed.append(key)
             db.commit()
         return [await self._deliver_claim(key, adapter) for key in claimed]
+
+    async def retry_retirements(self, *, adapter: Any, limit: int = 16) -> int:
+        """Retry stale-card keyboard removal; success is durably verified by clearing the marker."""
+        destination_id = self._destination_identity(adapter, "")
+        if destination_id is None:
+            return 0
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT proposal_key,clarify_id,session_key,chat_id,message_id,thread_id "
+                "FROM github_approval_proposals "
+                "WHERE state='superseded' AND retirement_pending=1 AND message_id IS NOT NULL AND destination_id=? "
+                "ORDER BY updated_at LIMIT ?", (destination_id, max(1, int(limit)))).fetchall()
+        retired = 0
+        retire = getattr(adapter, "retire_clarify_card", None)
+        if not callable(retire):
+            return 0
+        for row in rows:
+            restore = getattr(adapter, "recover_approval_retirement", None)
+            if callable(restore):
+                restore(
+                    str(row["clarify_id"]), str(row["session_key"]), str(row["chat_id"]),
+                    str(row["message_id"]),
+                    str(row["thread_id"]) if row["thread_id"] is not None else None)
+            try:
+                await _await(retire(str(row["clarify_id"]), "Superseded GitHub approval"))
+            except Exception:
+                logger.exception("Could not retry stale GitHub approval retirement")
+                continue
+            with self._connect() as db:
+                retired += db.execute(
+                    "UPDATE github_approval_proposals SET retirement_pending=0,updated_at=? "
+                    "WHERE proposal_key=? AND state='superseded' AND retirement_pending=1",
+                    (time.time(), str(row["proposal_key"]))).rowcount
+        return retired
 
     def recover_callbacks(self, adapter: Any) -> list[dict[str, str]]:
         restore = getattr(adapter, "recover_approval_callback", None)
@@ -389,8 +502,10 @@ class GitHubApprovalBroker:
         now, items = time.time(), []
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            rows = db.execute("SELECT decision_id FROM github_approval_decisions WHERE state='pending' OR "
-                              "(state='claimed' AND claim_expires_at<=?) ORDER BY decision_id LIMIT ?",
+            rows = db.execute("SELECT d.decision_id FROM github_approval_decisions d JOIN "
+                              "github_approval_proposals p USING(proposal_key) WHERE p.state='answered' AND "
+                              "(d.state='pending' OR (d.state='claimed' AND d.claim_expires_at<=?)) "
+                              "ORDER BY d.decision_id LIMIT ?",
                               (now, max(1, int(limit)))).fetchall()
             for row in rows:
                 token = secrets.token_hex(16)
@@ -459,6 +574,15 @@ class GitHubApprovalBroker:
                 self._finish_claim(claim, "stale")
                 outcomes.append("stale")
                 continue
+            with self._connect() as db:
+                current = db.execute(
+                    "SELECT 1 FROM github_approval_decisions d JOIN github_approval_proposals p "
+                    "USING(proposal_key) WHERE d.decision_id=? AND d.state='claimed' "
+                    "AND d.claim_token=? AND p.state='answered'",
+                    (int(claim["decision_id"]), str(claim["claim_token"]))).fetchone()
+            if current is None:
+                outcomes.append("stale")
+                continue
             execution_key = f"gha-exec-{claim['proposal_key']}"
             with self._connect() as db:
                 db.execute("UPDATE github_approval_decisions SET execution_key=? WHERE decision_id=? AND claim_token=?",
@@ -492,16 +616,24 @@ class GitHubApprovalBroker:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             rows = db.execute(
-                "SELECT clarify_id FROM github_approval_proposals WHERE item_key=? "
-                "AND state IN ('pending_notification','dispatching','delivery_unknown','active')",
+                "SELECT proposal_key,clarify_id FROM github_approval_proposals WHERE item_key=? "
+                "AND state IN ('pending_notification','dispatching','delivery_unknown','active','answered')",
                 (item_key,),
             ).fetchall()
             changed = db.execute(
                 "UPDATE github_approval_proposals SET state='superseded',callback_bound=0,"
                 "lease_expires_at=NULL,origin_status=?,updated_at=? WHERE item_key=? "
-                "AND state IN ('pending_notification','dispatching','delivery_unknown','active')",
+                "AND state IN ('pending_notification','dispatching','delivery_unknown','active','answered')",
                 (status, now, item_key),
             ).rowcount
+            db.execute("UPDATE github_approval_decisions SET state='stale',claim_token=NULL,claim_owner=NULL,"
+                       "claim_expires_at=NULL WHERE state IN ('pending','claimed') AND proposal_key IN "
+                       "(SELECT proposal_key FROM github_approval_proposals WHERE item_key=? AND state='superseded')",
+                       (item_key,))
+            db.execute("UPDATE github_approval_proposals SET retirement_pending="
+                       "CASE WHEN message_id IS NOT NULL THEN 1 ELSE 0 END WHERE proposal_key IN "
+                       "(SELECT proposal_key FROM github_approval_proposals WHERE item_key=? AND state='superseded')",
+                       (item_key,))
             db.commit()
         retire = getattr(adapter, "retire_clarify_card", None)
         if callable(retire):
@@ -510,6 +642,11 @@ class GitHubApprovalBroker:
                     await _await(retire(str(row["clarify_id"]), f"GitHub item {status}"))
                 except Exception:
                     logger.exception("Could not retire terminal GitHub approval card")
+                else:
+                    with self._connect() as db:
+                        db.execute("UPDATE github_approval_proposals SET retirement_pending=0,updated_at=? "
+                                   "WHERE proposal_key=? AND state='superseded'",
+                                   (time.time(), str(row["proposal_key"])))
         return int(changed)
 
     def observe_key(self, proposal_key: str) -> Optional[dict]:
