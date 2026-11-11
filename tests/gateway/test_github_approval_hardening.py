@@ -217,9 +217,9 @@ async def test_telegram_approval_prompt_has_no_free_text_other_choice(monkeypatc
         "42", "Approve?", ["Approve", "Do not approve"], "gha-id", "session",
         {"is_approval_prompt": True})
 
-    assert adapter._clarify_state["gha-id"] == "session"
-    assert adapter._approval_clarify_state["gha-id"] == ClarifyPrompt(
-        "session", "42", "501", None)
+    expected = ClarifyPrompt("session", "42", "501", None)
+    assert adapter._clarify_state["gha-id"] == expected
+    assert adapter._approval_clarify_state["gha-id"] == expected
 
 
 @pytest.mark.asyncio
