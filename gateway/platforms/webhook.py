@@ -852,7 +852,11 @@ class WebhookAdapter(BasePlatformAdapter):
                 if not keep:
                     logger.info("[webhook] script ignored event=%s route=%s", event_type, route_name)
                     return web.json_response({"status": "ignored", "reason": "script", "route": route_name})
-                payload = transformed_payload or payload
+                payload = transformed_payload if transformed_payload is not None else payload
+                approval = route_config.get("github_approval")
+                if (isinstance(approval, dict) and approval.get("schema") == _GITHUB_APPROVAL_SCHEMA
+                        and (not isinstance(transformed_payload, dict) or not transformed_payload)):
+                    return _json_error("Unrecognized or malformed GitHub approval contract", 400)
             if "github_approval" in route_config:
                 return await self._handle_github_approval_contract(
                     route_config, payload, event_type, route_name, profile, delivery_id)

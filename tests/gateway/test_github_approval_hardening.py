@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -139,7 +140,8 @@ class ReceiptExecutor:
     async def read_receipt(self, key):
         return self.receipts.get(key)
 
-    async def execute_idempotent(self, claim, *, idempotency_key):
+    async def execute_idempotent(self, claim, *, idempotency_key, execution_fence):
+        execution_fence.check()
         self.calls.append((claim, idempotency_key))
         receipt = {"id": idempotency_key}
         self.receipts[idempotency_key] = receipt
@@ -245,6 +247,71 @@ async def test_supersession_while_resumer_revalidates_prevents_executor(tmp_path
     await broker.request(
         proposal(head="c" * 40), adapter=BoundTelegram(), chat_id="42", question="Approve?",
         session_key="webhook:2", authorized_user_id="7")
+    release.set()
+
+    assert await resuming == ["stale"]
+    assert executor.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["superseded", "closed"])
+async def test_terminal_change_during_receipt_read_prevents_executor_effect(tmp_path, terminal):
+    broker = await _approved_broker(tmp_path)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BarrierReceiptExecutor(ReceiptExecutor):
+        async def read_receipt(self, key):
+            entered.set()
+            await release.wait()
+            return await super().read_receipt(key)
+
+    executor = BarrierReceiptExecutor()
+    resuming = asyncio.create_task(broker.resume_approved(
+        owner="worker", github=LiveReader(), executor=executor))
+    await entered.wait()
+    adapter = BoundTelegram()
+    if terminal == "superseded":
+        await broker.request(
+            proposal(head="c" * 40), adapter=adapter, chat_id="42", question="Approve?",
+            session_key="webhook:2", authorized_user_id="7")
+    else:
+        await broker.retire_item(proposal().item_key, status="closed", adapter=adapter)
+    release.set()
+
+    assert await resuming == ["stale"]
+    assert executor.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["superseded", "closed"])
+async def test_terminal_change_between_receipt_read_and_effect_fails_execution_fence(tmp_path, terminal):
+    broker = await _approved_broker(tmp_path)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BarrierEffectExecutor(ReceiptExecutor):
+        async def execute_idempotent(self, claim, *, idempotency_key, execution_fence=None):
+            entered.set()
+            await release.wait()
+            assert execution_fence is not None
+            execution_fence.check()
+            self.calls.append((claim, idempotency_key))
+            receipt = {"id": idempotency_key}
+            self.receipts[idempotency_key] = receipt
+            return receipt
+
+    executor = BarrierEffectExecutor()
+    resuming = asyncio.create_task(broker.resume_approved(
+        owner="worker", github=LiveReader(), executor=executor))
+    await entered.wait()
+    adapter = BoundTelegram()
+    if terminal == "superseded":
+        await broker.request(
+            proposal(head="c" * 40), adapter=adapter, chat_id="42", question="Approve?",
+            session_key="webhook:2", authorized_user_id="7")
+    else:
+        await broker.retire_item(proposal().item_key, status="closed", adapter=adapter)
     release.set()
 
     assert await resuming == ["stale"]
@@ -534,6 +601,50 @@ async def test_dynamic_v2_endpoint_retires_transformed_terminal_item(tmp_path, m
         assert response.status == 202
         assert (await response.json())["status"] == "approval_retired"
     assert broker.observe(proposal())["state"] == "superseded"
+    adapter._admit_agent_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dynamic_v2_endpoint_rejects_real_script_empty_object_instead_of_raw_payload(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "tools.environments.local.build_subprocess_env", lambda: dict(os.environ))
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    script = scripts / "empty.py"
+    script.write_text("import json\nprint(json.dumps({}))\n")
+    (tmp_path / "webhook_subscriptions.json").write_text(json.dumps({
+        "github-hermes-intake": {
+            "secret": "INSECURE_NO_AUTH", "events": ["issues"],
+            "script": "empty.py", "deliver": "telegram",
+            "deliver_extra": {"chat_id": "42"},
+            "github_approval": {
+                "schema": "hermes.github-intake.v2", "authorized_user_id": "7"},
+        }}))
+    target = BoundTelegram()
+    runner = MagicMock()
+    runner._authorization_adapter.return_value = target
+    runner.config = SimpleNamespace(multiplex_profiles=False)
+    adapter = WebhookAdapter(PlatformConfig(enabled=True, extra={"host": "127.0.0.1"}))
+    adapter.gateway_runner = runner
+    adapter._admit_agent_run = AsyncMock(side_effect=AssertionError("agent ran"))
+    app = web.Application()
+    app.router.add_post("/webhooks/{route_name}", adapter._handle_webhook)
+    raw_authority_envelope = {
+        "schema": "hermes.github-intake.v2", "item_key": "owner/repo#7",
+        "head_sha": "a" * 40, "contract_accepted": True, "digest": "b" * 64,
+        "scope": ["tests"], "limits": {"files": 3}, "risk": "low",
+        "binding_status": "pending",
+    }
+
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post(
+            "/webhooks/github-hermes-intake", json=raw_authority_envelope,
+            headers={"X-GitHub-Event": "issues", "X-GitHub-Delivery": "empty-v2"})
+
+    assert response.status == 400
+    assert target.sent == []
     adapter._admit_agent_run.assert_not_awaited()
 
 

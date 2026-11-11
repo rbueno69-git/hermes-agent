@@ -66,6 +66,34 @@ class ApprovalDecision:
     approver: str
 
 
+class StaleExecutionFence(RuntimeError):
+    """The durable approval ceased to be current before the effect boundary."""
+
+
+class ExecutionFence:
+    """One-shot authority token checked immediately before an executor effect."""
+
+    def __init__(self, broker: GitHubApprovalBroker, claim: dict, execution_key: str):
+        self._broker = broker
+        self._decision_id = int(claim["decision_id"])
+        self._claim_token = str(claim["claim_token"])
+        self._execution_key = execution_key
+
+    def check(self) -> None:
+        with self._broker._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            changed = db.execute(
+                "UPDATE github_approval_decisions SET execution_fenced=1 "
+                "WHERE decision_id=? AND state='claimed' AND claim_token=? "
+                "AND execution_key=? AND execution_fenced=0 AND EXISTS ("
+                "SELECT 1 FROM github_approval_proposals p "
+                "WHERE p.proposal_key=github_approval_decisions.proposal_key AND p.state='answered')",
+                (self._decision_id, self._claim_token, self._execution_key),
+            ).rowcount
+        if changed != 1:
+            raise StaleExecutionFence("GitHub approval execution fence is stale or already consumed")
+
+
 async def _await(value):
     return await value if inspect.isawaitable(value) else value
 
@@ -132,6 +160,7 @@ class GitHubApprovalBroker:
                     claim_owner TEXT,
                     claim_expires_at REAL,
                     execution_key TEXT,
+                    execution_fenced INTEGER NOT NULL DEFAULT 0 CHECK(execution_fenced IN (0,1)),
                     execution_receipt TEXT,
                     decided_at REAL NOT NULL,
                     resumed_at REAL
@@ -143,6 +172,9 @@ class GitHubApprovalBroker:
                 db.execute("ALTER TABLE github_approval_proposals ADD COLUMN destination_id TEXT")
             if "retirement_pending" not in columns:
                 db.execute("ALTER TABLE github_approval_proposals ADD COLUMN retirement_pending INTEGER NOT NULL DEFAULT 0")
+            decision_columns = {str(row[1]) for row in db.execute("PRAGMA table_info(github_approval_decisions)")}
+            if "execution_fenced" not in decision_columns:
+                db.execute("ALTER TABLE github_approval_decisions ADD COLUMN execution_fenced INTEGER NOT NULL DEFAULT 0")
         try:
             self.path.chmod(0o600)
         except OSError:
@@ -504,14 +536,15 @@ class GitHubApprovalBroker:
             db.execute("BEGIN IMMEDIATE")
             rows = db.execute("SELECT d.decision_id FROM github_approval_decisions d JOIN "
                               "github_approval_proposals p USING(proposal_key) WHERE p.state='answered' AND "
-                              "(d.state='pending' OR (d.state='claimed' AND d.claim_expires_at<=?)) "
+                              "(d.state='pending' OR (d.state='claimed' AND d.execution_fenced=0 "
+                              "AND d.claim_expires_at<=?)) "
                               "ORDER BY d.decision_id LIMIT ?",
                               (now, max(1, int(limit)))).fetchall()
             for row in rows:
                 token = secrets.token_hex(16)
                 if db.execute("UPDATE github_approval_decisions SET state='claimed',claim_token=?,claim_owner=?,"
-                              "claim_expires_at=? WHERE decision_id=? AND (state='pending' OR "
-                              "(state='claimed' AND claim_expires_at<=?))",
+                              "claim_expires_at=?,execution_fenced=0 WHERE decision_id=? AND (state='pending' OR "
+                              "(state='claimed' AND execution_fenced=0 AND claim_expires_at<=?))",
                               (token, owner, now + max(1.0, float(lease_seconds)), int(row["decision_id"]), now)).rowcount == 1:
                     claimed = db.execute("SELECT d.*,p.session_key,p.item_key,p.head_sha,p.contract_digest_sha256,"
                                          "p.executor,p.clarify_id FROM github_approval_decisions d JOIN "
@@ -532,6 +565,15 @@ class GitHubApprovalBroker:
                                   int(claim["decision_id"]), str(claim["claim_token"]))).rowcount
         return changed == 1
 
+    def _claim_is_current(self, claim: dict) -> bool:
+        with self._connect() as db:
+            return db.execute(
+                "SELECT 1 FROM github_approval_decisions d JOIN github_approval_proposals p "
+                "USING(proposal_key) WHERE d.decision_id=? AND d.state='claimed' "
+                "AND d.claim_token=? AND p.state='answered'",
+                (int(claim["decision_id"]), str(claim["claim_token"])),
+            ).fetchone() is not None
+
     async def resume_approved(self, *, owner: str, github: Any, executor: Any, adapter: Any = None,
                               limit: int = 16) -> list[str]:
         """Revalidate and continue only through a receipt-readable idempotent executor."""
@@ -547,10 +589,16 @@ class GitHubApprovalBroker:
             read_contract = getattr(github, "read_contract", None) if callable(reader_contract) else None
             read_receipt = getattr(executor, "read_receipt", None) if callable(reader_receipt) else None
             execute = getattr(executor, "execute_idempotent", None) if callable(executor_method) else None
-            if not all(callable(value) for value in (read_contract, read_receipt, execute)):
+            try:
+                executor_parameters = inspect.signature(execute).parameters if callable(execute) else {}
+            except (TypeError, ValueError):
+                executor_parameters = {}
+            if (not all(callable(value) for value in (read_contract, read_receipt, execute))
+                    or "execution_fence" not in executor_parameters):
                 self._finish_claim(claim, "blocked")
                 outcomes.append("blocked_executor")
                 continue
+            assert callable(read_contract) and callable(read_receipt) and callable(execute)
             try:
                 live = await _await(read_contract(str(claim["item_key"])))
                 if not isinstance(live, ApprovalProposal):
@@ -574,13 +622,7 @@ class GitHubApprovalBroker:
                 self._finish_claim(claim, "stale")
                 outcomes.append("stale")
                 continue
-            with self._connect() as db:
-                current = db.execute(
-                    "SELECT 1 FROM github_approval_decisions d JOIN github_approval_proposals p "
-                    "USING(proposal_key) WHERE d.decision_id=? AND d.state='claimed' "
-                    "AND d.claim_token=? AND p.state='answered'",
-                    (int(claim["decision_id"]), str(claim["claim_token"]))).fetchone()
-            if current is None:
+            if not self._claim_is_current(claim):
                 outcomes.append("stale")
                 continue
             execution_key = f"gha-exec-{claim['proposal_key']}"
@@ -588,8 +630,17 @@ class GitHubApprovalBroker:
                 db.execute("UPDATE github_approval_decisions SET execution_key=? WHERE decision_id=? AND claim_token=?",
                            (execution_key, int(claim["decision_id"]), str(claim["claim_token"])))
             receipt = await _await(read_receipt(execution_key))
+            if not self._claim_is_current(claim):
+                outcomes.append("stale")
+                continue
             if receipt is None:
-                receipt = await _await(execute(dict(claim), idempotency_key=execution_key))
+                fence = ExecutionFence(self, claim, execution_key)
+                try:
+                    receipt = await _await(execute(
+                        dict(claim), idempotency_key=execution_key, execution_fence=fence))
+                except StaleExecutionFence:
+                    outcomes.append("stale")
+                    continue
             if (not isinstance(receipt, dict) or set(receipt) != {"id"}
                     or receipt.get("id") != execution_key):
                 outcomes.append("operator_reconciliation")
