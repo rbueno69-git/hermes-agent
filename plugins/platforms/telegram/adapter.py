@@ -183,6 +183,7 @@ from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from plugins.platforms.telegram.telegram_entities import expand_link_entities
 from plugins.platforms.telegram.telegram_held_inbound import TelegramHeldInboundMixin
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id, parse_send_target, parse_telegram_message_id
+from plugins.platforms.telegram.telegram_clarify_binding import ClarifyPrompt
 from plugins.platforms.telegram.telegram_resolved_prompt import edit_keeping_prompt
 from plugins.platforms.telegram.telegram_topic_transfer import TopicTransferFn, apply_root_dm_topic_transfer
 from plugins.platforms.telegram.telegram_network import (
@@ -714,6 +715,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         self._approval_request_ids: dict[int, str] = {}  # message_id → tools.approval request id
         self._slash_confirm_state: dict[str, str] = {}  # confirm_id → session_key
         self._clarify_state: dict[str, str] = {}  # clarify_id → session_key
+        # Approval cards additionally bind the exact Telegram message without changing the public/current
+        # clarify-state shape used by ordinary prompts.
+        self._approval_clarify_state: dict[str, ClarifyPrompt] = {}
         # "important" (default): only final responses, approvals and slash confirmations notify;
         # "all": every message notifies (display.platforms.telegram.notifications).
         self._notifications_mode: str = "important"
@@ -4300,11 +4304,65 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 text += "\n\n" + "\n".join(f"{i + 1}. {_html.escape(str(c))}" for i, c in enumerate(choices))
                 # Telegram caps callback_data at 64 bytes; keep "cl:<id>:<idx>" short.
                 rows = [[InlineKeyboardButton(str(idx + 1), callback_data=f"cl:{clarify_id}:{idx}")] for idx in range(len(choices))]
-                rows.append([InlineKeyboardButton(t("platform.telegram.prompt.other"), callback_data=f"cl:{clarify_id}:other")])
+                if not (metadata or {}).get("is_approval_prompt"):
+                    rows.append([InlineKeyboardButton(t("platform.telegram.prompt.other"), callback_data=f"cl:{clarify_id}:other")])
                 keyboard = InlineKeyboardMarkup(rows)
-            return text, keyboard, lambda msg: self._clarify_state.__setitem__(clarify_id, session_key)
+            def remember(msg):
+                self._clarify_state[clarify_id] = session_key
+                if (metadata or {}).get("is_approval_prompt"):
+                    self._approval_clarify_state[clarify_id] = ClarifyPrompt.from_sent(session_key, msg)
+            return text, keyboard, remember
         return await self._send_prompt(
             "send_clarify", chat_id, metadata, build, parse_mode=ParseMode.HTML, thread_id=self._metadata_thread_id(metadata))
+
+    def approval_callback_binding(self, clarify_id: str, session_key: str) -> bool:
+        prompt = self._approval_clarify_state.get(clarify_id)
+        return bool(
+            prompt is not None
+            and prompt.session_key == session_key
+            and prompt.chat_id is not None
+            and prompt.message_id is not None
+        )
+
+    def approval_destination_identity(self, clarify_id: Optional[str] = None) -> Optional[str]:
+        bot_id = getattr(getattr(self, "_bot", None), "id", None)
+        return f"telegram-bot:{bot_id}" if bot_id is not None else None
+
+    def recover_approval_callback(
+        self, clarify_id: str, session_key: str, chat_id: str, message_id: str,
+        thread_id: Optional[str],
+    ) -> None:
+        self._clarify_state[clarify_id] = session_key
+        self._approval_clarify_state[clarify_id] = ClarifyPrompt(
+            session_key, chat_id, message_id, thread_id)
+
+    def recover_approval_retirement(
+        self, clarify_id: str, session_key: str, chat_id: str, message_id: str,
+        thread_id: Optional[str],
+    ) -> None:
+        """Restore edit coordinates for a stale card without restoring its callback authority."""
+        self._approval_clarify_state[clarify_id] = ClarifyPrompt(
+            session_key, chat_id, message_id, thread_id)
+        self._clarify_state.pop(clarify_id, None)
+
+    async def retire_clarify_card(self, clarify_id: str, notice: str) -> None:
+        """Make a durable approval card non-actionable, verifying the Telegram edit.
+
+        Callback admission is removed before I/O.  The message coordinates remain durable in memory
+        until Telegram confirms keyboard removal, so the broker can retry a transport failure.
+        """
+        self._clarify_state.pop(clarify_id, None)
+        prompt = self._approval_clarify_state.get(clarify_id)
+        if prompt is None or prompt.chat_id is None or prompt.message_id is None:
+            return
+        app = self._app
+        if app is None or app.bot is None:
+            raise RuntimeError("Telegram application unavailable while retiring approval card")
+        await app.bot.edit_message_text(
+            chat_id=prompt.chat_id, message_id=int(prompt.message_id),
+            text=f"<i>{_html.escape(notice)}</i>",
+            parse_mode=ParseMode.HTML, reply_markup=None)
+        self._approval_clarify_state.pop(clarify_id, None)
 
     @staticmethod
     def _provider_get_label():
@@ -4838,6 +4896,15 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         except Exception as exc:
             logger.error("[%s] slash-confirm callback failed: %s", self.name, exc, exc_info=True)
 
+    async def _retire_recorded_github_approval(self, broker, clarify_id: str, notice: str) -> None:
+        """Retire the native card, retaining durable retry intent when Telegram fails."""
+        try:
+            await self.retire_clarify_card(clarify_id, notice)
+        except Exception:
+            logger.exception("[telegram] Could not retire durable GitHub approval card")
+        else:
+            broker.mark_card_retired(clarify_id)
+
     async def _handle_clarify_callback(self, query, data: str, cb: dict[str, Any]) -> None:
         """``cl:<clarify_id>:<idx|other>`` — resolve a clarify prompt or flip to text capture."""
         parts = data.split(":", 2)
@@ -4845,6 +4912,51 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             return
         clarify_id = parts[1]
         choice_token = parts[2]
+        # Durable approval cards survive process-local clarify state. Resolve them before the
+        # ordinary callback path, while retaining current behavior for every non-broker clarify.
+        if choice_token != "other":
+            destination_id = None
+            try:
+                choice_index = int(choice_token)
+                from gateway.github_approval_broker import default_broker
+                broker = default_broker(instance_id="telegram-callback", create=False)
+                destination_id = self.approval_destination_identity(clarify_id)
+                durable_choice = (
+                    broker.callback_choice(clarify_id, choice_index, destination_id)
+                    if broker is not None and destination_id is not None else None)
+            except (TypeError, ValueError):
+                broker, durable_choice = None, None
+            except Exception:
+                logger.exception("[%s] Durable GitHub approval callback lookup failed", self.name)
+                broker, durable_choice = None, None
+            if (broker is not None and destination_id is not None and durable_choice is None
+                    and broker.has_callback(clarify_id, destination_id)):
+                await self._notify_clarify_expired(
+                    query, str(getattr(query.from_user, "id", "") or "unknown"))
+                return
+            if durable_choice is not None:
+                if not await self._callback_authorized(query, cb, _unauthorized()):
+                    return
+                approver_id = str(getattr(query.from_user, "id", "") or "unknown")
+                message = getattr(query, "message", None)
+                decision = broker.resolve_callback(
+                    clarify_id, choice_index, approver=f"telegram:{approver_id}",
+                    user_id=approver_id, chat_id=str(cb.get("chat_id", "")),
+                    thread_id=str(cb["thread_id"]) if cb.get("thread_id") is not None else None,
+                    message_id=str(getattr(message, "message_id", "") or ""),
+                    destination_id=destination_id)
+                if decision is None:
+                    await self._notify_clarify_expired(query, approver_id)
+                    return
+                # Wake a still-live foreground waiter; durable execution is deliberately separate.
+                with contextlib.suppress(Exception):
+                    from tools.clarify_gateway import resolve_gateway_clarify
+                    resolve_gateway_clarify(clarify_id, durable_choice)
+                user_display = getattr(query.from_user, "first_name", None) or t("platform.telegram.user_fallback")
+                await query.answer(text=f"✓ {durable_choice[:60]}")
+                await self._retire_recorded_github_approval(
+                    broker, clarify_id, f"{user_display}: {durable_choice}")
+                return
         session_key = await self._claim_callback_state(
             query, cb, self._clarify_state, clarify_id, _unauthorized(),
             _toast("platform.telegram.slash_confirm.already_resolved"), pop=False)
