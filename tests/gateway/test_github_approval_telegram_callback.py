@@ -21,7 +21,7 @@ class SendingTelegram:
 
 
 @pytest.mark.asyncio
-async def test_restart_callback_projects_decision_for_exactly_one_resumer(tmp_path, monkeypatch):
+async def test_restart_callback_persists_decision_and_failed_retirement_for_retry(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     proposal = ApprovalProposal("owner/repo#498", "a" * 40, "b" * 64)
     broker = default_broker(instance_id="publisher")
@@ -36,6 +36,7 @@ async def test_restart_callback_projects_decision_for_exactly_one_resumer(tmp_pa
     adapter._bot = SimpleNamespace(id=501)
     adapter._callback_authorized = AsyncMock(return_value=True)
     adapter._edit_html_quiet = AsyncMock()
+    adapter.retire_clarify_card = AsyncMock(side_effect=TimeoutError("telegram edit failed"))
     query = SimpleNamespace(
         from_user=SimpleNamespace(id=7, first_name="Rogerio"),
         message=SimpleNamespace(text="Approve?", message_id=501),
@@ -46,9 +47,10 @@ async def test_restart_callback_projects_decision_for_exactly_one_resumer(tmp_pa
     await adapter._handle_clarify_callback(
         query, f"cl:{sent.clarify_id}:0", callback_context)
 
-    resumed = default_broker(instance_id="restart").claim_resumptions(owner="worker")
-    assert len(resumed) == 1
-    assert resumed[0]["response"] == "Approve"
-    assert resumed[0]["approver"] == "telegram:7"
-    assert default_broker(instance_id="other").claim_resumptions(owner="other") == []
+    observed = default_broker(instance_id="restart").observe(proposal)
+    assert observed is not None
+    assert observed["response"] == "Approve"
+    assert observed["approver"] == "telegram:7"
+    assert observed["retirement_pending"] == 1
+    adapter.retire_clarify_card.assert_awaited_once()
     query.answer.assert_awaited_once_with(text="✓ Approve")

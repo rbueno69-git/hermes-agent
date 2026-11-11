@@ -357,13 +357,6 @@ class WebhookAdapter(BasePlatformAdapter):
                 broker.recover_callbacks(target)
                 completed += await broker.retry_retirements(adapter=target, limit=16)
                 completed += len(await broker.retry_pending(adapter=target, limit=16))
-                runtime = getattr(self.gateway_runner, "github_approval_runtime", None)
-                github = getattr(runtime, "github", None)
-                executor = getattr(runtime, "executor", None)
-                if github is not None and executor is not None:
-                    completed += len(await broker.resume_approved(
-                        owner=f"webhook-worker:{profile or 'default'}:{os.getpid()}",
-                        github=github, executor=executor, adapter=target, limit=16))
         return completed
 
     async def _github_approval_worker_loop(self) -> None:
@@ -889,6 +882,7 @@ class WebhookAdapter(BasePlatformAdapter):
         return await self._dispatch_agent_run(request, route_config, route_name, profile, payload, prompt, event_type,
                                         delivery_id, now)
 
+    # health: allow CC -- strict multi-schema authority validation stays fail-closed in one boundary
     async def _handle_github_approval_contract(
         self, route_config: dict, payload: Any, event_type: str, route_name: str,
         profile: Optional[str], delivery_id: str,
