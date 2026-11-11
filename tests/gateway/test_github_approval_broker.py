@@ -58,7 +58,7 @@ def _process_claim_then_crash(path, entered):
 
         async def crash_gap(_key, _adapter):
             entered.set()
-            await asyncio.sleep(60)
+            await asyncio.Event().wait()
 
         broker._deliver_claim = crash_gap
         await broker.retry_pending(adapter=TelegramStub())
@@ -322,7 +322,7 @@ def test_restart_recovery_does_not_bind_card_to_another_telegram_bot(tmp_path):
     assert other_bot._clarify_state == {}
 
 
-def test_callback_persists_decision_and_resumption_is_claimed_once(tmp_path):
+def test_callback_persists_exact_decision_without_exposing_execution_claim(tmp_path):
     path = tmp_path / "approvals.db"
     adapter = TelegramStub()
     broker = GitHubApprovalBroker(path, instance_id="gateway-a")
@@ -334,15 +334,13 @@ def test_callback_persists_decision_and_resumption_is_claimed_once(tmp_path):
                                        destination_id="telegram-bot:101")
     assert decision is not None and decision.response == "Approve"
     restarted = GitHubApprovalBroker(path, instance_id="gateway-b")
-    first_claim = restarted.claim_resumptions(owner="worker-1")
-    second_claim = restarted.claim_resumptions(owner="worker-2")
 
-    assert len(first_claim) == 1
-    assert second_claim == []
-    assert restarted.claim_resumptions(owner="worker-3") == []
+    assert not hasattr(restarted, "claim_resumptions")
+    assert not hasattr(restarted, "resume_approved")
     with sqlite3.connect(path) as db:
-        row = db.execute("SELECT state, approver FROM github_approval_decisions").fetchone()
-    assert row == ("claimed", "telegram:7")
+        row = db.execute(
+            "SELECT state, response, approver FROM github_approval_decisions").fetchone()
+    assert row == ("pending", "Approve", "telegram:7")
 
 
 @pytest.mark.asyncio
@@ -461,7 +459,7 @@ def test_crash_after_reservation_before_send_is_reclaimed_after_bounded_lease(tm
     assert reserved["state"] == "pending_notification"
     assert reserved["owner_instance_id"] == "crashing"
 
-    time.sleep(1.1)
+    time.sleep(1.1)  # health: allow HX013 -- this test exercises real wall-clock lease expiry
     adapter = TelegramStub()
     outcomes = asyncio.run(
         GitHubApprovalBroker(path, instance_id="recovery", delivery_lease_seconds=1)

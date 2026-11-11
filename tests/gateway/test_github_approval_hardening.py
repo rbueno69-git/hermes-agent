@@ -123,199 +123,13 @@ def test_replayed_opposite_choice_returns_original_durable_decision(tmp_path):
     assert broker.callback_choice(sent.clarify_id, 1, "telegram-bot:501") == "Approve"
 
 
-class LiveReader:
-    def __init__(self, *, head="a" * 40, digest="b" * 64):
-        self.head = head
-        self.digest = digest
-
-    async def read_contract(self, item_key):
-        return ApprovalProposal(item_key, self.head, self.digest)
-
-
-class ReceiptExecutor:
+class ForbiddenExecutor:
     def __init__(self):
-        self.receipts = {}
         self.calls = []
 
-    async def read_receipt(self, key):
-        return self.receipts.get(key)
-
-    async def execute_idempotent(self, claim, *, idempotency_key, execution_fence):
-        execution_fence.check()
-        self.calls.append((claim, idempotency_key))
-        receipt = {"id": idempotency_key}
-        self.receipts[idempotency_key] = receipt
-        return receipt
-
-
-async def _approved_broker(tmp_path):
-    broker = GitHubApprovalBroker(tmp_path / "approval.db", instance_id="one")
-    sent = await broker.request(
-        proposal(), adapter=BoundTelegram(), chat_id="42", question="Approve?",
-        session_key="webhook:1", authorized_user_id="7")
-    broker.resolve_callback(
-        sent.clarify_id, 0, approver="telegram:7", user_id="7", chat_id="42",
-        thread_id=None, message_id="501", destination_id="telegram-bot:501")
-    return broker
-
-
-@pytest.mark.asyncio
-async def test_do_not_approve_never_invokes_executor(tmp_path):
-    broker = GitHubApprovalBroker(tmp_path / "approval.db", instance_id="one")
-    sent = await broker.request(
-        proposal(), adapter=BoundTelegram(), chat_id="42", question="Approve?",
-        session_key="webhook:1", authorized_user_id="7")
-    broker.resolve_callback(
-        sent.clarify_id, 1, approver="telegram:7", user_id="7", chat_id="42",
-        thread_id=None, message_id="501", destination_id="telegram-bot:501")
-    executor = ReceiptExecutor()
-
-    assert await broker.resume_approved(owner="worker", github=LiveReader(), executor=executor) == ["declined"]
-    assert executor.calls == []
-
-
-@pytest.mark.asyncio
-async def test_resumer_revalidates_live_head_and_contract_and_retires_stale(tmp_path):
-    broker = await _approved_broker(tmp_path)
-    adapter = BoundTelegram()
-    executor = ReceiptExecutor()
-
-    outcomes = await broker.resume_approved(
-        owner="worker", github=LiveReader(head="c" * 40), executor=executor, adapter=adapter)
-
-    assert outcomes == ["stale"]
-    assert executor.calls == []
-    assert broker.observe(proposal())["state"] == "superseded"
-
-
-@pytest.mark.asyncio
-async def test_generic_executor_is_rejected_before_side_effect(tmp_path):
-    broker = await _approved_broker(tmp_path)
-    generic = AsyncMock()
-
-    outcomes = await broker.resume_approved(owner="worker", github=LiveReader(), executor=generic)
-
-    assert outcomes == ["blocked_executor"]
-    generic.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_receipt_contract_makes_continuation_replay_safe(tmp_path):
-    broker = await _approved_broker(tmp_path)
-    executor = ReceiptExecutor()
-
-    assert await broker.resume_approved(owner="worker", github=LiveReader(), executor=executor) == ["executed"]
-    assert await broker.resume_approved(owner="worker-2", github=LiveReader(), executor=executor) == []
-    assert len(executor.calls) == 1
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("terminal", ["superseded", "closed"])
-async def test_noncurrent_or_closed_approved_proposal_cannot_be_claimed_or_executed(tmp_path, terminal):
-    broker = await _approved_broker(tmp_path)
-    adapter = BoundTelegram()
-    if terminal == "superseded":
-        await broker.request(
-            proposal(head="c" * 40), adapter=adapter, chat_id="42", question="Approve?",
-            session_key="webhook:2", authorized_user_id="7")
-    else:
-        await broker.retire_item(proposal().item_key, status="closed", adapter=adapter)
-    executor = ReceiptExecutor()
-
-    assert broker.claim_resumptions(owner="worker") == []
-    assert await broker.resume_approved(
-        owner="worker", github=LiveReader(), executor=executor) == []
-    assert executor.calls == []
-
-
-@pytest.mark.asyncio
-async def test_supersession_while_resumer_revalidates_prevents_executor(tmp_path):
-    broker = await _approved_broker(tmp_path)
-    entered = asyncio.Event()
-    release = asyncio.Event()
-
-    class BarrierReader(LiveReader):
-        async def read_contract(self, item_key):
-            entered.set()
-            await release.wait()
-            return await super().read_contract(item_key)
-
-    executor = ReceiptExecutor()
-    resuming = asyncio.create_task(broker.resume_approved(
-        owner="worker", github=BarrierReader(), executor=executor))
-    await entered.wait()
-    await broker.request(
-        proposal(head="c" * 40), adapter=BoundTelegram(), chat_id="42", question="Approve?",
-        session_key="webhook:2", authorized_user_id="7")
-    release.set()
-
-    assert await resuming == ["stale"]
-    assert executor.calls == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("terminal", ["superseded", "closed"])
-async def test_terminal_change_during_receipt_read_prevents_executor_effect(tmp_path, terminal):
-    broker = await _approved_broker(tmp_path)
-    entered = asyncio.Event()
-    release = asyncio.Event()
-
-    class BarrierReceiptExecutor(ReceiptExecutor):
-        async def read_receipt(self, key):
-            entered.set()
-            await release.wait()
-            return await super().read_receipt(key)
-
-    executor = BarrierReceiptExecutor()
-    resuming = asyncio.create_task(broker.resume_approved(
-        owner="worker", github=LiveReader(), executor=executor))
-    await entered.wait()
-    adapter = BoundTelegram()
-    if terminal == "superseded":
-        await broker.request(
-            proposal(head="c" * 40), adapter=adapter, chat_id="42", question="Approve?",
-            session_key="webhook:2", authorized_user_id="7")
-    else:
-        await broker.retire_item(proposal().item_key, status="closed", adapter=adapter)
-    release.set()
-
-    assert await resuming == ["stale"]
-    assert executor.calls == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("terminal", ["superseded", "closed"])
-async def test_terminal_change_between_receipt_read_and_effect_fails_execution_fence(tmp_path, terminal):
-    broker = await _approved_broker(tmp_path)
-    entered = asyncio.Event()
-    release = asyncio.Event()
-
-    class BarrierEffectExecutor(ReceiptExecutor):
-        async def execute_idempotent(self, claim, *, idempotency_key, execution_fence=None):
-            entered.set()
-            await release.wait()
-            assert execution_fence is not None
-            execution_fence.check()
-            self.calls.append((claim, idempotency_key))
-            receipt = {"id": idempotency_key}
-            self.receipts[idempotency_key] = receipt
-            return receipt
-
-    executor = BarrierEffectExecutor()
-    resuming = asyncio.create_task(broker.resume_approved(
-        owner="worker", github=LiveReader(), executor=executor))
-    await entered.wait()
-    adapter = BoundTelegram()
-    if terminal == "superseded":
-        await broker.request(
-            proposal(head="c" * 40), adapter=adapter, chat_id="42", question="Approve?",
-            session_key="webhook:2", authorized_user_id="7")
-    else:
-        await broker.retire_item(proposal().item_key, status="closed", adapter=adapter)
-    release.set()
-
-    assert await resuming == ["stale"]
-    assert executor.calls == []
+    async def execute_idempotent(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        raise AssertionError("approval broker invoked a product executor")
 
 
 @pytest.mark.asyncio
@@ -668,15 +482,17 @@ def test_dynamic_github_approval_requires_exact_explicit_schema_metadata(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_startup_worker_recovers_callbacks_sends_outbox_and_resumes_once(tmp_path, monkeypatch):
-    broker = GitHubApprovalBroker(tmp_path / "approval.db", instance_id="startup")
+@pytest.mark.parametrize("terminal", [None, "superseded", "closed"])
+async def test_approval_lifecycle_and_restart_never_invoke_product_executor(
+        tmp_path, monkeypatch, terminal):
+    path = tmp_path / "approval.db"
+    broker = GitHubApprovalBroker(path, instance_id="startup")
     target = BoundTelegram()
     broker.admit(
         proposal(), adapter=target, chat_id="42", question="Approve?",
         session_key="webhook:1", authorized_user_id="7")
     runner = MagicMock()
     runner._authorization_adapter.return_value = target
-    runner.github_approval_runtime = None
     adapter = WebhookAdapter(PlatformConfig(enabled=True, extra={}))
     adapter.gateway_runner = runner
     adapter._routes = {"approval": {
@@ -692,18 +508,30 @@ async def test_startup_worker_recovers_callbacks_sends_outbox_and_resumes_once(t
     )
     assert len(target.sent) == 1
     active = broker.observe(proposal())
+    assert active is not None
     assert active["state"] == "active"
 
-    fresh_target = BoundTelegram()
-    runner._authorization_adapter.return_value = fresh_target
-    executor = ReceiptExecutor()
-    runner.github_approval_runtime = SimpleNamespace(github=LiveReader(), executor=executor)
+    executor = ForbiddenExecutor()
+    runner.github_approval_runtime = SimpleNamespace(executor=executor)
     broker.resolve_callback(
         active["clarify_id"], 0, approver="telegram:7", user_id="7", chat_id="42",
         thread_id=None, message_id="501", destination_id="telegram-bot:501")
+    if terminal == "superseded":
+        await broker.request(
+            proposal(head="c" * 40), adapter=target, chat_id="42", question="Approve?",
+            session_key="webhook:2", authorized_user_id="7")
+    elif terminal == "closed":
+        await broker.retire_item(proposal().item_key, status="closed", adapter=target)
 
+    restarted = GitHubApprovalBroker(path, instance_id="restart")
+    monkeypatch.setattr("gateway.github_approval_broker.default_broker", lambda **_kwargs: restarted)
+    runner._authorization_adapter.return_value = BoundTelegram()
     await asyncio.gather(
         adapter._github_approval_worker_once(),
         adapter._github_approval_worker_once(),
     )
-    assert len(executor.calls) == 1
+
+    assert executor.calls == []
+    recorded = restarted.observe(proposal())
+    assert recorded is not None
+    assert recorded["response"] == "Approve"

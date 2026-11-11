@@ -7,7 +7,6 @@ import inspect
 import json
 import logging
 import re
-import secrets
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -64,34 +63,6 @@ class ApprovalDecision:
     proposal_key: str
     response: str
     approver: str
-
-
-class StaleExecutionFence(RuntimeError):
-    """The durable approval ceased to be current before the effect boundary."""
-
-
-class ExecutionFence:
-    """One-shot authority token checked immediately before an executor effect."""
-
-    def __init__(self, broker: GitHubApprovalBroker, claim: dict, execution_key: str):
-        self._broker = broker
-        self._decision_id = int(claim["decision_id"])
-        self._claim_token = str(claim["claim_token"])
-        self._execution_key = execution_key
-
-    def check(self) -> None:
-        with self._broker._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            changed = db.execute(
-                "UPDATE github_approval_decisions SET execution_fenced=1 "
-                "WHERE decision_id=? AND state='claimed' AND claim_token=? "
-                "AND execution_key=? AND execution_fenced=0 AND EXISTS ("
-                "SELECT 1 FROM github_approval_proposals p "
-                "WHERE p.proposal_key=github_approval_decisions.proposal_key AND p.state='answered')",
-                (self._decision_id, self._claim_token, self._execution_key),
-            ).rowcount
-        if changed != 1:
-            raise StaleExecutionFence("GitHub approval execution fence is stale or already consumed")
 
 
 async def _await(value):
@@ -155,15 +126,8 @@ class GitHubApprovalBroker:
                     proposal_key TEXT NOT NULL UNIQUE REFERENCES github_approval_proposals(proposal_key),
                     response TEXT NOT NULL,
                     approver TEXT NOT NULL,
-                    state TEXT NOT NULL CHECK(state IN ('pending','claimed','resumed','stale','blocked')),
-                    claim_token TEXT,
-                    claim_owner TEXT,
-                    claim_expires_at REAL,
-                    execution_key TEXT,
-                    execution_fenced INTEGER NOT NULL DEFAULT 0 CHECK(execution_fenced IN (0,1)),
-                    execution_receipt TEXT,
-                    decided_at REAL NOT NULL,
-                    resumed_at REAL
+                    state TEXT NOT NULL CHECK(state IN ('pending','stale')),
+                    decided_at REAL NOT NULL
                 );
                 COMMIT;
             """)
@@ -172,18 +136,12 @@ class GitHubApprovalBroker:
                 db.execute("ALTER TABLE github_approval_proposals ADD COLUMN destination_id TEXT")
             if "retirement_pending" not in columns:
                 db.execute("ALTER TABLE github_approval_proposals ADD COLUMN retirement_pending INTEGER NOT NULL DEFAULT 0")
-            decision_columns = {str(row[1]) for row in db.execute("PRAGMA table_info(github_approval_decisions)")}
-            if "execution_fenced" not in decision_columns:
-                db.execute("ALTER TABLE github_approval_decisions ADD COLUMN execution_fenced INTEGER NOT NULL DEFAULT 0")
+
         try:
             self.path.chmod(0o600)
         except OSError:
             pass
 
-    @staticmethod
-    def _proposal_from_row(row: sqlite3.Row | dict) -> ApprovalProposal:
-        return ApprovalProposal(str(row["item_key"]), str(row["head_sha"]),
-                                str(row["contract_digest_sha256"]), str(row["executor"]))
 
     @staticmethod
     def _callback_is_bound(adapter: Any, clarify_id: str, session_key: str) -> bool:
@@ -244,8 +202,8 @@ class GitHubApprovalBroker:
                        "retirement_pending=CASE WHEN message_id IS NOT NULL THEN 1 ELSE 0 END,updated_at=? "
                        "WHERE item_key=? AND proposal_key!=? AND state IN "
                        "('pending_notification','dispatching','active','answered')", (now, proposal.item_key, key))
-            db.execute("UPDATE github_approval_decisions SET state='stale',claim_token=NULL,claim_owner=NULL,"
-                       "claim_expires_at=NULL WHERE state IN ('pending','claimed') AND proposal_key IN "
+            db.execute("UPDATE github_approval_decisions SET state='stale' "
+                       "WHERE state IN ('pending','claimed') AND proposal_key IN "
                        "(SELECT proposal_key FROM github_approval_proposals WHERE item_key=? "
                        "AND proposal_key!=? AND state='superseded')", (proposal.item_key, key))
             clarify_id = str(exact["clarify_id"]) if exact else f"gha-{key[:24]}"
@@ -431,9 +389,10 @@ class GitHubApprovalBroker:
             return 0
         with self._connect() as db:
             rows = db.execute(
-                "SELECT proposal_key,clarify_id,session_key,chat_id,message_id,thread_id "
+                "SELECT proposal_key,clarify_id,session_key,chat_id,message_id,thread_id,state,response "
                 "FROM github_approval_proposals "
-                "WHERE state='superseded' AND retirement_pending=1 AND message_id IS NOT NULL AND destination_id=? "
+                "WHERE state IN ('answered','superseded') AND retirement_pending=1 "
+                "AND message_id IS NOT NULL AND destination_id=? "
                 "ORDER BY updated_at LIMIT ?", (destination_id, max(1, int(limit)))).fetchall()
         retired = 0
         retire = getattr(adapter, "retire_clarify_card", None)
@@ -447,16 +406,28 @@ class GitHubApprovalBroker:
                     str(row["message_id"]),
                     str(row["thread_id"]) if row["thread_id"] is not None else None)
             try:
-                await _await(retire(str(row["clarify_id"]), "Superseded GitHub approval"))
+                notice = (f"GitHub approval recorded: {row['response']}"
+                          if row["state"] == "answered" else "Superseded GitHub approval")
+                await _await(retire(str(row["clarify_id"]), notice))
             except Exception:
                 logger.exception("Could not retry stale GitHub approval retirement")
                 continue
             with self._connect() as db:
                 retired += db.execute(
                     "UPDATE github_approval_proposals SET retirement_pending=0,updated_at=? "
-                    "WHERE proposal_key=? AND state='superseded' AND retirement_pending=1",
+                    "WHERE proposal_key=? AND state IN ('answered','superseded') AND retirement_pending=1",
                     (time.time(), str(row["proposal_key"]))).rowcount
         return retired
+
+    def mark_card_retired(self, clarify_id: str) -> bool:
+        """Durably acknowledge that Telegram removed an answered card's keyboard."""
+        with self._connect() as db:
+            changed = db.execute(
+                "UPDATE github_approval_proposals SET retirement_pending=0,updated_at=? "
+                "WHERE clarify_id=? AND state='answered' AND retirement_pending=1",
+                (time.time(), str(clarify_id)),
+            ).rowcount
+        return changed == 1
 
     def recover_callbacks(self, adapter: Any) -> list[dict[str, str]]:
         restore = getattr(adapter, "recover_approval_callback", None)
@@ -519,7 +490,8 @@ class GitHubApprovalBroker:
                     db.commit()
                     return None
                 db.execute("UPDATE github_approval_proposals SET state='answered',response=?,approver=?,"
-                           "callback_bound=0,updated_at=? WHERE clarify_id=? AND state='active'",
+                           "callback_bound=0,retirement_pending=CASE WHEN message_id IS NOT NULL THEN 1 ELSE 0 END,"
+                           "updated_at=? WHERE clarify_id=? AND state='active'",
                            (response, approver, now, str(clarify_id)))
                 db.execute("INSERT INTO github_approval_decisions(proposal_key,response,approver,state,decided_at) "
                            "VALUES(?,?,?,'pending',?) ON CONFLICT(proposal_key) DO NOTHING",
@@ -530,126 +502,6 @@ class GitHubApprovalBroker:
         return ApprovalDecision(int(decision["decision_id"]), str(decision["proposal_key"]),
                                 str(decision["response"]), str(decision["approver"])) if decision else None
 
-    def claim_resumptions(self, *, owner: str, lease_seconds: float = 30.0, limit: int = 16) -> list[dict]:
-        now, items = time.time(), []
-        with self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            rows = db.execute("SELECT d.decision_id FROM github_approval_decisions d JOIN "
-                              "github_approval_proposals p USING(proposal_key) WHERE p.state='answered' AND "
-                              "(d.state='pending' OR (d.state='claimed' AND d.execution_fenced=0 "
-                              "AND d.claim_expires_at<=?)) "
-                              "ORDER BY d.decision_id LIMIT ?",
-                              (now, max(1, int(limit)))).fetchall()
-            for row in rows:
-                token = secrets.token_hex(16)
-                if db.execute("UPDATE github_approval_decisions SET state='claimed',claim_token=?,claim_owner=?,"
-                              "claim_expires_at=?,execution_fenced=0 WHERE decision_id=? AND (state='pending' OR "
-                              "(state='claimed' AND execution_fenced=0 AND claim_expires_at<=?))",
-                              (token, owner, now + max(1.0, float(lease_seconds)), int(row["decision_id"]), now)).rowcount == 1:
-                    claimed = db.execute("SELECT d.*,p.session_key,p.item_key,p.head_sha,p.contract_digest_sha256,"
-                                         "p.executor,p.clarify_id FROM github_approval_decisions d JOIN "
-                                         "github_approval_proposals p USING(proposal_key) WHERE d.decision_id=?",
-                                         (int(row["decision_id"]),)).fetchone()
-                    item = dict(claimed)
-                    item["claim_token"] = token
-                    items.append(item)
-            db.commit()
-        return items
-
-    def _finish_claim(self, claim: dict, state: str, receipt: Any = None) -> bool:
-        receipt_json = json.dumps(receipt, sort_keys=True, separators=(",", ":")) if receipt is not None else None
-        with self._connect() as db:
-            changed = db.execute("UPDATE github_approval_decisions SET state=?,execution_receipt=?,resumed_at=?,"
-                                 "claim_expires_at=NULL WHERE decision_id=? AND state='claimed' AND claim_token=?",
-                                 (state, receipt_json, time.time() if state == "resumed" else None,
-                                  int(claim["decision_id"]), str(claim["claim_token"]))).rowcount
-        return changed == 1
-
-    def _claim_is_current(self, claim: dict) -> bool:
-        with self._connect() as db:
-            return db.execute(
-                "SELECT 1 FROM github_approval_decisions d JOIN github_approval_proposals p "
-                "USING(proposal_key) WHERE d.decision_id=? AND d.state='claimed' "
-                "AND d.claim_token=? AND p.state='answered'",
-                (int(claim["decision_id"]), str(claim["claim_token"])),
-            ).fetchone() is not None
-
-    async def resume_approved(self, *, owner: str, github: Any, executor: Any, adapter: Any = None,
-                              limit: int = 16) -> list[str]:
-        """Revalidate and continue only through a receipt-readable idempotent executor."""
-        outcomes = []
-        for claim in self.claim_resumptions(owner=owner, limit=limit):
-            if claim["response"] != "Approve":
-                self._finish_claim(claim, "resumed", {"decision": "declined"})
-                outcomes.append("declined")
-                continue
-            reader_contract = inspect.getattr_static(github, "read_contract", None)
-            reader_receipt = inspect.getattr_static(executor, "read_receipt", None)
-            executor_method = inspect.getattr_static(executor, "execute_idempotent", None)
-            read_contract = getattr(github, "read_contract", None) if callable(reader_contract) else None
-            read_receipt = getattr(executor, "read_receipt", None) if callable(reader_receipt) else None
-            execute = getattr(executor, "execute_idempotent", None) if callable(executor_method) else None
-            try:
-                executor_parameters = inspect.signature(execute).parameters if callable(execute) else {}
-            except (TypeError, ValueError):
-                executor_parameters = {}
-            if (not all(callable(value) for value in (read_contract, read_receipt, execute))
-                    or "execution_fence" not in executor_parameters):
-                self._finish_claim(claim, "blocked")
-                outcomes.append("blocked_executor")
-                continue
-            assert callable(read_contract) and callable(read_receipt) and callable(execute)
-            try:
-                live = await _await(read_contract(str(claim["item_key"])))
-                if not isinstance(live, ApprovalProposal):
-                    raise ValueError("GitHub reader returned a non-canonical contract")
-                live.validate()
-            except Exception:
-                logger.exception("Could not re-read live GitHub approval contract")
-                self._finish_claim(claim, "stale")
-                outcomes.append("stale")
-                continue
-            expected = self._proposal_from_row(claim)
-            if live != expected:
-                with self._connect() as db:
-                    db.execute("UPDATE github_approval_proposals SET state='superseded',callback_bound=0,updated_at=? "
-                               "WHERE proposal_key=?", (time.time(), str(claim["proposal_key"])))
-                if adapter is not None and callable(retire := getattr(adapter, "retire_clarify_card", None)):
-                    try:
-                        await retire(str(claim["clarify_id"]), "Stale GitHub head or contract")
-                    except Exception:
-                        logger.exception("Could not retire stale GitHub approval card")
-                self._finish_claim(claim, "stale")
-                outcomes.append("stale")
-                continue
-            if not self._claim_is_current(claim):
-                outcomes.append("stale")
-                continue
-            execution_key = f"gha-exec-{claim['proposal_key']}"
-            with self._connect() as db:
-                db.execute("UPDATE github_approval_decisions SET execution_key=? WHERE decision_id=? AND claim_token=?",
-                           (execution_key, int(claim["decision_id"]), str(claim["claim_token"])))
-            receipt = await _await(read_receipt(execution_key))
-            if not self._claim_is_current(claim):
-                outcomes.append("stale")
-                continue
-            if receipt is None:
-                fence = ExecutionFence(self, claim, execution_key)
-                try:
-                    receipt = await _await(execute(
-                        dict(claim), idempotency_key=execution_key, execution_fence=fence))
-                except StaleExecutionFence:
-                    outcomes.append("stale")
-                    continue
-            if (not isinstance(receipt, dict) or set(receipt) != {"id"}
-                    or receipt.get("id") != execution_key):
-                outcomes.append("operator_reconciliation")
-                continue
-            if not self._finish_claim(claim, "resumed", receipt):
-                outcomes.append("operator_reconciliation")
-                continue
-            outcomes.append("executed")
-        return outcomes
 
     def record_origin_status(self, proposal: ApprovalProposal, status: str) -> bool:
         with self._connect() as db:
@@ -677,8 +529,8 @@ class GitHubApprovalBroker:
                 "AND state IN ('pending_notification','dispatching','delivery_unknown','active','answered')",
                 (status, now, item_key),
             ).rowcount
-            db.execute("UPDATE github_approval_decisions SET state='stale',claim_token=NULL,claim_owner=NULL,"
-                       "claim_expires_at=NULL WHERE state IN ('pending','claimed') AND proposal_key IN "
+            db.execute("UPDATE github_approval_decisions SET state='stale' "
+                       "WHERE state IN ('pending','claimed') AND proposal_key IN "
                        "(SELECT proposal_key FROM github_approval_proposals WHERE item_key=? AND state='superseded')",
                        (item_key,))
             db.execute("UPDATE github_approval_proposals SET retirement_pending="

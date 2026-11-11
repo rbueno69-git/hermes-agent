@@ -4896,6 +4896,15 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         except Exception as exc:
             logger.error("[%s] slash-confirm callback failed: %s", self.name, exc, exc_info=True)
 
+    async def _retire_recorded_github_approval(self, broker, clarify_id: str, notice: str) -> None:
+        """Retire the native card, retaining durable retry intent when Telegram fails."""
+        try:
+            await self.retire_clarify_card(clarify_id, notice)
+        except Exception:
+            logger.exception("[telegram] Could not retire durable GitHub approval card")
+        else:
+            broker.mark_card_retired(clarify_id)
+
     async def _handle_clarify_callback(self, query, data: str, cb: dict[str, Any]) -> None:
         """``cl:<clarify_id>:<idx|other>`` — resolve a clarify prompt or flip to text capture."""
         parts = data.split(":", 2)
@@ -4939,17 +4948,14 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 if decision is None:
                     await self._notify_clarify_expired(query, approver_id)
                     return
-                self._clarify_state.pop(clarify_id, None)
-                self._approval_clarify_state.pop(clarify_id, None)
-                # Wake a still-live originating turn; after restart the durable claimant owns continuation.
+                # Wake a still-live foreground waiter; durable execution is deliberately separate.
                 with contextlib.suppress(Exception):
                     from tools.clarify_gateway import resolve_gateway_clarify
                     resolve_gateway_clarify(clarify_id, durable_choice)
                 user_display = getattr(query.from_user, "first_name", None) or t("platform.telegram.user_fallback")
                 await query.answer(text=f"✓ {durable_choice[:60]}")
-                await self._edit_html_quiet(
-                    query, f"❓ {_html.escape(query.message.text or '')}\n\n"
-                    f"<b>{_html.escape(user_display)}:</b> {_html.escape(durable_choice)}")
+                await self._retire_recorded_github_approval(
+                    broker, clarify_id, f"{user_display}: {durable_choice}")
                 return
         session_key = await self._claim_callback_state(
             query, cb, self._clarify_state, clarify_id, _unauthorized(),
