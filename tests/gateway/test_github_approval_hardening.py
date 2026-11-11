@@ -377,6 +377,54 @@ async def test_dynamic_subscription_v2_endpoint_durably_acks_without_waiting_for
 
 
 @pytest.mark.asyncio
+async def test_v2_approval_card_binds_bounded_contract_details(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "gateway.platforms.webhook.web",
+        SimpleNamespace(json_response=lambda body, status=200: SimpleNamespace(status=status, body=body)))
+    target = BoundTelegram()
+    runner = MagicMock()
+    runner._authorization_adapter.return_value = target
+    adapter = object.__new__(WebhookAdapter)
+    adapter.gateway_runner = runner
+    broker = GitHubApprovalBroker(tmp_path / "approval.db", instance_id="producer")
+    monkeypatch.setattr("gateway.github_approval_broker.default_broker", lambda **_kwargs: broker)
+    payload = {
+        "schema": "hermes.github-intake.v2",
+        "item_key": "owner/repo#7",
+        "head_sha": "a" * 40,
+        "contract_accepted": True,
+        "digest": "b" * 64,
+        "scope": ["tests", "deploy", "x" * 5000],
+        "limits": {"files": 3, "note": "y" * 5000},
+        "risk": "high\x00" + "z" * 5000,
+        "binding_status": "pending",
+    }
+
+    response = await adapter._handle_github_approval_contract(
+        {
+            "deliver": "telegram",
+            "deliver_extra": {"chat_id": "42"},
+            "github_approval": {
+                "schema": "hermes.github-intake.v2", "authorized_user_id": "7"},
+        },
+        payload, "issues", "route", None, "delivery-v2")
+
+    assert response.status == 202
+    recorded = broker.observe(proposal())
+    question = recorded["question"]
+    assert question.startswith(
+        "Approve GitHub execution?\n"
+        "Item: owner/repo#7\n"
+        f"Head: {'a' * 40}\n"
+        f"Digest: {'b' * 64}\n"
+        "Risk: high ")
+    assert "\nScope: [\"tests\",\"deploy\",\"" in question
+    assert "\nLimits: {\"files\":3,\"note\":\"" in question
+    assert "\x00" not in question
+    assert len(question) <= 2600
+
+
+@pytest.mark.asyncio
 async def test_dynamic_v2_endpoint_retires_transformed_terminal_item(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / "webhook_subscriptions.json").write_text(json.dumps({

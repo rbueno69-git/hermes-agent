@@ -75,6 +75,25 @@ _GH_TOKEN_VARS = ("GH_TOKEN", "GITHUB_TOKEN")
 _GITHUB_APPROVAL_SCHEMA = "hermes.github-intake.v2"
 
 
+def _github_approval_question(payload: dict, proposal: Any) -> str:
+    """Render the immutable contract identity and bounded operator context."""
+    def bounded(value: Any, limit: int, *, structured: bool = False) -> str:
+        text = (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                if structured else str(value))
+        text = "".join(" " if ord(char) < 32 or ord(char) == 127 else char for char in text)
+        return text[:limit]
+
+    return (
+        "Approve GitHub execution?\n"
+        f"Item: {proposal.item_key}\n"
+        f"Head: {proposal.head_sha}\n"
+        f"Digest: {proposal.contract_digest_sha256}\n"
+        f"Risk: {bounded(payload['risk'], 256)}\n"
+        f"Scope: {bounded(payload['scope'], 1024, structured=True)}\n"
+        f"Limits: {bounded(payload['limits'], 1024, structured=True)}"
+    )
+
+
 def _header_delivery_id(headers) -> str:
     """The provider's delivery id (GitHub, Svix, Standard Webhooks, generic), else a fresh one."""
     return headers.get("X-GitHub-Delivery", headers.get("svix-id", headers.get(
@@ -935,7 +954,7 @@ class WebhookAdapter(BasePlatformAdapter):
                         return _json_error("Telegram approval chat is not configured", 503)
                     outcome = broker.admit(
                         proposal, adapter=target, chat_id=str(target_chat_id),
-                        question=f"Approve {proposal.item_key} at {proposal.head_sha[:12]}?",
+                        question=_github_approval_question(payload, proposal),
                         session_key=f"github-approval:{profile or 'default'}:{route_name}:{delivery_id}",
                         authorized_user_id=authorized_user_id,
                         thread_id=extra.get("message_thread_id") or extra.get("thread_id"))
