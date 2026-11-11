@@ -12,8 +12,12 @@ imports so every reader (runtime helpers, turn prep, the conversation loop) can 
 # ``run_conversation``), so the model reads it as something IT said. A short natural-language phrase
 # in that position gets echoed verbatim — a clean ``finish_reason=stop`` turn answering an ordinary
 # instruction with just the placeholder (#132949, and #81841 for the same hazard on the scaffold).
-# Keep it a structural label the model has no conversational reason to reproduce, never prose.
-_INTERRUPTED_PLACEHOLDER = "[interrupt: no assistant output for this turn]"
+# Keep it a structural token the model has no conversational reason to reproduce, never prose.
+_INTERRUPTED_PLACEHOLDER = "<hermes:interrupted-assistant-turn/>"
+
+# The natural-language spelling shipped by #132949. A real Telegram turn proved that the model can
+# still reproduce it verbatim after an alternation repair, so replay preparation must retire it too.
+_ECHOED_INTERRUPTED_PLACEHOLDER = "[interrupt: no assistant output for this turn]"
 
 # The spelling shipped before #132949. Models reproduce it verbatim, so rows already carrying it
 # stay poisoned after the wording change; the replay filters reference this name to retire them.
