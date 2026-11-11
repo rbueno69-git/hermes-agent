@@ -4336,17 +4336,33 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         self._approval_clarify_state[clarify_id] = ClarifyPrompt(
             session_key, chat_id, message_id, thread_id)
 
-    async def retire_clarify_card(self, clarify_id: str, notice: str) -> None:
-        """Make a durable approval card non-actionable and remove both callback bindings."""
+    def recover_approval_retirement(
+        self, clarify_id: str, session_key: str, chat_id: str, message_id: str,
+        thread_id: Optional[str],
+    ) -> None:
+        """Restore edit coordinates for a stale card without restoring its callback authority."""
+        self._approval_clarify_state[clarify_id] = ClarifyPrompt(
+            session_key, chat_id, message_id, thread_id)
         self._clarify_state.pop(clarify_id, None)
-        prompt = self._approval_clarify_state.pop(clarify_id, None)
+
+    async def retire_clarify_card(self, clarify_id: str, notice: str) -> None:
+        """Make a durable approval card non-actionable, verifying the Telegram edit.
+
+        Callback admission is removed before I/O.  The message coordinates remain durable in memory
+        until Telegram confirms keyboard removal, so the broker can retry a transport failure.
+        """
+        self._clarify_state.pop(clarify_id, None)
+        prompt = self._approval_clarify_state.get(clarify_id)
         if prompt is None or prompt.chat_id is None or prompt.message_id is None:
             return
-        with contextlib.suppress(Exception):
-            await self._application.bot.edit_message_text(
-                chat_id=prompt.chat_id, message_id=int(prompt.message_id),
-                text=f"<i>{_html.escape(notice)}</i>",
-                parse_mode=ParseMode.HTML, reply_markup=None)
+        app = self._app
+        if app is None or app.bot is None:
+            raise RuntimeError("Telegram application unavailable while retiring approval card")
+        await app.bot.edit_message_text(
+            chat_id=prompt.chat_id, message_id=int(prompt.message_id),
+            text=f"<i>{_html.escape(notice)}</i>",
+            parse_mode=ParseMode.HTML, reply_markup=None)
+        self._approval_clarify_state.pop(clarify_id, None)
 
     @staticmethod
     def _provider_get_label():

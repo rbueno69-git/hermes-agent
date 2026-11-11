@@ -1,9 +1,14 @@
 import asyncio
+import json
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
 
+from gateway.config import Platform, PlatformConfig
 from gateway.github_approval_broker import ApprovalProposal, GitHubApprovalBroker
 from gateway.platforms.base import SendResult
 from gateway.platforms.webhook import WebhookAdapter
@@ -203,18 +208,106 @@ async def test_receipt_contract_makes_continuation_replay_safe(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["superseded", "closed"])
+async def test_noncurrent_or_closed_approved_proposal_cannot_be_claimed_or_executed(tmp_path, terminal):
+    broker = await _approved_broker(tmp_path)
+    adapter = BoundTelegram()
+    if terminal == "superseded":
+        await broker.request(
+            proposal(head="c" * 40), adapter=adapter, chat_id="42", question="Approve?",
+            session_key="webhook:2", authorized_user_id="7")
+    else:
+        await broker.retire_item(proposal().item_key, status="closed", adapter=adapter)
+    executor = ReceiptExecutor()
+
+    assert broker.claim_resumptions(owner="worker") == []
+    assert await broker.resume_approved(
+        owner="worker", github=LiveReader(), executor=executor) == []
+    assert executor.calls == []
+
+
+@pytest.mark.asyncio
+async def test_supersession_while_resumer_revalidates_prevents_executor(tmp_path):
+    broker = await _approved_broker(tmp_path)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BarrierReader(LiveReader):
+        async def read_contract(self, item_key):
+            entered.set()
+            await release.wait()
+            return await super().read_contract(item_key)
+
+    executor = ReceiptExecutor()
+    resuming = asyncio.create_task(broker.resume_approved(
+        owner="worker", github=BarrierReader(), executor=executor))
+    await entered.wait()
+    await broker.request(
+        proposal(head="c" * 40), adapter=BoundTelegram(), chat_id="42", question="Approve?",
+        session_key="webhook:2", authorized_user_id="7")
+    release.set()
+
+    assert await resuming == ["stale"]
+    assert executor.calls == []
+
+
+@pytest.mark.asyncio
 async def test_telegram_retire_clarify_card_removes_binding_and_keyboard():
     adapter = object.__new__(TelegramAdapter)
     adapter._clarify_state = {"gha-id": "session"}
     adapter._approval_clarify_state = {
         "gha-id": ClarifyPrompt("session", "42", "501", None)}
-    adapter._application = SimpleNamespace(bot=SimpleNamespace(edit_message_text=AsyncMock()))
+    adapter._app = SimpleNamespace(bot=SimpleNamespace(edit_message_text=AsyncMock()))
 
     await adapter.retire_clarify_card("gha-id", "Superseded")
 
     assert "gha-id" not in adapter._clarify_state
     assert "gha-id" not in adapter._approval_clarify_state
-    adapter._application.bot.edit_message_text.assert_awaited_once()
+    adapter._app.bot.edit_message_text.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_telegram_retirement_failure_keeps_coordinates_for_verified_retry():
+    adapter = object.__new__(TelegramAdapter)
+    adapter._clarify_state = {"gha-id": "session"}
+    adapter._approval_clarify_state = {
+        "gha-id": ClarifyPrompt("session", "42", "501", None)}
+    edit = AsyncMock(side_effect=[TimeoutError("telegram timeout"), None])
+    adapter._app = SimpleNamespace(bot=SimpleNamespace(edit_message_text=edit))
+
+    with pytest.raises(TimeoutError):
+        await adapter.retire_clarify_card("gha-id", "Superseded")
+    assert "gha-id" not in adapter._clarify_state
+    assert "gha-id" in adapter._approval_clarify_state
+
+    await adapter.retire_clarify_card("gha-id", "Superseded")
+    assert "gha-id" not in adapter._approval_clarify_state
+    assert edit.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_restart_rebuilds_terminal_retirement_coordinates_without_callback(tmp_path):
+    broker = GitHubApprovalBroker(tmp_path / "approval.db", instance_id="one")
+    target = BoundTelegram()
+    sent = await broker.request(
+        proposal(), adapter=target, chat_id="42", thread_id="9", question="Approve?",
+        session_key="webhook:1", authorized_user_id="7")
+
+    async def fail_retire(*_args):
+        raise TimeoutError("edit failed")
+
+    target.retire_clarify_card = fail_retire
+    await broker.retire_item(proposal().item_key, status="closed", adapter=target)
+    fresh = object.__new__(TelegramAdapter)
+    fresh._bot = SimpleNamespace(id=501)
+    fresh._clarify_state = {}
+    fresh._approval_clarify_state = {}
+    edit = AsyncMock()
+    fresh._app = SimpleNamespace(bot=SimpleNamespace(edit_message_text=edit))
+
+    assert await broker.retry_retirements(adapter=fresh) == 1
+    edit.assert_awaited_once()
+    assert sent.clarify_id not in fresh._clarify_state
 
 
 @pytest.mark.asyncio
@@ -334,3 +427,172 @@ async def test_approval_route_rejects_unrecognized_github_contract_before_agent(
         {"github_approval": {"authorized_user_id": "7"}}, {"action": "opened"},
         "pull_request", "route", None, "delivery-1")
     assert response.status == 400
+
+
+@pytest.mark.asyncio
+async def test_dynamic_subscription_v2_endpoint_durably_acks_without_waiting_for_telegram(
+        tmp_path, monkeypatch):
+    """The public endpoint and hot-reloaded subscription, not a private handler, own admission."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    subscription = {
+        "github-hermes-intake": {
+            "secret": "INSECURE_NO_AUTH",
+            "events": ["issues", "pull_request", "issue_comment"],
+            "script": "github-intake.py",
+            "deliver": "telegram",
+            "deliver_extra": {"chat_id": "42"},
+            "github_approval": {
+                "schema": "hermes.github-intake.v2",
+                "authorized_user_id": "7",
+            },
+        }
+    }
+    (tmp_path / "webhook_subscriptions.json").write_text(json.dumps(subscription))
+    broker = GitHubApprovalBroker(tmp_path / "approval.db", instance_id="endpoint")
+    monkeypatch.setattr("gateway.github_approval_broker.default_broker", lambda **_kwargs: broker)
+    transformed = {
+        "schema": "hermes.github-intake.v2",
+        "item_key": "owner/repo#7",
+        "head_sha": "a" * 40,
+        "contract_accepted": True,
+        "digest": "b" * 64,
+        "scope": ["tests"],
+        "limits": {"files": 3},
+        "risk": "low",
+        "binding_status": "pending",
+    }
+    target = BoundTelegram()
+    gate = asyncio.Event()
+
+    async def blocked_send(**kwargs):
+        target.sent.append(kwargs)
+        await gate.wait()
+        return SendResult(success=True, message_id="501")
+
+    target.send_clarify = blocked_send
+    runner = MagicMock()
+    runner._authorization_adapter.return_value = target
+    runner.config = SimpleNamespace(multiplex_profiles=False)
+    adapter = WebhookAdapter(PlatformConfig(enabled=True, extra={"host": "127.0.0.1", "port": 0}))
+    adapter.gateway_runner = runner
+    adapter._route_processor.run_route_script = MagicMock(return_value=(True, transformed))
+    adapter._admit_agent_run = AsyncMock(side_effect=AssertionError("LLM approval producer ran"))
+    app = web.Application()
+    app.router.add_post("/webhooks/{route_name}", adapter._handle_webhook)
+
+    started = time.monotonic()
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post(
+            "/webhooks/github-hermes-intake", json={"action": "opened"},
+            headers={"X-GitHub-Event": "issues", "X-GitHub-Delivery": "delivery-v2"})
+        elapsed = time.monotonic() - started
+        assert response.status == 202
+        assert (await response.json())["status"] == "approval_admitted"
+
+    assert elapsed < 0.5
+    assert target.sent == []
+    assert broker.observe(proposal())["state"] == "pending_notification"
+    adapter._admit_agent_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dynamic_v2_endpoint_retires_transformed_terminal_item(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "webhook_subscriptions.json").write_text(json.dumps({
+        "github-hermes-intake": {
+            "secret": "INSECURE_NO_AUTH", "events": ["pull_request"],
+            "script": "github-intake.py", "deliver": "telegram",
+            "deliver_extra": {"chat_id": "42"},
+            "github_approval": {
+                "schema": "hermes.github-intake.v2", "authorized_user_id": "7"},
+        }}))
+    target = BoundTelegram()
+    broker = GitHubApprovalBroker(tmp_path / "approval.db", instance_id="endpoint")
+    await broker.request(
+        proposal(), adapter=target, chat_id="42", question="Approve?",
+        session_key="webhook:1", authorized_user_id="7")
+    monkeypatch.setattr("gateway.github_approval_broker.default_broker", lambda **_kwargs: broker)
+    terminal = {
+        "schema": "hermes.github-intake.v2", "item_key": "owner/repo#7",
+        "head_sha": "a" * 40, "contract_accepted": False, "digest": "b" * 64,
+        "scope": [], "limits": {}, "risk": "none", "binding_status": "closed",
+    }
+    runner = MagicMock()
+    runner._authorization_adapter.return_value = target
+    runner.config = SimpleNamespace(multiplex_profiles=False)
+    adapter = WebhookAdapter(PlatformConfig(enabled=True, extra={"host": "127.0.0.1"}))
+    adapter.gateway_runner = runner
+    adapter._route_processor.run_route_script = MagicMock(return_value=(True, terminal))
+    adapter._admit_agent_run = AsyncMock(side_effect=AssertionError("agent ran"))
+    app = web.Application()
+    app.router.add_post("/webhooks/{route_name}", adapter._handle_webhook)
+
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post(
+            "/webhooks/github-hermes-intake", json={"action": "closed"},
+            headers={"X-GitHub-Event": "pull_request", "X-GitHub-Delivery": "close-v2"})
+        assert response.status == 202
+        assert (await response.json())["status"] == "approval_retired"
+    assert broker.observe(proposal())["state"] == "superseded"
+    adapter._admit_agent_run.assert_not_awaited()
+
+
+def test_dynamic_github_approval_requires_exact_explicit_schema_metadata(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    base = {
+        "secret": "INSECURE_NO_AUTH", "deliver": "telegram",
+        "github_approval": {"authorized_user_id": "7"},
+    }
+    (tmp_path / "webhook_subscriptions.json").write_text(json.dumps({
+        "missing": base,
+        "foreign": {**base, "github_approval": {
+            "authorized_user_id": "7", "schema": "hermes.github-intake.v1"}},
+        "valid": {**base, "github_approval": {
+            "authorized_user_id": "7", "schema": "hermes.github-intake.v2"}},
+    }))
+    adapter = WebhookAdapter(PlatformConfig(
+        enabled=True, extra={"host": "127.0.0.1", "secret": "fallback"}))
+    adapter._reload_dynamic_routes()
+    assert set(adapter._dynamic_routes) == {"valid"}
+
+
+@pytest.mark.asyncio
+async def test_startup_worker_recovers_callbacks_sends_outbox_and_resumes_once(tmp_path, monkeypatch):
+    broker = GitHubApprovalBroker(tmp_path / "approval.db", instance_id="startup")
+    target = BoundTelegram()
+    broker.admit(
+        proposal(), adapter=target, chat_id="42", question="Approve?",
+        session_key="webhook:1", authorized_user_id="7")
+    runner = MagicMock()
+    runner._authorization_adapter.return_value = target
+    runner.github_approval_runtime = None
+    adapter = WebhookAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter.gateway_runner = runner
+    adapter._routes = {"approval": {
+        "deliver": "telegram",
+        "github_approval": {
+            "schema": "hermes.github-intake.v2", "authorized_user_id": "7"},
+    }}
+    monkeypatch.setattr("gateway.github_approval_broker.default_broker", lambda **_kwargs: broker)
+
+    await asyncio.gather(
+        adapter._github_approval_worker_once(),
+        adapter._github_approval_worker_once(),
+    )
+    assert len(target.sent) == 1
+    active = broker.observe(proposal())
+    assert active["state"] == "active"
+
+    fresh_target = BoundTelegram()
+    runner._authorization_adapter.return_value = fresh_target
+    executor = ReceiptExecutor()
+    runner.github_approval_runtime = SimpleNamespace(github=LiveReader(), executor=executor)
+    broker.resolve_callback(
+        active["clarify_id"], 0, approver="telegram:7", user_id="7", chat_id="42",
+        thread_id=None, message_id="501", destination_id="telegram-bot:501")
+
+    await asyncio.gather(
+        adapter._github_approval_worker_once(),
+        adapter._github_approval_worker_once(),
+    )
+    assert len(executor.calls) == 1
