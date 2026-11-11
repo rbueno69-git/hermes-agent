@@ -9,8 +9,10 @@ pre-change spelling on a copy: removal could form ``tool -> user`` (#48879) or a
 ``user -> user`` pair that repair merges.
 """
 
+from agent.agent_runtime_helpers_placeholders import _INTERRUPTED_PLACEHOLDER
+
 LEGACY = "[response interrupted]"
-NEW_PLACEHOLDER = "[interrupt: no assistant output for this turn]"
+NEW_PLACEHOLDER = _INTERRUPTED_PLACEHOLDER
 
 
 def _agent(tmp_path, monkeypatch):

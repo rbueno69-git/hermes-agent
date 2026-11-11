@@ -119,15 +119,18 @@ class IterationPrep:
 def _neutralise_replay_echo_ghosts(seq: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
     """(new list, neutralised); never mutates ``seq`` or its row dicts."""
     from agent.agent_runtime_helpers_placeholders import (
+        _ECHOED_INTERRUPTED_PLACEHOLDER,
         _INTERRUPTED_PLACEHOLDER,
         _LEGACY_INTERRUPTED_PLACEHOLDER,
     )
     from agent.conversation_loop import _INTERRUPT_SCAFFOLD_MARKER
-    # Retire only spellings that predate the #132949 wording change: the scaffold
-    # (#81841) and the old placeholder, both reproduced verbatim. The current
-    # placeholder is the post-fix value — it stays (this is also what
-    # neutralisation rewrites to, so the rewrite does not retrigger the filter).
-    hazards = {_INTERRUPT_SCAFFOLD_MARKER, _LEGACY_INTERRUPTED_PLACEHOLDER}
+    # Retire every natural-language spelling observed to echo. The current placeholder is an XML-like
+    # structural token and stays; it is also the neutralisation target, so this does not retrigger.
+    hazards = {
+        _INTERRUPT_SCAFFOLD_MARKER,
+        _ECHOED_INTERRUPTED_PLACEHOLDER,
+        _LEGACY_INTERRUPTED_PLACEHOLDER,
+    }
     neutralised = 0
     out: list[dict[str, Any]] = []
     for m in seq:
