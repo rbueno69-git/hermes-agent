@@ -1120,6 +1120,8 @@ def _cmd_promote(args: argparse.Namespace) -> int:
 
 
 def _cmd_archive(args: argparse.Namespace) -> int:
+    from hermes_cli.kanban_db_graph import ContinuationParentInUse
+
     ids = list(args.task_ids or [])
     purge_ids = list(getattr(args, "purge_ids", None) or [])
     if ids and purge_ids:
@@ -1128,8 +1130,21 @@ def _cmd_archive(args: argparse.Namespace) -> int:
         return _err("at least one task_id is required")
     with kbc.connect_closing() as conn:
         if purge_ids:
-            return _bulk_apply(purge_ids, lambda tid: kb.delete_archived_task(conn, tid), lambda tid: f"Deleted {tid}",
-                               lambda tid: f"cannot delete {tid} (must already be archived)")
+            refused: dict[str, str] = {}
+
+            def purge(tid: str) -> bool:
+                try:
+                    return kb.delete_archived_task(conn, tid)
+                except ContinuationParentInUse as exc:
+                    refused[tid] = (
+                        f"cannot delete {tid}: continuation parent of {exc.child_id}"
+                    )
+                    return False
+
+            return _bulk_apply(
+                purge_ids, purge, lambda tid: f"Deleted {tid}",
+                lambda tid: refused.get(tid, f"cannot delete {tid} (must already be archived)"),
+            )
         return _bulk_apply(ids, lambda tid: kb.archive_task(conn, tid),
                            lambda tid: f"Archived {tid}", lambda tid: f"cannot archive {tid}")
 
