@@ -11,6 +11,10 @@ def test_claim_freezes_task_policy_and_rejects_forgery(tmp_path, monkeypatch):
     from hermes_cli.kanban_db_connect import connect
     from gateway.session_contract import SessionActor
     from hermes_state_runtime import RuntimeStoreError
+    monkeypatch.setattr(
+        'agent.skill_commands.build_preloaded_skills_prompt',
+        lambda names, task_id=None: ('skill prompt', list(names), []),
+    )
     monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setenv('HOME', str(tmp_path / 'home'))

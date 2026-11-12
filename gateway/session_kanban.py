@@ -46,6 +46,13 @@ def build_kanban_policy(connection, params, config):
             if kb._retry_status_for_run(conn, task.id, task.current_run_id) == 'review':
                 # Same rule as the dispatcher's review lane: the reviewer always loads sdlc-review.
                 skills = list(dict.fromkeys([*skills, 'sdlc-review']))
+            if skills:
+                from agent.skill_commands import build_preloaded_skills_prompt
+                _prompt, loaded, missing = build_preloaded_skills_prompt(skills, task_id=task.id)
+                if missing and not loaded:
+                    raise RuntimeStoreError('kanban_skills_unavailable:' + ','.join(missing))
+    except RuntimeStoreError:
+        raise
     except (ValueError, OSError, sqlite3.Error) as exc:
         raise RuntimeStoreError('invalid_kanban_claim') from exc
     cwd = task.workspace_path

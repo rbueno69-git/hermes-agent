@@ -30,9 +30,14 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
-from toolsets import get_toolset_names
+from hermes_cli.kanban_db_task_validation import (
+    canonical_assignee as _canonical_assignee,
+    normalize_parents_and_continuation as _normalize_parents_and_continuation,
+    normalize_task_skills as _normalize_task_skills,
+    normalize_workspace_request as _normalize_workspace_request,
+    validate_model_override as _validate_model_override,
+)
 from utils import unlink_files_older_than
-
 _log = logging.getLogger(__name__)
 
 
@@ -131,7 +136,6 @@ def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     raise ValueError(f"reasoning_effort must be one of {allowed}, got {effort!r}")
 
 
-KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024  # one cap for dashboard, tools and CLI
 
@@ -634,6 +638,7 @@ class Task:
     goal_mode: bool = False
     goal_max_turns: Optional[int] = None
     session_id: Optional[str] = None         # originating HERMES_SESSION_ID; NULL from CLI/dashboard
+    continuation_parent_id: Optional[str] = None  # explicit terminal predecessor; must remain a direct parent
     # VALID_BLOCK_KINDS or None (legacy); kept across unblock so a same-kind re-block reads as a loop.
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
@@ -669,7 +674,7 @@ _TASK_EPOCH_COLUMNS = ("created_at", "started_at", "completed_at", "claim_expire
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "current_run_id", "workflow_template_id",
-    "current_step_key", "max_retries", "session_id", "completion_contract",
+    "current_step_key", "max_retries", "session_id", "completion_contract", "continuation_parent_id",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -862,6 +867,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- profile's state.db (kanban_create verifies before stamping). Indexed
     -- so per-session list queries stay cheap on larger boards.
     session_id           TEXT,
+    -- Explicit terminal predecessor for a phase continuation. This is graph
+    -- identity, not a title-derived guess, and must remain a direct parent.
+    continuation_parent_id TEXT,
     -- Typed block reason set by ``block_task`` (one of VALID_BLOCK_KINDS, or
     -- NULL for legacy/un-typed blocks). Drives routing: ``dependency`` never
     -- sits in ``blocked`` (goes to ``todo`` for parent-gating); the others go
@@ -1008,26 +1016,6 @@ def _host_prefix() -> str:
 
 # --- Task creation / mutation ---
 
-def _validate_model_override(model: Optional[str], provider: Optional[str]) -> tuple[Optional[str], Optional[str]]:
-    """Strip both; a provider without a model is rejected (a bare ``--provider``
-    would re-resolve the profile's model against another backend — exactly
-    the mismatch the override exists to kill)."""
-    model = (model or "").strip() or None
-    provider = (provider or "").strip() or None
-    if provider and not model:
-        raise ValueError("provider_override requires a model_override")
-    return model, provider
-
-
-def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
-    """Lowercase-assignee normalization for Kanban rows (dashboard/CLI parity)."""
-    if assignee is None:
-        return None
-    from hermes_cli.profiles import normalize_profile_name
-
-    return normalize_profile_name(assignee)
-
-
 def _resolve_project_link(
     conn: sqlite3.Connection, project_id: Optional[str], project_source_task_id: Optional[str],
     workspace_kind: str, workspace_path: Optional[str],
@@ -1114,46 +1102,6 @@ def _project_from_source_task(
     return project_obj, project_repo
 
 
-def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str]]:
-    """Strip/dedupe a skills list. Commas are refused (a comma-joined string must
-    not land in one argv slot); toolset names are rejected all at once because
-    agents that confuse the two usually pass several."""
-    if skills is None:
-        return None
-    cleaned: list[str] = []
-    seen: set[str] = set()
-    toolset_typos: list[str] = []
-    for s in skills:
-        if not s:
-            continue
-        name = str(s).strip()
-        if not name:
-            continue
-        if "," in name:
-            raise ValueError(
-                f"skill name cannot contain comma: {name!r} "
-                f"(pass a list of separate names instead of a comma-joined string)"
-            )
-        if name.casefold() in KNOWN_TOOLSET_NAMES:
-            toolset_typos.append(name)
-            continue
-        if name in seen:
-            continue
-        seen.add(name)
-        cleaned.append(name)
-    if toolset_typos:
-        quoted = ", ".join(repr(n) for n in toolset_typos)
-        noun = "is a toolset name" if len(toolset_typos) == 1 else "are toolset names"
-        raise ValueError(
-            f"{quoted} {noun}, not skill name(s). "
-            "Put toolsets in the assignee profile's `toolsets:` config "
-            "instead of per-task skills. Skills are named skill bundles "
-            "(e.g. `blogwatcher`, `github-code-review`); toolsets are runtime "
-            "capabilities (e.g. `web`, `browser`, `terminal`)."
-        )
-    return cleaned
-
-
 def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
@@ -1168,6 +1116,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    continuation_parent_id: Optional[str] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1195,31 +1144,18 @@ def create_task(
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
-    # A project-scoped board anchors every new task to its project's repo
-    # (deterministic worktree + branch) without each surface repeating it.
-    # An explicit ``scratch`` (or ``project_id=""``) is a request for no project:
-    # it must not be upgraded to a worktree in the board's repo (#106342).
-    if project_id is None and workspace_kind != "scratch":
-        try:
-            project_id = (_board_meta_for(board).get("project_id") or "").strip() or None
-        except Exception:
-            pass
-    if workspace_kind is None:
-        workspace_kind = "scratch"
-    if workspace_kind not in VALID_WORKSPACE_KINDS:
-        raise ValueError(
-            f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
-            f"got {workspace_kind!r}"
-        )
-    if branch_name is not None:
-        branch_name = str(branch_name).strip() or None
-    if branch_name and workspace_kind != "worktree":
-        raise ValueError("branch_name is only valid for worktree workspaces")
-
+    project_id, workspace_kind, branch_name = _normalize_workspace_request(
+        project_id,
+        workspace_kind,
+        branch_name,
+        lambda: _board_meta_for(board).get("project_id"),
+    )
     project_id, project_obj, project_repo, workspace_kind = _resolve_project_link(
         conn, project_id, project_source_task_id, workspace_kind, workspace_path
     )
-    parents = tuple(p for p in parents if p)
+    parents, continuation_parent_id = _normalize_parents_and_continuation(
+        parents, continuation_parent_id,
+    )
     skills_list = _normalize_task_skills(skills)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
@@ -1267,8 +1203,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract,
+                        continuation_parent_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1278,6 +1215,7 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        continuation_parent_id,
                     ),
                 )
                 for pid in parents:
@@ -1300,6 +1238,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "continuation_parent_id": continuation_parent_id,
                     },
                 )
                 if task_status == "blocked":
@@ -1320,6 +1259,8 @@ def create_task(
                             "dependency_wait",
                             {"reason": "parent_not_done", "parent": gating[0]},
                         )
+                if continuation_parent_id:
+                    _triage_invalid_continuation(conn, task_id)
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -1610,6 +1551,11 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
 
 def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
     with write_txn(conn):
+        declared = conn.execute(
+            "SELECT continuation_parent_id FROM tasks WHERE id = ?", (child_id,),
+        ).fetchone()
+        if declared and declared["continuation_parent_id"] == parent_id:
+            raise ValueError("cannot unlink a task's declared continuation parent")
         cur = conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?", (parent_id, child_id),
         )
@@ -2056,6 +2002,8 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            if _triage_invalid_continuation(conn, task_id):
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Explicit human-intervention block; only ``unblock_task`` may exit it.
                 continue
@@ -2105,6 +2053,51 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
         "WHERE l.child_id = ? "
         "AND p.status NOT IN ('done', 'archived') LIMIT 1", (task_id,),
     ).fetchone() is None
+
+
+def _continuation_parent_missing(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Declared continuation parent when its required direct edge is absent."""
+    row = conn.execute(
+        "SELECT continuation_parent_id FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    parent_id = row["continuation_parent_id"] if row else None
+    if not parent_id:
+        return None
+    linked = conn.execute(
+        "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+        (parent_id, task_id),
+    ).fetchone()
+    return None if linked else parent_id
+
+
+def _triage_invalid_continuation(conn: sqlite3.Connection, task_id: str) -> bool:
+    parent_id = _continuation_parent_missing(conn, task_id)
+    if parent_id:
+        conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (task_id,))
+        _append_event(conn, task_id, "continuation_link_invalid",
+                      {"continuation_parent_id": parent_id})
+        return True
+    row = conn.execute(
+        "SELECT continuation_parent_id FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    parent_id = row["continuation_parent_id"] if row else None
+    if not parent_id:
+        return False
+    parent = conn.execute("SELECT status FROM tasks WHERE id = ?", (parent_id,)).fetchone()
+    if parent is None or parent["status"] not in ("done", "archived"):
+        return False
+    conflicts = [row["parent_id"] for row in conn.execute(
+        "SELECT l.parent_id FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+        "WHERE l.child_id = ? AND l.parent_id != ? AND p.status NOT IN ('done', 'archived') "
+        "ORDER BY l.parent_id",
+        (task_id, parent_id),
+    ).fetchall()]
+    if not conflicts:
+        return False
+    conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (task_id,))
+    _append_event(conn, task_id, "continuation_parent_conflict",
+                  {"continuation_parent_id": parent_id, "nonterminal_parents": conflicts})
+    return True
 
 
 def unsatisfied_parents(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, str]]:
@@ -2181,9 +2174,11 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
-        # Single enforcement point: never ready -> running with an undone
-        # parent, whichever writer set 'ready'. Demote to 'todo';
-        # recompute_ready re-promotes when the parents finish.
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None or row["status"] != "ready":
+            return None
+        if _triage_invalid_continuation(conn, task_id):
+            return None
         if not _parents_satisfied(conn, task_id):
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -2207,13 +2202,15 @@ def claim_review_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
 ) -> Optional[Task]:
-    """Atomic ``review -> running`` (None when lost). Parents are re-checked
-    (one may have reopened meanwhile) and a NEW run tracks the reviewer
-    separately from the implementer."""
+    """Atomic ``review -> running`` after graph validation; None when lost."""
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if _task_status(conn, task_id) != "review":
+            return None
+        if _triage_invalid_continuation(conn, task_id):
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -2236,9 +2233,7 @@ def claim_review_task(
 def _retry_status_for_run(
     conn: sqlite3.Connection, task_id: str, run_id: Optional[int] = None,
 ) -> str:
-    """``review`` when the run's ``claimed`` event says ``source_status=review``,
-    else ``ready`` — one place, so crash/timeout/reclaim can't silently turn a
-    reviewer run into an implementation run."""
+    """Return the status from which a run was claimed, defaulting to ready."""
     if run_id is None:
         run_id = _current_run_id(conn, task_id)
     if run_id is None:
@@ -3835,6 +3830,11 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
 
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
     """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
+    from hermes_cli.kanban_db_graph import ContinuationParentInUse
+    declared_child = conn.execute(
+        "SELECT id FROM tasks WHERE continuation_parent_id = ? LIMIT 1", (task_id,)).fetchone()
+    if declared_child:
+        raise ContinuationParentInUse(task_id, declared_child["id"])
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
     for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs"):
         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))

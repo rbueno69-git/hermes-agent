@@ -450,6 +450,31 @@ def test_delete_task(client):
     r = client.get(f"/api/plugins/kanban/tasks/{t['id']}")
     assert r.status_code == 404
 
+
+def test_delete_declared_continuation_parent_returns_conflict(client):
+    with kbc.connect() as conn:
+        parent_id = kb.create_task(conn, title="terminal phase")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent_id,))
+        child_id = kb.create_task(
+            conn,
+            title="next phase",
+            parents=[parent_id],
+            continuation_parent_id=parent_id,
+        )
+
+    response = client.delete(f"/api/plugins/kanban/tasks/{parent_id}")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "error": "continuation_parent_in_use",
+        "parent_id": parent_id,
+        "child_id": child_id,
+    }
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, parent_id) is not None
+        assert kb.get_task(conn, child_id) is not None
+
 # ---------------------------------------------------------------------------
 # Comments + Links
 # ---------------------------------------------------------------------------
