@@ -116,6 +116,7 @@ class GitHubApprovalBroker:
                     origin_status TEXT,
                     last_error TEXT,
                     retirement_pending INTEGER NOT NULL DEFAULT 0 CHECK(retirement_pending IN (0,1)),
+                    retirement_retry_after REAL,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
@@ -136,6 +137,8 @@ class GitHubApprovalBroker:
                 db.execute("ALTER TABLE github_approval_proposals ADD COLUMN destination_id TEXT")
             if "retirement_pending" not in columns:
                 db.execute("ALTER TABLE github_approval_proposals ADD COLUMN retirement_pending INTEGER NOT NULL DEFAULT 0")
+            if "retirement_retry_after" not in columns:
+                db.execute("ALTER TABLE github_approval_proposals ADD COLUMN retirement_retry_after REAL")
 
         try:
             self.path.chmod(0o600)
@@ -387,13 +390,15 @@ class GitHubApprovalBroker:
         destination_id = self._destination_identity(adapter, "")
         if destination_id is None:
             return 0
+        now = time.time()
         with self._connect() as db:
             rows = db.execute(
                 "SELECT proposal_key,clarify_id,session_key,chat_id,message_id,thread_id,state,response "
                 "FROM github_approval_proposals "
                 "WHERE state IN ('answered','superseded') AND retirement_pending=1 "
                 "AND message_id IS NOT NULL AND destination_id=? "
-                "ORDER BY updated_at LIMIT ?", (destination_id, max(1, int(limit)))).fetchall()
+                "AND (retirement_retry_after IS NULL OR retirement_retry_after<=?) "
+                "ORDER BY updated_at LIMIT ?", (destination_id, now, max(1, int(limit)))).fetchall()
         retired = 0
         retire = getattr(adapter, "retire_clarify_card", None)
         if not callable(retire):
@@ -409,12 +414,34 @@ class GitHubApprovalBroker:
                 notice = (f"GitHub approval recorded: {row['response']}"
                           if row["state"] == "answered" else "Superseded GitHub approval")
                 await _await(retire(str(row["clarify_id"]), notice))
-            except Exception:
+            except Exception as exc:
+                raw_retry_after = getattr(exc, "retry_after", None)
+                total_seconds = getattr(raw_retry_after, "total_seconds", None)
+                if callable(total_seconds):
+                    raw_retry_after = total_seconds()
+                retry_after: Optional[float] = None
+                if raw_retry_after is not None:
+                    try:
+                        retry_after = max(1.0, float(raw_retry_after))
+                    except (TypeError, ValueError):
+                        pass
+                if retry_after is not None:
+                    cooldown_started = time.time()
+                    with self._connect() as db:
+                        db.execute(
+                            "UPDATE github_approval_proposals SET retirement_retry_after=?,updated_at=? "
+                            "WHERE state IN ('answered','superseded') AND retirement_pending=1 "
+                            "AND message_id IS NOT NULL AND destination_id=? "
+                            "AND (retirement_retry_after IS NULL OR retirement_retry_after<=?)",
+                            (cooldown_started + retry_after, cooldown_started,
+                             destination_id, cooldown_started))
                 logger.exception("Could not retry stale GitHub approval retirement")
+                if retry_after is not None:
+                    break
                 continue
             with self._connect() as db:
                 retired += db.execute(
-                    "UPDATE github_approval_proposals SET retirement_pending=0,updated_at=? "
+                    "UPDATE github_approval_proposals SET retirement_pending=0,retirement_retry_after=NULL,updated_at=? "
                     "WHERE proposal_key=? AND state IN ('answered','superseded') AND retirement_pending=1",
                     (time.time(), str(row["proposal_key"]))).rowcount
         return retired

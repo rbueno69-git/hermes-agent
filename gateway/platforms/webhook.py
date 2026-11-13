@@ -374,8 +374,8 @@ class WebhookAdapter(BasePlatformAdapter):
                 if broker is None:
                     continue
                 broker.recover_callbacks(target)
-                completed += await broker.retry_retirements(adapter=target, limit=16)
                 completed += len(await broker.retry_pending(adapter=target, limit=16))
+                completed += await broker.retry_retirements(adapter=target, limit=16)
                 from gateway.github_approval_reconciler import (
                     ApprovalDecisionReconciler, IntakeScriptLiveReader,
                 )

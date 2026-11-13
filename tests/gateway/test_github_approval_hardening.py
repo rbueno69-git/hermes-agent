@@ -192,6 +192,34 @@ async def test_restart_rebuilds_terminal_retirement_coordinates_without_callback
 
 
 @pytest.mark.asyncio
+async def test_retirement_flood_control_cools_due_destination_batch_and_stops(tmp_path):
+    class FloodLimited(Exception):
+        def __init__(self, retry_after):
+            super().__init__(f"retry in {retry_after}")
+            self.retry_after = retry_after
+
+    path = tmp_path / "approval.db"
+    broker = GitHubApprovalBroker(path, instance_id="one")
+    target = BoundTelegram()
+    proposals = [proposal(item_key=f"owner/repo#{number}") for number in (7, 8)]
+    for candidate in proposals:
+        sent = await broker.request(
+            candidate, adapter=target, chat_id="42", question="Approve?",
+            session_key=f"webhook:{candidate.item_key}", authorized_user_id="7")
+        broker.resolve_callback(
+            sent.clarify_id, 0, approver="telegram:7", user_id="7", chat_id="42",
+            thread_id=None, message_id="501", destination_id="telegram-bot:501")
+
+    limited = BoundTelegram()
+    limited.retire_clarify_card = AsyncMock(side_effect=[FloodLimited(3600), None])
+
+    assert await broker.retry_retirements(adapter=limited) == 0
+    limited.retire_clarify_card.assert_awaited_once()
+    for candidate in proposals:
+        assert broker.observe(candidate)["retirement_retry_after"] > time.time() + 3500
+
+
+@pytest.mark.asyncio
 async def test_telegram_approval_prompt_has_no_free_text_other_choice(monkeypatch):
     adapter = object.__new__(TelegramAdapter)
     adapter._clarify_state = {}
@@ -527,6 +555,32 @@ def test_dynamic_github_approval_requires_exact_explicit_schema_metadata(tmp_pat
         enabled=True, extra={"host": "127.0.0.1", "secret": "fallback"}))
     adapter._reload_dynamic_routes()
     assert set(adapter._dynamic_routes) == {"valid"}
+
+
+@pytest.mark.asyncio
+async def test_approval_worker_retries_new_notifications_before_retirements(tmp_path, monkeypatch):
+    calls = []
+    broker = SimpleNamespace(
+        path=tmp_path / "approval.db",
+        recover_callbacks=lambda _target: calls.append("recover"),
+        retry_pending=AsyncMock(side_effect=lambda **_kwargs: calls.append("pending") or []),
+        retry_retirements=AsyncMock(side_effect=lambda **_kwargs: calls.append("retire") or 0),
+    )
+    target = BoundTelegram()
+    runner = MagicMock()
+    runner._authorization_adapter.return_value = target
+    adapter = WebhookAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter.gateway_runner = runner
+    adapter._routes = {"approval": {
+        "deliver": "telegram",
+        "github_approval": {
+            "schema": "hermes.github-intake.v2", "authorized_user_id": "7"},
+    }}
+    monkeypatch.setattr("gateway.github_approval_broker.default_broker", lambda **_kwargs: broker)
+
+    await adapter._github_approval_worker_once()
+
+    assert calls == ["recover", "pending", "retire"]
 
 
 @pytest.mark.asyncio
