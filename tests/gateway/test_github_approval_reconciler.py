@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
@@ -126,6 +127,29 @@ def test_replay_after_ledger_append_without_receipt_creates_no_duplicate(tmp_pat
     assert replay == []
     assert len(_ledger_rows(tmp_path / "approvals.jsonl")) == 1
     assert len(_task_rows(tmp_path / "kanban.db")) == 1
+
+
+def test_reconciler_waits_for_the_canonical_ledger_lock(tmp_path):
+    reconciler = _reconciler(tmp_path, _live())
+    canonical_lock = Path(f"{tmp_path / 'approvals.jsonl'}.lock")
+    reached_live_read = threading.Event()
+    completed = threading.Event()
+    reconciler.live_reader = lambda _item: (reached_live_read.set(), _live())[1]
+
+    from gateway.github_approval_reconciler import _exclusive_lock
+
+    with _exclusive_lock(canonical_lock):
+        worker = threading.Thread(
+            target=lambda: (reconciler.reconcile(), completed.set()), daemon=True,
+        )
+        worker.start()
+        assert not reached_live_read.wait(2.0)
+        assert not completed.is_set()
+    worker.join(timeout=5.0)
+
+    assert completed.is_set()
+    assert reached_live_read.is_set()
+    assert len(_ledger_rows(tmp_path / "approvals.jsonl")) == 1
 
 
 def test_replay_after_task_creation_reuses_existing_task_without_mutation(tmp_path, monkeypatch):

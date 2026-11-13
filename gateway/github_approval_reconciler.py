@@ -288,7 +288,7 @@ class ApprovalDecisionReconciler:
         self.kanban_path = Path(kanban_path)
         self.live_reader = live_reader
         self.assignee = assignee
-        self.lock_path = Path(lock_path) if lock_path else self.broker_path.with_suffix(".reconcile.lock")
+        self.lock_path = Path(lock_path) if lock_path else Path(f"{self.ledger_path}.lock")
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
