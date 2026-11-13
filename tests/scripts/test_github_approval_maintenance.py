@@ -91,7 +91,7 @@ def test_cursor_advances_only_after_every_candidate_is_processed(tmp_path, monke
     assert not module.CURSOR.exists()
 
 
-def test_missed_snapshot_contract_is_emitted_once_then_deduped(tmp_path, monkeypatch):
+def test_snapshot_only_contract_is_not_replayed_without_new_change(tmp_path, monkeypatch):
     module = _load()
     module.CURSOR = tmp_path / "cursor.json"
     module.CHANGES = tmp_path / "changes.jsonl"
@@ -102,24 +102,14 @@ def test_missed_snapshot_contract_is_emitted_once_then_deduped(tmp_path, monkeyp
     module.SNAPSHOT.write_text(json.dumps({"items": [
         {"id": ITEM, "observation": "unassigned_approval_candidate"},
     ]}), encoding="utf-8")
+    module.CURSOR.write_text('{"changes_lines":0}\n', encoding="utf-8")
     monkeypatch.setattr(module, "project_pending_decisions", list)
     monkeypatch.setattr(module, "actionable_items", lambda: set())
-    payload = {
-        "action": "edited", "repository": {"full_name": "rbueno69-git/tutordigital-dashboard"},
-        "pull_request": {"number": 519, "head": {"sha": HEAD}},
-    }
-    monkeypatch.setattr(module, "live_payload", lambda _item: payload)
-    monkeypatch.setattr(module, "validated_envelope", lambda _payload: {
-        "contract_accepted": True, "head_sha": HEAD, "digest": DIGEST,
-    })
-    present = {"value": False}
-    monkeypatch.setattr(module, "has_current_tuple", lambda _item, _envelope: present["value"])
-    sent = []
-    monkeypatch.setattr(module, "post_signed_local", lambda value: (sent.append(value), present.update(value=True)))
+    monkeypatch.setattr(module, "live_payload", lambda _item: (_ for _ in ()).throw(
+        AssertionError("snapshot-only candidate must not be replayed")
+    ))
 
-    first = module.run_once(dry_run=False)
-    second = module.run_once(dry_run=False)
+    result = module.run_once(dry_run=False)
 
-    assert first["emitted"] == [ITEM]
-    assert second["emitted"] == []
-    assert sent == [payload]
+    assert result["emitted"] == []
+    assert result["candidates"] == []

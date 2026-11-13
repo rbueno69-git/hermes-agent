@@ -242,7 +242,10 @@ def project_pending_decisions() -> list[dict]:
 def _candidate_items() -> tuple[set[str], int, int]:
     start = _read_cursor()
     changed, total = _changed_items(start)
-    return snapshot_candidates() | changed | actionable_items(), start, total
+    # The durable changes cursor is the missed-event authority. Replaying every
+    # snapshot candidate on each tick would regenerate issue approvals whenever
+    # an unrelated default-branch commit changes the issue's synthetic head.
+    return changed | actionable_items(), start, total
 
 
 def run_once(*, dry_run: bool) -> dict:
