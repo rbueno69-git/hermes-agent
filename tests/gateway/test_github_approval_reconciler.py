@@ -293,6 +293,66 @@ def test_live_reader_returns_unaccepted_when_pinned_validator_rejects_contract()
     assert live.accepted is False
 
 
+def test_live_reader_revalidates_exact_comment_contract_digest():
+    calls = []
+
+    def github(endpoint):
+        calls.append(endpoint)
+        if endpoint.endswith("/issues/519"):
+            return {
+                "number": 519, "state": "open", "title": "Comment contract",
+                "labels": [{"name": "pink:auto"}], "pull_request": {},
+            }
+        if endpoint.endswith("/pulls/519"):
+            return {"number": 519, "state": "open", "head": {"sha": HEAD}}
+        if endpoint.endswith("/issues/519/comments?per_page=100"):
+            return [
+                {"id": 77, "body": "old note", "user": {"login": "author"}},
+                {"id": 88, "body": "exact approved contract", "user": {"login": "author"}},
+            ]
+        raise AssertionError(endpoint)
+
+    def intake(payload):
+        comment = payload.get("comment")
+        if not isinstance(comment, dict):
+            raise ContractRejected("item body is not the approved comment contract")
+        digest = DIGEST if comment.get("id") == 88 else "b" * 64
+        return {
+            "schema": "hermes.github-intake.v2", "item_key": ITEM,
+            "head_sha": HEAD, "contract_accepted": True, "digest": digest,
+            "scope": ["comment contract"], "limits": {"contract": "bounded"},
+            "risk": "alto", "binding_status": "pending",
+        }
+
+    reader = IntakeScriptLiveReader(github_reader=github, intake_runner=intake)
+
+    live = reader.for_digest(ITEM, DIGEST)
+
+    assert live == LiveContract(
+        item_key=ITEM, state="open", head_sha=HEAD,
+        contract_digest_sha256=DIGEST, accepted=True, title="Comment contract")
+    assert calls[-1].endswith("/issues/519/comments?per_page=100")
+
+
+def test_reconciler_uses_digest_aware_live_reader_for_comment_contract(tmp_path):
+    class DigestAwareReader:
+        def __call__(self, _item):
+            pytest.fail("generic item-body validation must not replace comment provenance")
+
+        def for_digest(self, item, digest):
+            assert item == ITEM
+            assert digest == DIGEST
+            return _live()
+
+    reconciler = _reconciler(tmp_path, _live())
+    reconciler.live_reader = DigestAwareReader()
+
+    result = reconciler.reconcile()
+
+    assert [item.outcome for item in result] == ["approved"]
+    assert len(_task_rows(tmp_path / "kanban.db")) == 1
+
+
 def test_live_reader_rejects_malformed_authority_fields():
     def github(endpoint):
         if endpoint.endswith("/issues/519"):

@@ -42,7 +42,7 @@ class IntakeScriptLiveReader:
     def __init__(
         self,
         *,
-        github_reader: Optional[Callable[[str], dict]] = None,
+        github_reader: Optional[Callable[[str], object]] = None,
         intake_runner: Optional[Callable[[dict], dict]] = None,
         intake_script: Optional[Path] = None,
     ):
@@ -51,7 +51,7 @@ class IntakeScriptLiveReader:
         self.intake_runner = intake_runner or self._run_intake
 
     @staticmethod
-    def _github_api(endpoint: str) -> dict:
+    def _github_api(endpoint: str) -> object:
         result = subprocess.run(
             ["gh", "api", endpoint], capture_output=True, text=True,
             encoding="utf-8", errors="strict", timeout=30, check=False,
@@ -59,9 +59,32 @@ class IntakeScriptLiveReader:
         if result.returncode != 0 or len(result.stdout) > 1_048_576:
             raise RuntimeError("GitHub live metadata read failed")
         value = json.loads(result.stdout)
-        if not isinstance(value, dict):
+        if not isinstance(value, (dict, list)):
             raise RuntimeError("GitHub live metadata has the wrong shape")
         return value
+
+    @staticmethod
+    def _from_envelope(item_key: str, title: str, envelope: dict) -> LiveContract:
+        required = {
+            "schema", "item_key", "head_sha", "contract_accepted", "digest",
+            "scope", "limits", "risk", "binding_status",
+        }
+        if set(envelope) != required or envelope.get("schema") != "hermes.github-intake.v2":
+            raise RuntimeError("pinned GitHub intake validator returned an unexpected envelope")
+        if (not isinstance(envelope.get("scope"), list)
+                or any(not isinstance(value, str) for value in envelope["scope"])
+                or not isinstance(envelope.get("limits"), dict)
+                or any(not isinstance(key, str) or not isinstance(value, str)
+                       for key, value in envelope["limits"].items())
+                or not isinstance(envelope.get("risk"), str)):
+            raise RuntimeError("pinned GitHub intake validator returned malformed authority fields")
+        head_sha, digest = envelope.get("head_sha"), envelope.get("digest")
+        accepted = envelope.get("contract_accepted") is True and envelope.get("binding_status") == "pending"
+        if (envelope.get("item_key") != item_key or not isinstance(head_sha, str)
+                or not _SHA40_RE.fullmatch(head_sha) or not isinstance(digest, str)
+                or not _SHA64_RE.fullmatch(digest)):
+            raise RuntimeError("pinned GitHub intake validator returned a mismatched tuple")
+        return LiveContract(item_key, "open", head_sha, digest, accepted, title)
 
     def _run_intake(self, payload: dict) -> dict:
         script = self.intake_script
@@ -90,6 +113,8 @@ class IntakeScriptLiveReader:
             raise ValueError("item_key must be owner/repo#number")
         repo, number = match.group("repo"), int(match.group("number"))
         issue = self.github_reader(f"repos/{repo}/issues/{number}")
+        if not isinstance(issue, dict):
+            raise RuntimeError("GitHub live issue metadata has the wrong shape")
         if issue.get("number") not in (None, number):
             raise RuntimeError("GitHub live item identity changed")
         state = issue.get("state")
@@ -104,7 +129,10 @@ class IntakeScriptLiveReader:
         head_sha = ""
         if isinstance(issue.get("pull_request"), dict):
             pull = self.github_reader(f"repos/{repo}/pulls/{number}")
-            head = pull.get("head") if isinstance(pull.get("head"), dict) else {}
+            if not isinstance(pull, dict):
+                raise RuntimeError("GitHub live PR metadata has the wrong shape")
+            raw_head = pull.get("head")
+            head = raw_head if isinstance(raw_head, dict) else {}
             head_sha = head.get("sha")
             if pull.get("state") != "open" or not isinstance(head_sha, str) or not _SHA40_RE.fullmatch(head_sha):
                 return LiveContract(item_key, str(pull.get("state") or "unknown"), "", "", False, title)
@@ -129,26 +157,51 @@ class IntakeScriptLiveReader:
             envelope = self.intake_runner(payload)
         except ContractRejected:
             return LiveContract(item_key, "open", head_sha, "", False, title)
-        required = {
-            "schema", "item_key", "head_sha", "contract_accepted", "digest",
-            "scope", "limits", "risk", "binding_status",
+        return self._from_envelope(item_key, title, envelope)
+
+    def for_digest(self, item_key: str, expected_digest: str) -> LiveContract:
+        """Revalidate the exact approved contract, including comment-hosted contracts."""
+        if not _SHA64_RE.fullmatch(expected_digest):
+            raise ValueError("expected_digest must be sha256")
+        current = self(item_key)
+        if current.accepted and current.contract_digest_sha256 == expected_digest:
+            return current
+        match = _ITEM_RE.fullmatch(item_key)
+        if match is None or current.state != "open":
+            return current
+        repo, number = match.group("repo"), int(match.group("number"))
+        issue = self.github_reader(f"repos/{repo}/issues/{number}")
+        comments = self.github_reader(f"repos/{repo}/issues/{number}/comments?per_page=100")
+        if not isinstance(issue, dict) or not isinstance(comments, list):
+            raise RuntimeError("GitHub comment metadata has the wrong shape")
+        common_issue = {
+            "number": number, "state": "open", "title": current.title,
+            "html_url": issue.get("html_url", ""), "user": issue.get("user", {}),
+            "labels": issue.get("labels", []),
         }
-        if set(envelope) != required or envelope.get("schema") != "hermes.github-intake.v2":
-            raise RuntimeError("pinned GitHub intake validator returned an unexpected envelope")
-        if (not isinstance(envelope.get("scope"), list)
-                or any(not isinstance(value, str) for value in envelope["scope"])
-                or not isinstance(envelope.get("limits"), dict)
-                or any(not isinstance(key, str) or not isinstance(value, str)
-                       for key, value in envelope["limits"].items())
-                or not isinstance(envelope.get("risk"), str)):
-            raise RuntimeError("pinned GitHub intake validator returned malformed authority fields")
-        head_sha, digest = envelope.get("head_sha"), envelope.get("digest")
-        accepted = envelope.get("contract_accepted") is True and envelope.get("binding_status") == "pending"
-        if (envelope.get("item_key") != item_key or not isinstance(head_sha, str)
-                or not _SHA40_RE.fullmatch(head_sha) or not isinstance(digest, str)
-                or not _SHA64_RE.fullmatch(digest)):
-            raise RuntimeError("pinned GitHub intake validator returned a mismatched tuple")
-        return LiveContract(item_key, "open", head_sha, digest, accepted, title)
+        if isinstance(issue.get("pull_request"), dict):
+            common_issue["pull_request"] = issue["pull_request"]
+        for comment in reversed(comments):
+            if not isinstance(comment, dict) or type(comment.get("id")) is not int:
+                continue
+            payload = {
+                "action": "edited", "repository": {"full_name": repo},
+                "sender": {"login": "github-approval-reconciler"},
+                "issue": common_issue,
+                "comment": {
+                    "id": comment["id"], "body": comment.get("body", ""),
+                    "html_url": comment.get("html_url", ""), "user": comment.get("user", {}),
+                },
+            }
+            try:
+                candidate = self._from_envelope(
+                    item_key, current.title, self.intake_runner(payload)
+                )
+            except ContractRejected:
+                continue
+            if candidate.accepted and candidate.contract_digest_sha256 == expected_digest:
+                return candidate
+        return current
 
 
 class ApprovalWatchdog:
@@ -505,7 +558,15 @@ class ApprovalDecisionReconciler:
                 if row["response"] != "Approve":
                     results.append(self._finish(row, "stale", reason="unknown_decision"))
                     continue
-                live = self.live_reader(str(row["item_key"]))
+                digest_reader = getattr(self.live_reader, "for_digest", None)
+                if callable(digest_reader):
+                    live = digest_reader(
+                        str(row["item_key"]), str(row["contract_digest_sha256"])
+                    )
+                else:
+                    live = self.live_reader(str(row["item_key"]))
+                if not isinstance(live, LiveContract):
+                    raise RuntimeError("live approval reader returned the wrong type")
                 reason = self._stale_reason(row, live)
                 if reason is not None:
                     results.append(self._finish(row, "stale", reason=reason))
