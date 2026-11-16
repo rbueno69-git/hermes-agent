@@ -416,6 +416,10 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "synthesizer task."
             ),
         },
+        "continuation_parent_id": _prop("string", (
+            "Explicit terminal predecessor for a phase continuation. It must also appear in "
+            "parents; Hermes validates that exact edge instead of inferring phases from titles."
+        )),
         "tenant": _prop("string", (
                 "Optional namespace for multi-project isolation. "
                 "Defaults to HERMES_TENANT env if set."

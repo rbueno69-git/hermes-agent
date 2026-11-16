@@ -718,8 +718,18 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 
 @router.delete("/tasks/{task_id}")
 def delete_task(task_id: str, board: Optional[str] = Query(None)):
+    from hermes_cli.kanban_db_graph import ContinuationParentInUse
+
     with _board_conn(board) as (board, conn):
-        if not kanban_db.delete_task(conn, task_id):
+        try:
+            deleted = kanban_db.delete_task(conn, task_id)
+        except ContinuationParentInUse as exc:
+            raise HTTPException(status_code=409, detail={
+                "error": "continuation_parent_in_use",
+                "parent_id": exc.parent_id,
+                "child_id": exc.child_id,
+            }) from exc
+        if not deleted:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
         return {"deleted": True, "task_id": task_id}
 

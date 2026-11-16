@@ -147,6 +147,15 @@ async def _await_receipt(client, params, board_db, claim):
 def _exit_code(receipt, params, board_db):
     from hermes_cli.gateway_client import GatewayClientError
     if receipt['status'] == 'unknown':
+        # A managed worker records its exact run/claim result before the owner settles the
+        # admission. If the owner then classifies the interrupted admission as unknown, that
+        # immutable board result remains authoritative and prevents a misleading generic failure.
+        from gateway.session_kanban import worker_result
+        result = worker_result(board_db, params)
+        if result:
+            if result.get('last_output'):
+                print(result['last_output'])
+            return result.get('exit_code', 1)
         raise GatewayClientError('Kanban execution unknown; retained by owner')
     from gateway.session_kanban import worker_result
     result = worker_result(board_db, params)

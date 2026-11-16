@@ -469,6 +469,8 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
     _ptb_proxy_url: str | None = None  # set by _build_ptb_requests; error text then shows no detail
 
     MAX_MESSAGE_LENGTH = 4096
+    # Leave room to append a localized decision and an escaped 64-char Telegram first name.
+    _APPROVAL_RESOLUTION_RESERVE = 512
     supports_code_blocks = True  # MarkdownV2 renders fenced code blocks
     allow_from_covers_groups = True  # allow_from is global (DMs + groups); group_allow_from adds group-only users
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
@@ -3884,6 +3886,9 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         SendResult to return as-is), routed send, state hook, redacted failure log."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        flood_remaining = self._send_flood_cooldown_remaining(chat_id)
+        if flood_remaining is not None:
+            return _flood_cap_result(flood_remaining)
         try:
             built = build()
             if isinstance(built, SendResult):
@@ -3897,6 +3902,18 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             logger.warning("[%s] %s failed: %s", self.name, what, _redact_telegram_error_text(e))
+            retry_after = getattr(e, "retry_after", None)
+            total_seconds = getattr(retry_after, "total_seconds", None)
+            if callable(total_seconds):
+                retry_after = total_seconds()
+            if retry_after is not None:
+                try:
+                    wait = float(retry_after)
+                except (TypeError, ValueError):
+                    pass
+                else:
+                    if wait > 0:
+                        return self._record_send_flood_cooldown(chat_id, wait)
             return SendResult(success=False, error=_redact_telegram_error_text(e))
 
     @staticmethod
@@ -3992,16 +4009,23 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         """Render a clarify prompt: numbered buttons per choice plus "✏️ Other (type answer)" (flips to
         text-capture mode); without choices, plain question and the gateway text-intercept captures."""
         def build():
-            text = f"❓ {_html.escape(question)}"
+            raw_text = f"❓ {question}"
             keyboard = None
             if choices:
                 # Full option text in the body (mobile truncates button labels); buttons keep numeric labels.
-                text += "\n\n" + "\n".join(f"{i + 1}. {_html.escape(str(c))}" for i, c in enumerate(choices))
+                raw_text += "\n\n" + "\n".join(f"{i + 1}. {c}" for i, c in enumerate(choices))
                 # Telegram caps callback_data at 64 bytes; keep "cl:<id>:<idx>" short.
                 rows = [[InlineKeyboardButton(str(idx + 1), callback_data=f"cl:{clarify_id}:{idx}")] for idx in range(len(choices))]
                 if not (metadata or {}).get("is_approval_prompt"):
                     rows.append([InlineKeyboardButton(t("platform.telegram.prompt.other"), callback_data=f"cl:{clarify_id}:other")])
                 keyboard = InlineKeyboardMarkup(rows)
+            if (metadata or {}).get("is_approval_prompt"):
+                raw_text = self._ea_fit(
+                    raw_text,
+                    self.MAX_MESSAGE_LENGTH - self._APPROVAL_RESOLUTION_RESERVE
+                    - utf16_len(_html.escape("...")),
+                    escape=_html.escape)
+            text = _html.escape(raw_text)
             def remember(msg):
                 prompt = ClarifyPrompt.from_sent(session_key, msg)
                 self._clarify_state[clarify_id] = prompt
@@ -4054,10 +4078,41 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         app = self._app
         if app is None or app.bot is None:
             raise RuntimeError("Telegram application unavailable while retiring approval card")
-        await app.bot.edit_message_text(
-            chat_id=prompt.chat_id, message_id=int(prompt.message_id),
-            text=f"<i>{_html.escape(notice)}</i>",
-            parse_mode=ParseMode.HTML, reply_markup=None)
+        try:
+            await app.bot.edit_message_text(
+                chat_id=prompt.chat_id, message_id=int(prompt.message_id),
+                text=f"<i>{_html.escape(notice)}</i>",
+                parse_mode=ParseMode.HTML, reply_markup=None)
+        except Exception as exc:
+            from telegram.error import BadRequest
+            if not isinstance(exc, BadRequest) or str(exc).strip().casefold() != "message is not modified":
+                raise
+        self._approval_clarify_state.pop(clarify_id, None)
+
+    async def resolve_clarify_card(
+        self, clarify_id: str, original_text: str, decision: str, *, edit=None,
+        parse_mode=None,
+    ) -> None:
+        """Keep an approval request visible, append its decision, and remove only its buttons."""
+        text = f"{original_text.rstrip()}\n\n— {decision}" if original_text.strip() else decision
+        try:
+            if edit is not None:
+                await edit(text=text, parse_mode=parse_mode, reply_markup=None)
+            else:
+                prompt = self._approval_clarify_state.get(clarify_id)
+                if prompt is None or prompt.chat_id is None or prompt.message_id is None:
+                    raise RuntimeError("Telegram approval coordinates unavailable while resolving card")
+                app = self._app
+                if app is None or app.bot is None:
+                    raise RuntimeError("Telegram application unavailable while resolving approval card")
+                await app.bot.edit_message_text(
+                    chat_id=prompt.chat_id, message_id=int(prompt.message_id),
+                    text=text, parse_mode=parse_mode, reply_markup=None)
+        except Exception as exc:
+            from telegram.error import BadRequest
+            if not isinstance(exc, BadRequest) or str(exc).strip().casefold() != "message is not modified":
+                raise
+        self._clarify_state.pop(clarify_id, None)
         self._approval_clarify_state.pop(clarify_id, None)
 
     @staticmethod
@@ -4588,12 +4643,17 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         except Exception as exc:
             logger.error("[%s] slash-confirm callback failed: %s", self.name, exc, exc_info=True)
 
-    async def _retire_recorded_github_approval(self, broker, clarify_id: str, notice: str) -> None:
-        """Retire the native card, retaining durable retry intent when Telegram fails."""
+    async def _resolve_recorded_github_approval(
+        self, broker, clarify_id: str, query, original_text: str, decision: str,
+        *, parse_mode=None,
+    ) -> None:
+        """Preserve the approval request and durably remove only its buttons."""
         try:
-            await self.retire_clarify_card(clarify_id, notice)
+            await self.resolve_clarify_card(
+                clarify_id, original_text, decision, edit=query.edit_message_text,
+                parse_mode=parse_mode)
         except Exception:
-            logger.exception("[telegram] Could not retire durable GitHub approval card")
+            logger.exception("[telegram] Could not resolve durable GitHub approval card in place")
         else:
             broker.mark_card_retired(clarify_id)
 
@@ -4630,12 +4690,27 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                     return
                 approver_id = str(getattr(query.from_user, "id", "") or "unknown")
                 message = getattr(query, "message", None)
+                user_display = str(
+                    getattr(query.from_user, "first_name", None)
+                    or t("platform.telegram.user_fallback"))[:64]
+                label_key = "resolved_once" if durable_choice == "Approve" else "resolved_deny"
+                label = t(f"platform.telegram.approval.{label_key}")
+                decision_text = t(
+                    "platform.telegram.approval.resolved_by_user",
+                    label=label, user=_html.escape(user_display))
+                original_html = getattr(message, "text_html", None)
+                original_text = (
+                    str(original_html) if isinstance(original_html, str) and original_html
+                    else _html.escape(str(getattr(message, "text", "") or "")))
                 decision = broker.resolve_callback(
                     clarify_id, choice_index, approver=f"telegram:{approver_id}",
                     user_id=approver_id, chat_id=str(cb.get("chat_id", "")),
                     thread_id=str(cb["thread_id"]) if cb.get("thread_id") is not None else None,
                     message_id=str(getattr(message, "message_id", "") or ""),
-                    destination_id=destination_id)
+                    destination_id=destination_id,
+                    resolution_original_text=original_text,
+                    resolution_decision_text=decision_text,
+                    resolution_parse_mode=ParseMode.HTML)
                 if decision is None:
                     await self._notify_clarify_expired(query, approver_id)
                     return
@@ -4643,10 +4718,12 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 with contextlib.suppress(Exception):
                     from tools.clarify_gateway import resolve_gateway_clarify
                     resolve_gateway_clarify(clarify_id, durable_choice)
-                user_display = getattr(query.from_user, "first_name", None) or t("platform.telegram.user_fallback")
                 await query.answer(text=f"✓ {durable_choice[:60]}")
-                await self._retire_recorded_github_approval(
-                    broker, clarify_id, f"{user_display}: {durable_choice}")
+                await self._resolve_recorded_github_approval(
+                    broker, clarify_id, query,
+                    decision.resolution_original_text or original_text,
+                    decision.resolution_decision_text or decision_text,
+                    parse_mode=decision.resolution_parse_mode or ParseMode.HTML)
                 return
         prompt = await self._claim_callback_state(
             query, cb, self._clarify_state, clarify_id, _unauthorized(),
@@ -5293,7 +5370,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         closed locally (same ``flood_control:<s>`` result, so ledger recognition and redelivery timing are
         unchanged) instead of firing more requests into a penalty Telegram lengthens while it is hammered."""
         until: dict[str, float] = self.__dict__.setdefault("_telegram_send_cooldown_until", {})
-        until[str(normalize_telegram_chat_id(chat_id))] = asyncio.get_running_loop().time() + max(1.0, min(float(wait), 300.0))
+        until[str(normalize_telegram_chat_id(chat_id))] = asyncio.get_running_loop().time() + max(1.0, float(wait))
         return _flood_cap_result(wait)
 
     def _send_flood_cooldown_remaining(self, chat_id: Any) -> Optional[float]:

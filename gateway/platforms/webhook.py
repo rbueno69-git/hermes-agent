@@ -374,8 +374,33 @@ class WebhookAdapter(BasePlatformAdapter):
                 if broker is None:
                     continue
                 broker.recover_callbacks(target)
-                completed += await broker.retry_retirements(adapter=target, limit=16)
                 completed += len(await broker.retry_pending(adapter=target, limit=16))
+                completed += await broker.retry_retirements(adapter=target, limit=16)
+                from gateway.github_approval_reconciler import (
+                    ApprovalDecisionReconciler, IntakeScriptLiveReader,
+                )
+                from hermes_cli.kanban_db import kanban_db_path
+                from hermes_constants import get_hermes_home
+
+                home = get_hermes_home()
+                if broker.path != home / "state" / "github-approval-broker.db":
+                    continue
+                reconcilers = getattr(self, "_github_approval_reconcilers", None)
+                if not isinstance(reconcilers, dict):
+                    reconcilers = self._github_approval_reconcilers = {}
+                cache_key = str(home)
+                reconciler = reconcilers.get(cache_key)
+                if reconciler is None:
+                    reconciler = ApprovalDecisionReconciler(
+                        broker_path=broker.path,
+                        ledger_path=home / "github-intake" / "approvals.jsonl",
+                        kanban_path=kanban_db_path(),
+                        live_reader=IntakeScriptLiveReader(
+                            intake_script=home / "scripts" / "github-hermes-intake.py"),
+                        assignee=profile or "default",
+                    )
+                    reconcilers[cache_key] = reconciler
+                completed += len(await asyncio.to_thread(reconciler.reconcile, limit=16))
         return completed
 
     async def _github_approval_worker_loop(self) -> None:

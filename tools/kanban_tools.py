@@ -1140,6 +1140,7 @@ def _handle_create(args: dict, **kw) -> str:
             board=args.get("board"),
             project_source_task_id=project_source_task_id, triage=triage,
             creator_task_id=self_tid,
+            continuation_parent_id=args.get("continuation_parent_id"),
             idempotency_key=args.get("idempotency_key"),
             max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
             model_override=model_override, provider_override=provider_override,
