@@ -63,6 +63,31 @@ async def test_send_long_flood_fails_closed_without_inline_sleep(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_control_prompt_preserves_flood_retry_after_and_arms_chat_window():
+    """Clarify/button sends must not strip RetryAfter and hot-loop the Bot API."""
+    adapter = _make_adapter()
+    adapter._send_control_message = AsyncMock(side_effect=_FloodError(3600.0))
+
+    result = await adapter._send_prompt(
+        "send_clarify", "123", None,
+        lambda: ("Approve?", None, None),
+    )
+
+    assert result.success is False
+    assert result.error == "flood_control:3600.0"
+    assert result.retry_after == 3600.0
+    assert result.retryable is False
+    assert adapter._send_flood_cooldown_remaining("123") > 3500.0
+    adapter._send_control_message.reset_mock()
+    refused = await adapter._send_prompt(
+        "send_clarify", "123", None,
+        lambda: ("Approve?", None, None),
+    )
+    assert refused.error.startswith("flood_control:")
+    adapter._send_control_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_send_short_flood_still_retries_inline(monkeypatch):
     """Waits of a few seconds keep the existing inline retry."""
     adapter = _make_adapter()

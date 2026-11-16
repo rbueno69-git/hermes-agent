@@ -105,8 +105,11 @@ async def test_changed_digest_or_head_supersedes_and_reissues(tmp_path):
 
     assert first.action == "sent" and second.action == "sent"
     assert len(adapter.sent) == 2
-    assert adapter.retired == [(first.clarify_id, "Superseded by a newer GitHub contract")]
-    assert broker.observe(proposal())["state"] == "superseded"
+    assert adapter.retired == []
+    observed_old = broker.observe(proposal())
+    assert observed_old is not None
+    assert observed_old["state"] == "superseded"
+    assert observed_old["retirement_pending"] == 0
     assert broker.observe(changed)["state"] == "active"
 
 
@@ -231,18 +234,21 @@ async def test_identical_approved_tuple_replays_decision_without_republishing(tm
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["closed", "merged", "superseded"])
-async def test_terminal_item_status_retires_active_buttons(tmp_path, status):
+async def test_terminal_item_status_fail_closes_active_buttons_locally(tmp_path, status):
     adapter = TelegramStub()
     broker = GitHubApprovalBroker(tmp_path / "approvals.db", instance_id="gateway")
-    sent = await broker.request(
+    await broker.request(
         proposal(), adapter=adapter, chat_id="42", question="approve",
         session_key="webhook:1", authorized_user_id="7")
 
     retired = await broker.retire_item(proposal().item_key, status=status, adapter=adapter)
 
     assert retired == 1
-    assert adapter.retired == [(sent.clarify_id, f"GitHub item {status}")]
-    assert broker.observe(proposal())["state"] == "superseded"
+    assert adapter.retired == []
+    observed = broker.observe(proposal())
+    assert observed is not None
+    assert observed["state"] == "superseded"
+    assert observed["retirement_pending"] == 0
 
 
 @pytest.mark.asyncio
@@ -358,7 +364,7 @@ async def test_async_completion_status_cannot_orphan_active_card(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_inflight_supersession_retires_card_sent_after_generation_changed(tmp_path):
+async def test_inflight_supersession_fail_closes_card_sent_after_generation_changed(tmp_path):
     class BarrierTelegram(TelegramStub):
         def __init__(self):
             super().__init__()
@@ -389,12 +395,14 @@ async def test_inflight_supersession_retires_card_sent_after_generation_changed(
 
     assert sent_new.action == "sent"
     assert stale.action == "superseded"
-    assert adapter.retired.count((stale.clarify_id, "Superseded during delivery")) == 1
-    assert set(adapter._clarify_state) == {sent_new.clarify_id}
+    assert adapter.retired == []
+    observed = broker.observe(old)
+    assert observed is not None
+    assert observed["retirement_pending"] == 0
 
 
 @pytest.mark.asyncio
-async def test_terminal_close_during_send_retires_late_card(tmp_path):
+async def test_terminal_close_during_send_fail_closes_late_card_locally(tmp_path):
     class BarrierTelegram(TelegramStub):
         def __init__(self):
             super().__init__()
@@ -419,8 +427,10 @@ async def test_terminal_close_during_send_retires_late_card(tmp_path):
     outcome = await sending
 
     assert outcome.action == "superseded"
-    assert adapter.retired[-1] == (outcome.clarify_id, "Superseded during delivery")
-    assert adapter._clarify_state == {}
+    assert adapter.retired == []
+    observed = broker.observe(proposal())
+    assert observed is not None
+    assert observed["retirement_pending"] == 0
 
 
 def test_multiprocess_outbox_claim_has_one_transport_sender(tmp_path):
@@ -469,7 +479,7 @@ def test_crash_after_reservation_before_send_is_reclaimed_after_bounded_lease(tm
 
 
 @pytest.mark.asyncio
-async def test_failed_terminal_retirement_is_durable_and_retried(tmp_path):
+async def test_terminal_retirement_never_calls_failing_cosmetic_edit(tmp_path):
     class FailingRetire(TelegramStub):
         async def retire_clarify_card(self, clarify_id, notice):
             raise TimeoutError("edit failed")
@@ -480,14 +490,12 @@ async def test_failed_terminal_retirement_is_durable_and_retried(tmp_path):
         proposal(), adapter=publisher, chat_id="42", question="approve",
         session_key="webhook:1", authorized_user_id="7")
     await broker.retire_item(proposal().item_key, status="closed", adapter=FailingRetire())
-    assert broker.observe(proposal())["retirement_pending"] == 1
-
-    assert await broker.retry_retirements(adapter=publisher) == 1
     assert broker.observe(proposal())["retirement_pending"] == 0
+    assert await broker.retry_retirements(adapter=publisher) == 0
 
 
 @pytest.mark.asyncio
-async def test_failed_supersession_retirement_is_durable(tmp_path):
+async def test_supersession_never_calls_failing_cosmetic_edit(tmp_path):
     class FailSecondRetire(TelegramStub):
         async def retire_clarify_card(self, clarify_id, notice):
             raise TimeoutError("edit failed")
@@ -502,7 +510,10 @@ async def test_failed_supersession_retirement_is_durable(tmp_path):
     outcome = await broker.request(
         changed, adapter=failing, chat_id="42",
         question="new", session_key="webhook:2", authorized_user_id="7")
-    assert outcome.action == "pending_retry"
-    assert failing.sent == []
-    assert broker.observe(proposal())["retirement_pending"] == 1
-    assert broker.observe(changed)["state"] == "pending_notification"
+    assert outcome.action == "sent"
+    assert len(failing.sent) == 1
+    observed_old = broker.observe(proposal())
+    observed_new = broker.observe(changed)
+    assert observed_old is not None and observed_new is not None
+    assert observed_old["retirement_pending"] == 0
+    assert observed_new["state"] == "active"

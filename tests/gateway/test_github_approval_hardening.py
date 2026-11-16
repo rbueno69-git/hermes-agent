@@ -71,6 +71,28 @@ async def test_unknown_provider_send_outcome_is_never_retried(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_pending_delivery_retry_after_is_persisted_and_suppresses_hot_loop(tmp_path):
+    path = tmp_path / "approval.db"
+    broker = GitHubApprovalBroker(path, instance_id="one")
+    limited = BoundTelegram()
+    limited.send_clarify = AsyncMock(
+        return_value=SendResult(success=False, error="flood_control:3600", retry_after=3600))
+
+    outcome = await broker.request(
+        proposal(), adapter=limited, chat_id="42", question="Approve?",
+        session_key="webhook:1", authorized_user_id="7")
+    assert outcome.action == "pending_retry"
+    limited.send_clarify.assert_awaited_once()
+
+    fresh = GitHubApprovalBroker(path, instance_id="two")
+    suppressed = BoundTelegram()
+    suppressed.send_clarify = AsyncMock(return_value=SendResult(success=True, message_id="501"))
+    assert await fresh.retry_pending(adapter=suppressed) == []
+    suppressed.send_clarify.assert_not_awaited()
+    assert fresh.observe(proposal())["delivery_retry_after"] > time.time() + 3500
+
+
+@pytest.mark.asyncio
 async def test_webhook_binding_is_checked_on_delegated_telegram_adapter(tmp_path):
     target = BoundTelegram()
     runner = MagicMock()
@@ -148,6 +170,24 @@ async def test_telegram_retire_clarify_card_removes_binding_and_keyboard():
 
 
 @pytest.mark.asyncio
+async def test_telegram_retirement_treats_already_retired_card_as_success():
+    from telegram.error import BadRequest
+
+    adapter = object.__new__(TelegramAdapter)
+    adapter._clarify_state = {"gha-id": "session"}
+    adapter._approval_clarify_state = {
+        "gha-id": ClarifyPrompt("session", "42", "501", None)}
+    edit = AsyncMock(side_effect=BadRequest("Message is not modified"))
+    adapter._app = SimpleNamespace(bot=SimpleNamespace(edit_message_text=edit))
+
+    await adapter.retire_clarify_card("gha-id", "Superseded")
+
+    assert "gha-id" not in adapter._clarify_state
+    assert "gha-id" not in adapter._approval_clarify_state
+    edit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_telegram_retirement_failure_keeps_coordinates_for_verified_retry():
     adapter = object.__new__(TelegramAdapter)
     adapter._clarify_state = {"gha-id": "session"}
@@ -167,7 +207,7 @@ async def test_telegram_retirement_failure_keeps_coordinates_for_verified_retry(
 
 
 @pytest.mark.asyncio
-async def test_restart_rebuilds_terminal_retirement_coordinates_without_callback(tmp_path):
+async def test_restart_has_no_terminal_retirement_backlog(tmp_path):
     broker = GitHubApprovalBroker(tmp_path / "approval.db", instance_id="one")
     target = BoundTelegram()
     sent = await broker.request(
@@ -186,9 +226,39 @@ async def test_restart_rebuilds_terminal_retirement_coordinates_without_callback
     edit = AsyncMock()
     fresh._app = SimpleNamespace(bot=SimpleNamespace(edit_message_text=edit))
 
-    assert await broker.retry_retirements(adapter=fresh) == 1
-    edit.assert_awaited_once()
+    assert await broker.retry_retirements(adapter=fresh) == 0
+    edit.assert_not_awaited()
     assert sent.clarify_id not in fresh._clarify_state
+
+
+@pytest.mark.asyncio
+async def test_retirement_retry_after_is_persisted_and_suppresses_hot_loop(tmp_path):
+    class FloodLimited(Exception):
+        def __init__(self, retry_after):
+            super().__init__(f"retry in {retry_after}")
+            self.retry_after = retry_after
+
+    path = tmp_path / "approval.db"
+    broker = GitHubApprovalBroker(path, instance_id="one")
+    target = BoundTelegram()
+    sent = await broker.request(
+        proposal(), adapter=target, chat_id="42", question="Approve?",
+        session_key="webhook:1", authorized_user_id="7")
+    broker.resolve_callback(
+        sent.clarify_id, 0, approver="telegram:7", user_id="7", chat_id="42",
+        thread_id=None, message_id="501", destination_id="telegram-bot:501")
+
+    limited = BoundTelegram()
+    limited.retire_clarify_card = AsyncMock(side_effect=FloodLimited(3600))
+    assert await broker.retry_retirements(adapter=limited) == 0
+    limited.retire_clarify_card.assert_awaited_once()
+
+    fresh = GitHubApprovalBroker(path, instance_id="two")
+    suppressed = BoundTelegram()
+    suppressed.retire_clarify_card = AsyncMock()
+    assert await fresh.retry_retirements(adapter=suppressed) == 0
+    suppressed.retire_clarify_card.assert_not_awaited()
+    assert fresh.observe(proposal())["retirement_retry_after"] > time.time() + 3500
 
 
 @pytest.mark.asyncio
@@ -217,6 +287,44 @@ async def test_retirement_flood_control_cools_due_destination_batch_and_stops(tm
     limited.retire_clarify_card.assert_awaited_once()
     for candidate in proposals:
         assert broker.observe(candidate)["retirement_retry_after"] > time.time() + 3500
+
+
+@pytest.mark.asyncio
+async def test_superseded_cards_settle_locally_without_telegram_edit_or_retry_backlog(tmp_path):
+    broker = GitHubApprovalBroker(tmp_path / "approval.db", instance_id="one")
+    target = BoundTelegram()
+    old = proposal()
+    await broker.request(
+        old, adapter=target, chat_id="42", question="Approve?",
+        session_key="webhook:1", authorized_user_id="7")
+    target.retire_clarify_card = AsyncMock(side_effect=AssertionError("must not edit stale Telegram cards"))
+
+    outcome = await broker.request(
+        proposal(head="c" * 40), adapter=target, chat_id="42", question="Approve newer?",
+        session_key="webhook:2", authorized_user_id="7")
+
+    assert outcome.action == "sent"
+    target.retire_clarify_card.assert_not_awaited()
+    assert broker.observe(old)["state"] == "superseded"
+    assert broker.observe(old)["retirement_pending"] == 0
+    assert await broker.retry_retirements(adapter=target) == 0
+
+
+@pytest.mark.asyncio
+async def test_terminal_cards_settle_locally_without_telegram_edit_or_retry_backlog(tmp_path):
+    broker = GitHubApprovalBroker(tmp_path / "approval.db", instance_id="one")
+    target = BoundTelegram()
+    sent = await broker.request(
+        proposal(), adapter=target, chat_id="42", question="Approve?",
+        session_key="webhook:1", authorized_user_id="7")
+    target.retire_clarify_card = AsyncMock(side_effect=AssertionError("must not edit stale Telegram cards"))
+
+    assert await broker.retire_item(proposal().item_key, status="closed", adapter=target) == 1
+
+    target.retire_clarify_card.assert_not_awaited()
+    assert broker.observe_key(sent.proposal_key)["state"] == "superseded"
+    assert broker.observe_key(sent.proposal_key)["retirement_pending"] == 0
+    assert await broker.retry_retirements(adapter=target) == 0
 
 
 @pytest.mark.asyncio
@@ -323,7 +431,8 @@ async def test_pull_request_terminal_event_retires_existing_card(tmp_path, monke
 
     assert response.status == 202
     assert broker.observe(proposal())["state"] == "superseded"
-    assert target.retired == [("gha-" + proposal().canonical_key()[:24], f"GitHub item {expected}")]
+    assert target.retired == []
+    assert broker.observe(proposal())["retirement_pending"] == 0
 
 
 @pytest.mark.asyncio
