@@ -255,6 +255,7 @@ def run_once(*, dry_run: bool) -> dict:
         projected = [] if dry_run else project_pending_decisions()
         candidates, start, total = _candidate_items()
         actionable = actionable_items()
+        approval_candidates = snapshot_candidates()
         emitted: list[str] = []
         for item_key in sorted(candidates):
             payload = live_payload(item_key)
@@ -264,7 +265,13 @@ def run_once(*, dry_run: bool) -> dict:
                     continue
             else:
                 envelope = validated_envelope(payload)
-                if envelope is None or envelope.get("contract_accepted") is not True:
+                if envelope is None:
+                    if item_key in approval_candidates:
+                        raise RuntimeError(
+                            f"candidate item rejected by Hermes intake: {item_key}"
+                        )
+                    continue
+                if envelope.get("contract_accepted") is not True:
                     continue
                 if has_current_tuple(item_key, envelope):
                     continue

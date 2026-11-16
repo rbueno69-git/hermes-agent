@@ -91,6 +91,29 @@ def test_cursor_advances_only_after_every_candidate_is_processed(tmp_path, monke
     assert not module.CURSOR.exists()
 
 
+def test_snapshot_candidate_rejected_by_intake_does_not_advance_cursor(tmp_path, monkeypatch):
+    module = _load()
+    module.CURSOR = tmp_path / "cursor.json"
+    module.CHANGES = tmp_path / "changes.jsonl"
+    module.SNAPSHOT = tmp_path / "snapshot.json"
+    module.BROKER = tmp_path / "broker.db"
+    module.LEDGER = tmp_path / "approvals.jsonl"
+    module.LOCK = tmp_path / "maintenance.lock"
+    module.CHANGES.write_text(json.dumps({"id": ITEM}) + "\n", encoding="utf-8")
+    module.SNAPSHOT.write_text(json.dumps({"items": [
+        {"id": ITEM, "observation": "unassigned_approval_candidate"},
+    ]}), encoding="utf-8")
+    monkeypatch.setattr(module, "project_pending_decisions", list)
+    monkeypatch.setattr(module, "actionable_items", lambda: set())
+    monkeypatch.setattr(module, "live_payload", lambda _item: {"action": "edited"})
+    monkeypatch.setattr(module, "validated_envelope", lambda _payload: None)
+
+    with pytest.raises(RuntimeError, match="candidate item rejected by Hermes intake"):
+        module.run_once(dry_run=False)
+
+    assert not module.CURSOR.exists()
+
+
 def test_snapshot_only_contract_is_not_replayed_without_new_change(tmp_path, monkeypatch):
     module = _load()
     module.CURSOR = tmp_path / "cursor.json"
