@@ -213,6 +213,7 @@ class GatewayKanbanWatchersMixin:
         toggle which is re-read every tick. The env var is an escape hatch to
         disable without editing YAML.
         """
+        self._kanban_dispatcher_lock_contended = False
         try:
             from hermes_cli.config import load_config as _load_config
         except Exception:
@@ -243,8 +244,9 @@ class GatewayKanbanWatchersMixin:
         _lock_path = _kb.kanban_home() / "kanban" / ".dispatcher.lock"
         _lock_handle, _lock_state = _acquire_singleton_lock(_lock_path)
         if _lock_state == "contended":
+            self._kanban_dispatcher_lock_contended = True
             logger.info("kanban dispatcher: another gateway already holds the dispatcher "
-                        "lock (%s); this gateway will NOT dispatch.", _lock_path)
+                        "lock (%s); this gateway will retry ownership.", _lock_path)
             return None
         if _lock_state == "held":
             self._kanban_dispatcher_lock_handle = _lock_handle  # hold for process lifetime
@@ -263,8 +265,14 @@ class GatewayKanbanWatchersMixin:
         failure never stops the next. Shutdown: ``self._running`` is checked
         between ticks and the in-flight ``to_thread`` returns on its own.
         """
-        boot = self._kanban_dispatcher_boot()
-        if boot is None:
+        while getattr(self, "_running", False):
+            boot = self._kanban_dispatcher_boot()
+            if boot is not None:
+                break
+            if not getattr(self, "_kanban_dispatcher_lock_contended", False):
+                return
+            await self._sleep_between_ticks(1.0)
+        else:
             return
         _load_config, _kb, kanban_cfg = boot
         settings = _resolve_dispatcher_settings(kanban_cfg, _kb)

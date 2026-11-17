@@ -84,6 +84,14 @@ def test_kanban_guidance_requires_worker_task_at_agent_init(monkeypatch, task_id
     assert (agent._kanban_worker_guidance == KANBAN_GUIDANCE) is expected
 
 
+def test_kanban_guidance_forbids_summary_only_actionable_followups():
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    assert "Never leave actionable follow-up work only in the completion summary" in KANBAN_GUIDANCE
+    assert "pass every captured id in `kanban_complete(created_cards=[...])`" in KANBAN_GUIDANCE
+    assert "ready reserve" in KANBAN_GUIDANCE
+
+
 @pytest.mark.parametrize("task_id, owner, expected", [
     (None, True, False),        # interactive session with the kanban toolset enabled
     ("t_worker", True, True),   # the dispatcher-owned worker

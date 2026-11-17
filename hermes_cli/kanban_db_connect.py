@@ -204,6 +204,38 @@ def _dispatch_tick_lock(db_path: Path):
                 handle.close()
 
 
+@contextlib.contextmanager
+def _host_dispatch_admission_lock():
+    """Serialize admission decisions that consume host-wide worker caps.
+
+    Board locks protect one SQLite database, but global and per-profile caps
+    read every board before claiming work. Without one host-level critical
+    section, two boards can both observe the same free slot and over-admit.
+    Fail closed: a cap is a safety boundary, so an unavailable lock skips the
+    tick rather than silently multiplying capacity.
+    """
+    lock_path = _kb.kanban_home() / "kanban" / ".host-dispatch-admission.lock"
+    handle = None
+    acquired = False
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("a+b")
+        acquired = _try_lock_nb(handle)
+    except (OSError, AttributeError):
+        acquired = False
+    try:
+        yield acquired
+    finally:
+        if handle is not None:
+            try:
+                if acquired:
+                    _unlock(handle)
+            except (OSError, AttributeError):
+                pass
+            finally:
+                handle.close()
+
+
 # Periodic explicit WAL checkpoint from the dispatcher tick: a passive
 # autocheckpoint can be starved on a busy multi-process board (any open reader
 # snapshot blocks the WAL reset), letting -wal grow between gateway restarts.

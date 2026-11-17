@@ -52,12 +52,12 @@ def conn(kanban_home):
 
 
 def _orphan_running(conn, tid, *, claim_lock=None, claim_expires=None,
-                    worker_pid=None):
+                    worker_pid=None, worker_started_at=None):
     """Force a task into running with (partially) broken claim bookkeeping."""
     conn.execute(
         "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
-        "worker_pid=? WHERE id=?",
-        (claim_lock, claim_expires, worker_pid, tid),
+        "worker_pid=?, worker_started_at=? WHERE id=?",
+        (claim_lock, claim_expires, worker_pid, worker_started_at, tid),
     )
     conn.commit()
 
@@ -117,16 +117,36 @@ class TestReconcileOrphanedRunning:
             "SELECT status FROM tasks WHERE id=?", (tid,)
         ).fetchone()["status"] == "running"
 
-    def test_live_worker_pid_defers_reconcile(self, conn):
-        """If the orphan row still records a live PID on this host, don't
-        requeue beside a possibly-alive worker — defer to the next tick."""
+    def test_legacy_live_pid_orphan_is_quarantined(self, conn):
+        """A legacy PID without a fingerprint cannot occupy host capacity forever."""
         tid = kb.create_task(conn, title="maybe-alive", assignee="w")
         sleeper = subprocess.Popen(["sleep", "30"])
         try:
             _orphan_running(conn, tid, worker_pid=sleeper.pid)
+            assert kbd.reconcile_orphaned_running(conn) == [tid]
+            row = conn.execute(
+                "SELECT status, block_kind, worker_pid FROM tasks WHERE id=?", (tid,),
+            ).fetchone()
+            assert row["status"] == "blocked"
+            assert row["block_kind"] == "capability"
+            assert row["worker_pid"] is None
+        finally:
+            sleeper.terminate()
+            sleeper.wait()
+
+    def test_fingerprinted_live_worker_still_defers_reconcile(self, conn):
+        """A verified live worker is not duplicated or quarantined."""
+        tid = kb.create_task(conn, title="verified-alive", assignee="w")
+        sleeper = subprocess.Popen(["sleep", "30"])
+        try:
+            fingerprint = kbd._process_fingerprint(sleeper.pid)
+            assert fingerprint is not None
+            _orphan_running(
+                conn, tid, worker_pid=sleeper.pid, worker_started_at=fingerprint,
+            )
             assert kbd.reconcile_orphaned_running(conn) == []
             assert conn.execute(
-                "SELECT status FROM tasks WHERE id=?", (tid,)
+                "SELECT status FROM tasks WHERE id=?", (tid,),
             ).fetchone()["status"] == "running"
         finally:
             sleeper.terminate()

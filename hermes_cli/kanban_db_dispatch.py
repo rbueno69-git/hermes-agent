@@ -873,11 +873,52 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
             continue
         tid = row["id"]
         pid = row["worker_pid"]
-        if pid and _worker_alive(pid, _kb._row_get(row, "worker_started_at")):
-            # Never requeue beside a live process. Retry next tick.
+        worker_started_at = _kb._row_get(row, "worker_started_at")
+        if pid and _worker_alive(pid, worker_started_at):
+            if worker_started_at is None:
+                # A legacy orphan has only a bare PID. That PID may have been
+                # recycled after a reboot, so deferring forever lets an unrelated
+                # process consume host capacity indefinitely. Quarantine instead
+                # of requeueing: this frees the cap without spawning beside a
+                # possibly-live historical worker.
+                with _kb.write_txn(conn):
+                    if owner_reclaim_blocked(conn, tid):
+                        continue
+                    cur = conn.execute(
+                        "UPDATE tasks SET status = 'blocked', block_kind = 'capability', "
+                        "block_recurrences = 1, claim_lock = NULL, claim_expires = NULL, "
+                        "worker_pid = NULL, worker_started_at = NULL, last_heartbeat_at = NULL "
+                        "WHERE id = ? AND status = 'running' "
+                        "  AND claim_lock IS ? AND claim_expires IS ? "
+                        "  AND worker_pid IS ? AND worker_started_at IS NULL",
+                        (tid, row["claim_lock"], row["claim_expires"], pid),
+                    )
+                    if cur.rowcount != 1:
+                        continue
+                    payload = {
+                        "reason": "legacy_live_pid_unverifiable",
+                        "worker_pid": int(pid),
+                        "now": now,
+                    }
+                    run_id = _kb._end_run(
+                        conn, tid,
+                        outcome="blocked", status="blocked",
+                        error="legacy orphan has a live PID without a process fingerprint",
+                        metadata=payload,
+                    )
+                    _kb._insert_comment(
+                        conn, tid, "dispatcher",
+                        "reconciliation: legacy orphan had a live PID but no process "
+                        "fingerprint — quarantined to avoid PID-reuse starvation",
+                        now,
+                    )
+                    _kb._append_event(conn, tid, "blocked", payload, run_id=run_id)
+                    reconciled.append(tid)
+                continue
+            # Never requeue beside a verified live process. Retry next tick.
             _kb._log.debug(
                 "kanban reconcile: task %s has broken claim bookkeeping but "
-                "pid %s is alive on this host — deferring", tid, pid,
+                "fingerprinted pid %s is alive on this host — deferring", tid, pid,
             )
             continue
         with _kb.write_txn(conn):
@@ -1921,41 +1962,84 @@ def count_running_tasks(conn: sqlite3.Connection) -> int:
         return 0
 
 
-def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
+def count_running_tasks_other_boards(board: Optional[str] = None) -> Optional[int]:
     """Total ``running`` tasks across every board EXCEPT ``board``.
 
     Caps bound the HOST, but each board's tick only sees its own DB; without
     this a derived cap of N gets multiplied by the number of active boards.
     Boards are matched by resolved DB path, so ``HERMES_KANBAN_DB`` (pins every
-    board to one file) yields 0. Fails open per board.
+    board to one file) yields 0. Returns ``None`` when any active board cannot
+    be enumerated or read: an incomplete snapshot must never authorize another
+    worker under a host-wide cap.
     """
     try:
         current_path = str(_kb.kanban_db_path(board=board).expanduser().resolve())
-    except Exception:
-        current_path = None
-    try:
         boards = _kb.list_boards(include_archived=False)
     except Exception:
-        return 0
+        return None
     total = 0
     for meta in boards:
         slug = meta.get("slug") or _kb.DEFAULT_BOARD
         try:
             path = _kb.kanban_db_path(board=slug).expanduser()
             resolved = str(path.resolve())
-            if current_path is not None and resolved == current_path:
+            if resolved == current_path:
                 continue
             if not path.exists():
                 continue
             other = _kbc.connect(board=slug)
             try:
-                total += count_running_tasks(other)
+                total += int(other.execute(
+                    "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+                ).fetchone()[0])
             finally:
                 with contextlib.suppress(Exception):
                     other.close()
         except Exception:
-            continue
+            return None
     return total
+
+
+def count_running_tasks_by_assignee_other_boards(
+    board: Optional[str] = None,
+) -> Optional[dict[str, int]]:
+    """Host-wide per-profile running counts excluding ``board``.
+
+    A profile shares provider/browser resources across boards, so its cap is a
+    host boundary. Returns ``None`` on any incomplete cross-board snapshot so
+    admission fails closed rather than multiplying the configured cap.
+    """
+    try:
+        current_path = str(_kb.kanban_db_path(board=board).expanduser().resolve())
+        boards = _kb.list_boards(include_archived=False)
+    except Exception:
+        return None
+    counts: dict[str, int] = {}
+    for meta in boards:
+        slug = meta.get("slug") or _kb.DEFAULT_BOARD
+        try:
+            path = _kb.kanban_db_path(board=slug).expanduser()
+            resolved = str(path.resolve())
+            if resolved == current_path:
+                continue
+            if not path.exists():
+                continue
+            other = _kbc.connect(board=slug)
+            try:
+                rows = other.execute(
+                    "SELECT assignee, COUNT(*) AS n FROM tasks "
+                    "WHERE status = 'running' AND assignee IS NOT NULL "
+                    "GROUP BY assignee"
+                ).fetchall()
+                for row in rows:
+                    name = row["assignee"]
+                    counts[name] = counts.get(name, 0) + int(row["n"])
+            finally:
+                with contextlib.suppress(Exception):
+                    other.close()
+        except Exception:
+            return None
+    return counts
 
 
 def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
@@ -1998,7 +2082,9 @@ def dispatch_once(
     so two dispatchers on one ``kanban.db`` never race a write tick on WAL
     frames. The loser returns an empty ``DispatchResult`` with
     ``skipped_locked=True`` and writes nothing; the lock is keyed on the
-    resolved DB path so unrelated boards tick in parallel.
+    resolved DB path so unrelated boards tick in parallel. Ticks enforcing a
+    host-wide global or per-profile cap additionally share one host admission
+    lock, making the cross-board snapshot-and-claim decision atomic.
     """
     def _locked_tick() -> DispatchResult:
         return _dispatch_once_locked(
@@ -2027,9 +2113,22 @@ def dispatch_once(
         if not held:
             result = DispatchResult(skipped_locked=True)
         else:
-            result = _locked_tick()
-            # Still under the dispatch lock: periodic PASSIVE WAL checkpoint.
-            _kbc._maybe_checkpoint_wal(conn, db_path)
+            host_cap_active = max_in_progress is not None or (
+                isinstance(max_in_progress_per_profile, int)
+                and not isinstance(max_in_progress_per_profile, bool)
+                and max_in_progress_per_profile > 0
+            )
+            if host_cap_active:
+                with _kbc._host_dispatch_admission_lock() as host_held:
+                    if not host_held:
+                        result = DispatchResult(skipped_locked=True)
+                    else:
+                        result = _locked_tick()
+            else:
+                result = _locked_tick()
+            if not result.skipped_locked:
+                # Still under the dispatch lock: periodic PASSIVE WAL checkpoint.
+                _kbc._maybe_checkpoint_wal(conn, db_path)
     # Lock released. Fire the tick observer strictly OUTSIDE the critical
     # section: a slow subscriber must never stall a sibling dispatcher's tick.
     _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
@@ -2263,7 +2362,15 @@ def _tick_spawn_budget(
         spawn_budget = max_spawn - running_count
 
     if max_in_progress is not None:
-        total_running = running_count + count_running_tasks_other_boards(board)
+        other_running = count_running_tasks_other_boards(board)
+        if other_running is None:
+            result.skipped_locked = True
+            _kb._log.warning(
+                "kanban dispatch: incomplete cross-board running snapshot; "
+                "host-wide admission skipped"
+            )
+            return False, None
+        total_running = running_count + other_running
         if total_running >= max_in_progress:
             return False, None
         remaining = max_in_progress - total_running
@@ -2407,6 +2514,16 @@ def _dispatch_once_locked(
             "GROUP BY assignee"
         ):
             per_profile_running[prow["assignee"]] = int(prow["n"])
+        other_profile_running = count_running_tasks_by_assignee_other_boards(board)
+        if other_profile_running is None:
+            result.skipped_locked = True
+            _kb._log.warning(
+                "kanban dispatch: incomplete cross-board profile snapshot; "
+                "host-wide admission skipped"
+            )
+            return result
+        for assignee, n in other_profile_running.items():
+            per_profile_running[assignee] = per_profile_running.get(assignee, 0) + n
     # Review-lane reservation: the ready loop runs first and would otherwise
     # consume the ENTIRE shared budget, starving reviews under a sustained ready
     # backlog. When spawnable review work exists and there is any budget, hold
@@ -2424,21 +2541,30 @@ def _dispatch_once_locked(
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
-    for row in ready_rows:
-        if ready_budget is not None and spawned >= ready_budget:
-            break
+    attempted_ready: set[str] = set()
+
+    def _try_ready(row: sqlite3.Row) -> bool:
+        row_id = row["id"]
+        attempted_ready.add(row_id)
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee so an unassigned task doesn't
             # park in 'ready' forever.
             if not default_assignee or not _apply_default_assignee(
-                conn, row["id"], default_assignee, dry_run=dry_run,
+                conn, row_id, default_assignee, dry_run=dry_run,
             ):
-                result.skipped_unassigned.append(row["id"])
-                continue
+                result.skipped_unassigned.append(row_id)
+                return False
             row_assignee = default_assignee
-            result.auto_assigned_default.append(row["id"])
-        if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs):
+            result.auto_assigned_default.append(row_id)
+        return _dispatch_lane_task(
+            conn, row, row_assignee, result, lane="ready", **lane_kwargs,
+        )
+
+    for row in ready_rows:
+        if ready_budget is not None and spawned >= ready_budget:
+            break
+        if _try_ready(row):
             spawned += 1
 
     # A review agent (sdlc-review) approves (→ done) or requests changes
@@ -2453,6 +2579,17 @@ def _dispatch_once_locked(
             continue
         if _dispatch_lane_task(conn, row, row["assignee"], result, lane="review", **lane_kwargs):
             spawned += 1
+
+    # The review reservation is a fairness hint, not consumed capacity. If all
+    # review launches fail, return the unused slot to ready work this tick.
+    if spawn_budget is not None and spawned < spawn_budget:
+        for row in ready_rows:
+            if row["id"] in attempted_ready:
+                continue
+            if spawned >= spawn_budget:
+                break
+            if _try_ready(row):
+                spawned += 1
     return result
 
 
