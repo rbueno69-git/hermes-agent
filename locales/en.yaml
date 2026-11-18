@@ -1251,6 +1251,7 @@ platform:
       action_deny: "❌ Deny"
       toast_invalid_data: "Invalid approval data."
       toast_already_resolved: "This approval has already been resolved."
+      superseded: "This approval was superseded by a newer GitHub revision."
       resolved_once: "✅ Approved once"
       resolved_session: "✅ Approved for session"
       resolved_always: "✅ Approved permanently"

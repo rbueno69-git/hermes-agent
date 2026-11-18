@@ -109,6 +109,47 @@ async def test_failed_edit_retries_exact_persisted_resolution_after_restart(tmp_
 
 
 @pytest.mark.asyncio
+async def test_superseded_github_card_is_not_reported_as_expired(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    old = ApprovalProposal("owner/repo#500", "a" * 40, "b" * 64)
+    newer = ApprovalProposal("owner/repo#500", "c" * 40, "d" * 64)
+    broker = default_broker(instance_id="publisher")
+    sender = SendingTelegram()
+    sent = await broker.request(
+        old, adapter=sender, chat_id="42", question="Approve old head?",
+        session_key="webhook:old", authorized_user_id="7")
+    await broker.request(
+        newer, adapter=sender, chat_id="42", question="Approve new head?",
+        session_key="webhook:new", authorized_user_id="7")
+
+    adapter = object.__new__(TelegramAdapter)
+    adapter._clarify_state = {}
+    adapter._approval_clarify_state = {}
+    adapter._bot = SimpleNamespace(id=501)
+    adapter._callback_authorized = AsyncMock(return_value=True)
+    adapter._edit_html_quiet = AsyncMock()
+    adapter._notify_clarify_expired = AsyncMock(
+        side_effect=AssertionError("superseded is not expired"))
+    query = SimpleNamespace(
+        from_user=SimpleNamespace(id=7, first_name="Rogerio"),
+        message=SimpleNamespace(
+            text="Approve old head?", text_html="<b>Approve old head?</b>", message_id=501),
+        answer=AsyncMock(), edit_message_text=AsyncMock())
+
+    await adapter._handle_clarify_callback(
+        query, f"cl:{sent.clarify_id}:0",
+        {"chat_id": 42, "chat_type": "private", "thread_id": None})
+
+    adapter._notify_clarify_expired.assert_not_awaited()
+    query.answer.assert_awaited_once_with(
+        text="This approval was superseded by a newer GitHub revision.", show_alert=True)
+    query.edit_message_text.assert_awaited_once_with(
+        text=("<b>Approve old head?</b>\n\n— "
+              "This approval was superseded by a newer GitHub revision."),
+        parse_mode="HTML", reply_markup=None)
+
+
+@pytest.mark.asyncio
 async def test_approval_prompt_reserves_space_for_resolution_suffix(monkeypatch):
     adapter = object.__new__(TelegramAdapter)
     adapter._clarify_state = {}

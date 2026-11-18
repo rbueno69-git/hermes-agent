@@ -114,6 +114,45 @@ def test_snapshot_candidate_rejected_by_intake_does_not_advance_cursor(tmp_path,
     assert not module.CURSOR.exists()
 
 
+def test_rejected_candidate_does_not_block_later_valid_candidate(tmp_path, monkeypatch):
+    module = _load()
+    rejected = "rbueno69-git/Open-Loops#1"
+    valid = ITEM
+    module.CURSOR = tmp_path / "cursor.json"
+    module.CHANGES = tmp_path / "changes.jsonl"
+    module.SNAPSHOT = tmp_path / "snapshot.json"
+    module.BROKER = tmp_path / "broker.db"
+    module.LEDGER = tmp_path / "approvals.jsonl"
+    module.LOCK = tmp_path / "maintenance.lock"
+    module.CHANGES.write_text(
+        json.dumps({"id": rejected}) + "\n" + json.dumps({"id": valid}) + "\n",
+        encoding="utf-8",
+    )
+    module.SNAPSHOT.write_text(json.dumps({"items": [
+        {"id": rejected, "observation": "unassigned_approval_candidate"},
+        {"id": valid, "observation": "unassigned_approval_candidate"},
+    ]}), encoding="utf-8")
+    monkeypatch.setattr(module, "project_pending_decisions", list)
+    monkeypatch.setattr(module, "actionable_items", lambda: set())
+    monkeypatch.setattr(module, "live_payload", lambda item: {"action": "edited", "item": item})
+    monkeypatch.setattr(
+        module,
+        "validated_envelope",
+        lambda payload: None if payload["item"] == rejected else {
+            "contract_accepted": True, "head_sha": HEAD, "digest": DIGEST,
+        },
+    )
+    monkeypatch.setattr(module, "has_current_tuple", lambda _item, _envelope: False)
+    emitted = []
+    monkeypatch.setattr(module, "post_signed_local", lambda payload: emitted.append(payload["item"]))
+
+    with pytest.raises(RuntimeError, match=rejected):
+        module.run_once(dry_run=False)
+
+    assert emitted == [valid]
+    assert not module.CURSOR.exists()
+
+
 def test_snapshot_only_contract_is_not_replayed_without_new_change(tmp_path, monkeypatch):
     module = _load()
     module.CURSOR = tmp_path / "cursor.json"

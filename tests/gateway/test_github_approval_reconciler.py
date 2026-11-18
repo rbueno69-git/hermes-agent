@@ -116,6 +116,49 @@ def test_approved_pending_decision_projects_one_ledger_row_and_one_local_task(tm
     assert DIGEST in tasks[0]["body"]
 
 
+def test_inherited_successor_reuses_canonical_task_and_records_lineage(tmp_path):
+    reconciler = _reconciler(tmp_path, _live())
+    first = reconciler.reconcile()
+    canonical_task = first[0].task_id
+    successor_head = "7" * 40
+    successor = ApprovalProposal(ITEM, successor_head, DIGEST)
+    predecessor_key = "5a58c9c3eb18111bc0447af6670dd297ef2cca653ca80620e8868d29460e3a50"
+    # The broker already verified same authority text, active task and descendant ancestry.
+    with reconciler._connect() as db:
+        now = 1_794_591_244.0
+        key = successor.canonical_key()
+        db.execute(
+            """INSERT INTO github_approval_proposals(
+                proposal_key,item_key,head_sha,contract_digest_sha256,executor,state,clarify_id,
+                session_key,chat_id,authorized_user_id,destination_id,question,message_id,
+                callback_bound,response,approver,created_at,updated_at)
+                VALUES(?,?,?,?,?,'answered',?,?,?,?,?,?,NULL,0,'Approve',?,?,?)""",
+            (key, ITEM, successor_head, DIGEST, "hermes", "gha-successor", "github:successor",
+             "42", "7", "telegram-bot:test", "Approve bounded #519 contract?",
+             "telegram:7", now, now),
+        )
+        db.execute(
+            """INSERT INTO github_approval_decisions(
+                proposal_key,response,approver,state,decided_at)
+                VALUES(?,'Approve','telegram:7','pending',?) RETURNING decision_id""",
+            (key, now),
+        ).fetchone()[0]
+        db.execute(
+            "INSERT INTO github_approval_inheritances VALUES(?,?,?,?)",
+            (key, predecessor_key, canonical_task, now),
+        )
+    reconciler.live_reader = lambda _item: _live(head=successor_head)
+
+    inherited = reconciler.reconcile()
+
+    assert inherited[0].task_id == canonical_task
+    assert len(_task_rows(tmp_path / "kanban.db")) == 1
+    ledger = _ledger_rows(tmp_path / "approvals.jsonl")
+    assert ledger[-1]["status"] == "approved_terminal_successor_contract"
+    assert ledger[-1]["predecessor_proposal_key"] == predecessor_key
+    assert ledger[-1]["inherited_task_id"] == canonical_task
+
+
 def test_replay_after_ledger_append_without_receipt_creates_no_duplicate(tmp_path):
     reconciler = _reconciler(tmp_path, _live())
     reconciler.reconcile(stop_after="ledger")

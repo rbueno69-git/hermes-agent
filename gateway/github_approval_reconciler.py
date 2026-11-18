@@ -370,10 +370,12 @@ class ApprovalDecisionReconciler:
             return db.execute(
                 """SELECT d.decision_id,d.proposal_key,d.response,d.approver,d.state,d.decided_at,
                           p.item_key,p.head_sha,p.contract_digest_sha256,p.executor,p.question,
-                          p.message_id,p.chat_id,p.authorized_user_id,p.state AS proposal_state
+                          p.message_id,p.chat_id,p.authorized_user_id,p.state AS proposal_state,
+                          i.predecessor_proposal_key,i.task_id AS inherited_task_id
                    FROM github_approval_decisions d
                    JOIN github_approval_proposals p USING(proposal_key)
                    LEFT JOIN github_approval_reconciliations r USING(decision_id)
+                   LEFT JOIN github_approval_inheritances i USING(proposal_key)
                    WHERE d.state='pending' AND r.decision_id IS NULL
                    ORDER BY d.decision_id LIMIT ?""",
                 (max(1, int(limit)),),
@@ -434,7 +436,9 @@ class ApprovalDecisionReconciler:
             "schema": "hermes.github-approval.v1",
             "approval_request_id": request_id,
             "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-            "status": "approved_terminal",
+            "status": ("approved_terminal_successor_contract"
+                       if row["predecessor_proposal_key"] is not None
+                       else "approved_terminal"),
             "approver": row["approver"],
             "platform": "telegram",
             "work_item": row["item_key"],
@@ -448,6 +452,9 @@ class ApprovalDecisionReconciler:
             "scope": row["question"],
             "decision": row["response"],
         }
+        if row["predecessor_proposal_key"] is not None:
+            record["predecessor_proposal_key"] = row["predecessor_proposal_key"]
+            record["inherited_task_id"] = row["inherited_task_id"]
         with self.ledger_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
             handle.flush()
@@ -478,6 +485,14 @@ class ApprovalDecisionReconciler:
         )
         conn = connect(self.kanban_path)
         try:
+            inherited_task_id = row["inherited_task_id"]
+            if inherited_task_id is not None:
+                inherited = conn.execute(
+                    "SELECT id FROM tasks WHERE id=? AND status IN ('ready','in_progress','running')",
+                    (str(inherited_task_id),),
+                ).fetchone()
+                if inherited is not None:
+                    return str(inherited["id"])
             idempotency_key = self._idempotency_key(row)
             existing = conn.execute(
                 "SELECT id FROM tasks WHERE idempotency_key=? AND status!='archived' "

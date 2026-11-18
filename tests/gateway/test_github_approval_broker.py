@@ -20,6 +20,7 @@ class TelegramStub:
         self.bind = bind
         self.sent = []
         self.retired = []
+        self.deleted = []
         self._clarify_state = {}
         self.destination_id = destination_id
 
@@ -40,6 +41,11 @@ class TelegramStub:
     async def retire_clarify_card(self, clarify_id, notice):
         self.retired.append((clarify_id, notice))
         self._clarify_state.pop(clarify_id, None)
+
+    async def delete_clarify_card(self, clarify_id):
+        self.deleted.append(clarify_id)
+        self._clarify_state.pop(clarify_id, None)
+        return True
 
 
 def _process_retry(path, barrier, results):
@@ -106,6 +112,7 @@ async def test_changed_digest_or_head_supersedes_and_reissues(tmp_path):
     assert first.action == "sent" and second.action == "sent"
     assert len(adapter.sent) == 2
     assert adapter.retired == []
+    assert adapter.deleted == [first.clarify_id]
     observed_old = broker.observe(proposal())
     assert observed_old is not None
     assert observed_old["state"] == "superseded"
@@ -230,6 +237,152 @@ async def test_identical_approved_tuple_replays_decision_without_republishing(tm
     assert replay.action == "answered"
     assert replay.response == "Approve"
     assert len(adapter.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_approved_descendant_same_contract_inherits_without_new_card(tmp_path):
+    adapter = TelegramStub()
+    path = tmp_path / "approvals.db"
+    kanban = tmp_path / "kanban.db"
+    broker = GitHubApprovalBroker(path, instance_id="gateway")
+    old = proposal(head="a" * 40)
+    new = proposal(head="c" * 40)
+    old_question = f"Approve?\nHead: {old.head_sha}\nRisk: bounded"
+    new_question = f"Approve?\nHead: {new.head_sha}\nRisk: bounded"
+    sent = await broker.request(
+        old, adapter=adapter, chat_id="42", question=old_question,
+        session_key="webhook:1", authorized_user_id="7")
+    assert sent.clarify_id is not None
+    broker.resolve_callback(
+        sent.clarify_id, 0, approver="telegram:7", user_id="7", chat_id="42",
+        thread_id=None, message_id="101", destination_id="telegram-bot:101")
+    with sqlite3.connect(path) as db:
+        decision_id = db.execute(
+            "SELECT decision_id FROM github_approval_decisions WHERE proposal_key=?",
+            (old.canonical_key(),)).fetchone()[0]
+        db.execute("""CREATE TABLE github_approval_reconciliations (
+            decision_id INTEGER PRIMARY KEY, proposal_key TEXT NOT NULL UNIQUE,
+            outcome TEXT NOT NULL, reason TEXT, approval_request_id TEXT,
+            task_id TEXT, completed_at REAL NOT NULL)""")
+        db.execute(
+            "INSERT INTO github_approval_reconciliations VALUES(?,?, 'approved',NULL,'req','t_same',?)",
+            (decision_id, old.canonical_key(), time.time()))
+    with sqlite3.connect(kanban) as db:
+        db.execute("CREATE TABLE tasks(id TEXT PRIMARY KEY,status TEXT NOT NULL)")
+        db.execute("INSERT INTO tasks VALUES('t_same','running')")
+
+    inherited = broker.try_inherit_successor(
+        new, question=new_question, session_key="webhook:2", chat_id="42",
+        authorized_user_id="7", destination_id="telegram-bot:101", thread_id=None,
+        kanban_path=kanban, ancestry_checker=lambda _item, old_head, new_head:
+        old_head == old.head_sha and new_head == new.head_sha)
+
+    assert inherited is not None and inherited.action == "inherited"
+    assert inherited.response == "Approve"
+    assert len(adapter.sent) == 1
+    observed = broker.observe(new)
+    assert observed is not None and observed["state"] == "answered"
+    with sqlite3.connect(path) as db:
+        lineage = db.execute(
+            "SELECT predecessor_proposal_key,task_id FROM github_approval_inheritances "
+            "WHERE proposal_key=?", (new.canonical_key(),)).fetchone()
+        decision = db.execute(
+            "SELECT state FROM github_approval_decisions WHERE proposal_key=?",
+            (new.canonical_key(),)).fetchone()
+    assert lineage == (old.canonical_key(), "t_same")
+    assert decision == ("pending",)
+
+
+@pytest.mark.asyncio
+async def test_successor_inheritance_fails_closed_on_material_question_change(tmp_path):
+    adapter = TelegramStub()
+    path = tmp_path / "approvals.db"
+    kanban = tmp_path / "kanban.db"
+    broker = GitHubApprovalBroker(path, instance_id="gateway")
+    old = proposal(head="a" * 40)
+    new = proposal(head="c" * 40)
+    sent = await broker.request(
+        old, adapter=adapter, chat_id="42", question=f"Head: {old.head_sha}\nRisk: bounded",
+        session_key="webhook:1", authorized_user_id="7")
+    assert sent.clarify_id is not None
+    broker.resolve_callback(
+        sent.clarify_id, 0, approver="telegram:7", user_id="7", chat_id="42",
+        thread_id=None, message_id="101", destination_id="telegram-bot:101")
+    with sqlite3.connect(path) as db:
+        decision_id = db.execute(
+            "SELECT decision_id FROM github_approval_decisions WHERE proposal_key=?",
+            (old.canonical_key(),)).fetchone()[0]
+        db.execute("""CREATE TABLE github_approval_reconciliations (
+            decision_id INTEGER PRIMARY KEY, proposal_key TEXT NOT NULL UNIQUE,
+            outcome TEXT NOT NULL, reason TEXT, approval_request_id TEXT,
+            task_id TEXT, completed_at REAL NOT NULL)""")
+        db.execute(
+            "INSERT INTO github_approval_reconciliations VALUES(?,?, 'approved',NULL,'req','t_same',?)",
+            (decision_id, old.canonical_key(), time.time()))
+    with sqlite3.connect(kanban) as db:
+        db.execute("CREATE TABLE tasks(id TEXT PRIMARY KEY,status TEXT NOT NULL)")
+        db.execute("INSERT INTO tasks VALUES('t_same','running')")
+
+    inherited = broker.try_inherit_successor(
+        new, question=f"Head: {new.head_sha}\nRisk: expanded", session_key="webhook:2",
+        chat_id="42", authorized_user_id="7", destination_id="telegram-bot:101",
+        thread_id=None, kanban_path=kanban,
+        ancestry_checker=lambda *_args: True)
+
+    assert inherited is None
+    assert broker.observe(new) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_mode", ["terminal_predecessor", "task_finishes_during_ancestry"])
+async def test_successor_inheritance_rechecks_terminal_boundaries(tmp_path, failure_mode):
+    adapter = TelegramStub()
+    path = tmp_path / "approvals.db"
+    kanban = tmp_path / "kanban.db"
+    broker = GitHubApprovalBroker(path, instance_id="gateway")
+    old = proposal(head="a" * 40)
+    new = proposal(head="c" * 40)
+    old_question = f"Head: {old.head_sha}\nRisk: bounded"
+    new_question = f"Head: {new.head_sha}\nRisk: bounded"
+    sent = await broker.request(
+        old, adapter=adapter, chat_id="42", question=old_question,
+        session_key="webhook:1", authorized_user_id="7")
+    assert sent.clarify_id is not None
+    broker.resolve_callback(
+        sent.clarify_id, 0, approver="telegram:7", user_id="7", chat_id="42",
+        thread_id=None, message_id="101", destination_id="telegram-bot:101")
+    with sqlite3.connect(path) as db:
+        decision_id = db.execute(
+            "SELECT decision_id FROM github_approval_decisions WHERE proposal_key=?",
+            (old.canonical_key(),)).fetchone()[0]
+        db.execute("""CREATE TABLE github_approval_reconciliations (
+            decision_id INTEGER PRIMARY KEY, proposal_key TEXT NOT NULL UNIQUE,
+            outcome TEXT NOT NULL, reason TEXT, approval_request_id TEXT,
+            task_id TEXT, completed_at REAL NOT NULL)""")
+        db.execute(
+            "INSERT INTO github_approval_reconciliations VALUES(?,?, 'approved',NULL,'req','t_same',?)",
+            (decision_id, old.canonical_key(), time.time()))
+        if failure_mode == "terminal_predecessor":
+            db.execute(
+                "UPDATE github_approval_proposals SET state='superseded' WHERE proposal_key=?",
+                (old.canonical_key(),))
+    with sqlite3.connect(kanban) as db:
+        db.execute("CREATE TABLE tasks(id TEXT PRIMARY KEY,status TEXT NOT NULL)")
+        db.execute("INSERT INTO tasks VALUES('t_same','running')")
+
+    def ancestry(*_args):
+        if failure_mode == "task_finishes_during_ancestry":
+            with sqlite3.connect(kanban) as db:
+                db.execute("UPDATE tasks SET status='done' WHERE id='t_same'")
+        return True
+
+    inherited = broker.try_inherit_successor(
+        new, question=new_question, session_key="webhook:2", chat_id="42",
+        authorized_user_id="7", destination_id="telegram-bot:101", thread_id=None,
+        kanban_path=kanban, ancestry_checker=ancestry)
+
+    assert inherited is None
+    assert broker.observe(new) is None
 
 
 @pytest.mark.asyncio
@@ -396,6 +549,7 @@ async def test_inflight_supersession_fail_closes_card_sent_after_generation_chan
     assert sent_new.action == "sent"
     assert stale.action == "superseded"
     assert adapter.retired == []
+    assert adapter.deleted == [stale.clarify_id]
     observed = broker.observe(old)
     assert observed is not None
     assert observed["retirement_pending"] == 0
@@ -428,6 +582,7 @@ async def test_terminal_close_during_send_fail_closes_late_card_locally(tmp_path
 
     assert outcome.action == "superseded"
     assert adapter.retired == []
+    assert adapter.deleted == [outcome.clarify_id]
     observed = broker.observe(proposal())
     assert observed is not None
     assert observed["retirement_pending"] == 0

@@ -4089,6 +4089,14 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 raise
         self._approval_clarify_state.pop(clarify_id, None)
 
+    async def delete_clarify_card(self, clarify_id: str) -> bool:
+        """Delete an unanswered durable approval superseded by a newer GitHub tuple."""
+        self._clarify_state.pop(clarify_id, None)
+        prompt = self._approval_clarify_state.pop(clarify_id, None)
+        if prompt is None or prompt.chat_id is None or prompt.message_id is None:
+            return False
+        return await self.delete_message(str(prompt.chat_id), str(prompt.message_id))
+
     async def resolve_clarify_card(
         self, clarify_id: str, original_text: str, decision: str, *, edit=None,
         parse_mode=None,
@@ -4682,6 +4690,20 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 broker, durable_choice = None, None
             if (broker is not None and destination_id is not None and durable_choice is None
                     and broker.has_callback(clarify_id, destination_id)):
+                if broker.callback_state(clarify_id, destination_id) == "superseded":
+                    if not await self._callback_authorized(query, cb, _unauthorized()):
+                        return
+                    notice = t("platform.telegram.approval.superseded")
+                    message = getattr(query, "message", None)
+                    original_html = getattr(message, "text_html", None)
+                    original_text = (
+                        str(original_html) if isinstance(original_html, str) and original_html
+                        else _html.escape(str(getattr(message, "text", "") or "")))
+                    await query.answer(text=notice[:_TOAST_LIMIT], show_alert=True)
+                    await self.resolve_clarify_card(
+                        clarify_id, original_text, notice, edit=query.edit_message_text,
+                        parse_mode=ParseMode.HTML)
+                    return
                 await self._notify_clarify_expired(
                     query, str(getattr(query.from_user, "id", "") or "unknown"))
                 return

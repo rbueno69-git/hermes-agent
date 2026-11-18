@@ -94,6 +94,33 @@ def _github_approval_question(payload: dict, proposal: Any) -> str:
     )
 
 
+def _github_head_is_descendant(item_key: str, predecessor: str, successor: str) -> bool:
+    """Verify ancestry from GitHub repository metadata; ambiguity fails closed."""
+    repo, separator, _number = item_key.rpartition("#")
+    if (not separator or _REPO_RE.fullmatch(repo) is None
+            or re.fullmatch(r"[0-9a-f]{40}", predecessor) is None
+            or re.fullmatch(r"[0-9a-f]{40}", successor) is None):
+        return False
+    result = subprocess.run(
+        ["gh", "api", f"repos/{repo}/compare/{predecessor}...{successor}"],
+        capture_output=True, text=True, encoding="utf-8", errors="strict",
+        timeout=30, check=False,
+    )
+    if result.returncode != 0 or len(result.stdout) > 1_048_576:
+        return False
+    try:
+        comparison = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return False
+    merge_base = comparison.get("merge_base_commit")
+    return bool(
+        isinstance(merge_base, dict)
+        and merge_base.get("sha") == predecessor
+        and comparison.get("behind_by") == 0
+        and comparison.get("status") in {"ahead", "identical"}
+    )
+
+
 def _header_delivery_id(headers) -> str:
     """The provider's delivery id (GitHub, Svix, Standard Webhooks, generic), else a fresh one."""
     return headers.get("X-GitHub-Delivery", headers.get("svix-id", headers.get(
@@ -964,6 +991,8 @@ class WebhookAdapter(BasePlatformAdapter):
                     if target is None:
                         return _json_error("Telegram approval destination unavailable", 503)
                     broker = default_broker(instance_id=f"webhook-producer:{profile or 'default'}:{route_name}")
+                    if broker is None:
+                        return _json_error("GitHub approval broker unavailable", 503)
                     if terminal_status is not None:
                         retired = await broker.retire_item(
                             proposal.item_key, status=terminal_status, adapter=target)
@@ -977,12 +1006,26 @@ class WebhookAdapter(BasePlatformAdapter):
                         target_chat_id = home.chat_id if home else None
                     if not target_chat_id:
                         return _json_error("Telegram approval chat is not configured", 503)
-                    outcome = broker.admit(
+                    question = _github_approval_question(payload, proposal)
+                    session_key = f"github-approval:{profile or 'default'}:{route_name}:{delivery_id}"
+                    thread_id = extra.get("message_thread_id") or extra.get("thread_id")
+                    destination_id = broker._destination_identity(
+                        target, f"gha-{proposal.canonical_key()[:24]}")
+                    inherited = None
+                    if destination_id is not None:
+                        from hermes_cli.kanban_db import kanban_db_path
+
+                        inherited = broker.try_inherit_successor(
+                            proposal, question=question, session_key=session_key,
+                            chat_id=str(target_chat_id), authorized_user_id=authorized_user_id,
+                            destination_id=destination_id,
+                            thread_id=str(thread_id) if thread_id is not None else None,
+                            kanban_path=kanban_db_path(),
+                            ancestry_checker=_github_head_is_descendant)
+                    outcome = inherited or broker.admit(
                         proposal, adapter=target, chat_id=str(target_chat_id),
-                        question=_github_approval_question(payload, proposal),
-                        session_key=f"github-approval:{profile or 'default'}:{route_name}:{delivery_id}",
-                        authorized_user_id=authorized_user_id,
-                        thread_id=extra.get("message_thread_id") or extra.get("thread_id"))
+                        question=question, session_key=session_key,
+                        authorized_user_id=authorized_user_id, thread_id=thread_id)
                 return web.json_response(
                     {"status": "approval_admitted", "action": outcome.action,
                      "proposal_key": outcome.proposal_key, "delivery_id": delivery_id}, status=202)

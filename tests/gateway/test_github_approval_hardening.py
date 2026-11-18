@@ -170,6 +170,22 @@ async def test_telegram_retire_clarify_card_removes_binding_and_keyboard():
 
 
 @pytest.mark.asyncio
+async def test_telegram_delete_clarify_card_removes_unanswered_superseded_message():
+    adapter = object.__new__(TelegramAdapter)
+    adapter._clarify_state = {"gha-id": "session"}
+    adapter._approval_clarify_state = {
+        "gha-id": ClarifyPrompt("session", "42", "501", None)}
+    adapter.delete_message = AsyncMock(return_value=True)
+
+    deleted = await adapter.delete_clarify_card("gha-id")
+
+    assert deleted is True
+    assert "gha-id" not in adapter._clarify_state
+    assert "gha-id" not in adapter._approval_clarify_state
+    adapter.delete_message.assert_awaited_once_with("42", "501")
+
+
+@pytest.mark.asyncio
 async def test_telegram_retirement_treats_already_retired_card_as_success():
     from telegram.error import BadRequest
 

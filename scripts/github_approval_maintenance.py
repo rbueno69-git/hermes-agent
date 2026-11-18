@@ -257,6 +257,7 @@ def run_once(*, dry_run: bool) -> dict:
         actionable = actionable_items()
         approval_candidates = snapshot_candidates()
         emitted: list[str] = []
+        rejected: list[str] = []
         for item_key in sorted(candidates):
             payload = live_payload(item_key)
             terminal = payload.get("action") == "closed"
@@ -267,9 +268,7 @@ def run_once(*, dry_run: bool) -> dict:
                 envelope = validated_envelope(payload)
                 if envelope is None:
                     if item_key in approval_candidates:
-                        raise RuntimeError(
-                            f"candidate item rejected by Hermes intake: {item_key}"
-                        )
+                        rejected.append(item_key)
                     continue
                 if envelope.get("contract_accepted") is not True:
                     continue
@@ -278,6 +277,10 @@ def run_once(*, dry_run: bool) -> dict:
             if not dry_run:
                 post_signed_local(payload)
             emitted.append(item_key)
+        if rejected:
+            raise RuntimeError(
+                "candidate item rejected by Hermes intake: " + ", ".join(rejected)
+            )
         if not dry_run:
             _write_cursor(total)
         return {
