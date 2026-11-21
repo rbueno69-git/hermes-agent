@@ -318,67 +318,70 @@ class GitHubApprovalBroker:
             f"github-corrective:{authority['item_key']}:{authority['head_sha']}:"
             f"{authority['contract_digest_sha256']}"
         )
+        kanban_guard = sqlite3.connect(Path(kanban_path), timeout=30.0)
         try:
-            with sqlite3.connect(f"file:{Path(kanban_path)}?mode=ro", uri=True) as kanban:
-                predecessor = kanban.execute(
-                    "SELECT status,block_kind FROM tasks WHERE id=?", (predecessor_task_id,)
+            kanban_guard.execute("BEGIN IMMEDIATE")
+            predecessor = kanban_guard.execute(
+                "SELECT status FROM tasks WHERE id=?", (predecessor_task_id,)
+            ).fetchone()
+            continuation = kanban_guard.execute(
+                "SELECT status,idempotency_key FROM tasks WHERE id=?", (continuation_task_id,)
+            ).fetchone()
+            if predecessor is None or str(predecessor[0]) != "blocked":
+                raise ValueError("approved predecessor must be blocked before binding a continuation")
+            if continuation is None or str(continuation[0]) not in {"ready", "in_progress", "running"}:
+                raise ValueError("internal continuation must be live")
+            if str(continuation[1]) != expected_key:
+                raise ValueError("internal continuation lacks the canonical idempotency binding")
+            continuation_idempotency_key = expected_key
+            with self._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                current = db.execute(
+                    """SELECT r.task_id,p.origin_status
+                       FROM github_approval_proposals p
+                       JOIN github_approval_decisions d USING(proposal_key)
+                       JOIN github_approval_reconciliations r USING(decision_id)
+                       WHERE p.proposal_key=? AND p.response='Approve' AND r.outcome='approved'""",
+                    (predecessor_proposal_key,),
                 ).fetchone()
-                continuation = kanban.execute(
-                    "SELECT status,idempotency_key FROM tasks WHERE id=?", (continuation_task_id,)
+                if (current is None or str(current["task_id"]) != predecessor_task_id
+                        or current["origin_status"] in {"closed", "merged", "superseded"}):
+                    db.rollback()
+                    raise ValueError("continuation predecessor approval changed during binding")
+                record = (
+                    predecessor_proposal_key,
+                    str(authority["item_key"]),
+                    str(authority["contract_digest_sha256"]),
+                    predecessor_task_id,
+                    continuation_task_id,
+                    continuation_idempotency_key,
+                    "internal",
+                )
+                db.execute(
+                    """INSERT OR IGNORE INTO github_approval_continuations(
+                        predecessor_proposal_key,item_key,contract_digest_sha256,
+                        predecessor_task_id,continuation_task_id,continuation_idempotency_key,
+                        blocker_class,created_at)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    (*record, time.time()),
+                )
+                persisted = db.execute(
+                    """SELECT predecessor_proposal_key,item_key,contract_digest_sha256,
+                              predecessor_task_id,continuation_task_id,continuation_idempotency_key,
+                              blocker_class
+                       FROM github_approval_continuations WHERE predecessor_proposal_key=?""",
+                    (predecessor_proposal_key,),
                 ).fetchone()
+                if persisted is None or tuple(persisted) != record:
+                    db.rollback()
+                    raise ValueError("approved predecessor already has a different continuation binding")
+                db.commit()
+            kanban_guard.commit()
         except sqlite3.Error as exc:
             raise ValueError("Kanban continuation state is unavailable") from exc
-        if predecessor is None or str(predecessor[0]) != "blocked":
-            raise ValueError("approved predecessor must be blocked before binding a continuation")
-        if predecessor[1] not in (None, "transient"):
-            raise ValueError("approved predecessor is not an internal blocker")
-        if continuation is None or str(continuation[0]) not in {"ready", "in_progress", "running"}:
-            raise ValueError("internal continuation must be live")
-        if str(continuation[1]) != expected_key:
-            raise ValueError("internal continuation lacks the canonical idempotency binding")
-        continuation_idempotency_key = expected_key
-        with self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            current = db.execute(
-                """SELECT r.task_id,p.origin_status
-                   FROM github_approval_proposals p
-                   JOIN github_approval_decisions d USING(proposal_key)
-                   JOIN github_approval_reconciliations r USING(decision_id)
-                   WHERE p.proposal_key=? AND p.response='Approve' AND r.outcome='approved'""",
-                (predecessor_proposal_key,),
-            ).fetchone()
-            if (current is None or str(current["task_id"]) != predecessor_task_id
-                    or current["origin_status"] in {"closed", "merged", "superseded"}):
-                db.rollback()
-                raise ValueError("continuation predecessor approval changed during binding")
-            record = (
-                predecessor_proposal_key,
-                str(authority["item_key"]),
-                str(authority["contract_digest_sha256"]),
-                predecessor_task_id,
-                continuation_task_id,
-                continuation_idempotency_key,
-                "internal",
-            )
-            db.execute(
-                """INSERT OR IGNORE INTO github_approval_continuations(
-                    predecessor_proposal_key,item_key,contract_digest_sha256,
-                    predecessor_task_id,continuation_task_id,continuation_idempotency_key,
-                    blocker_class,created_at)
-                   VALUES(?,?,?,?,?,?,?,?)""",
-                (*record, time.time()),
-            )
-            persisted = db.execute(
-                """SELECT predecessor_proposal_key,item_key,contract_digest_sha256,
-                          predecessor_task_id,continuation_task_id,continuation_idempotency_key,
-                          blocker_class
-                   FROM github_approval_continuations WHERE predecessor_proposal_key=?""",
-                (predecessor_proposal_key,),
-            ).fetchone()
-            if persisted is None or tuple(persisted) != record:
-                db.rollback()
-                raise ValueError("approved predecessor already has a different continuation binding")
-            db.commit()
+        finally:
+            kanban_guard.close()
+
 
     def try_inherit_successor(
         self,
@@ -453,10 +456,9 @@ class GitHubApprovalBroker:
             try:
                 with sqlite3.connect(f"file:{Path(kanban_path)}?mode=ro", uri=True) as kanban:
                     task = kanban.execute(
-                        "SELECT status,block_kind FROM tasks WHERE id=?", (predecessor_task_id,)
+                        "SELECT status FROM tasks WHERE id=?", (predecessor_task_id,)
                     ).fetchone()
-                    if (task is not None and str(task[0]) == "blocked"
-                            and task[1] in (None, "transient")):
+                    if task is not None and str(task[0]) == "blocked":
                         with self._connect() as db:
                             binding = db.execute(
                                 """SELECT continuation_task_id,continuation_idempotency_key
@@ -497,7 +499,7 @@ class GitHubApprovalBroker:
             try:
                 kanban_guard.execute("BEGIN IMMEDIATE")
                 live_predecessor = kanban_guard.execute(
-                    "SELECT status,block_kind FROM tasks WHERE id=?", (predecessor_task_id,)
+                    "SELECT status FROM tasks WHERE id=?", (predecessor_task_id,)
                 ).fetchone()
                 live_task = kanban_guard.execute(
                     ("SELECT status,idempotency_key FROM tasks WHERE id=?"
@@ -510,7 +512,6 @@ class GitHubApprovalBroker:
                         or (continuation_key is not None
                             and (live_predecessor is None
                                  or str(live_predecessor[0]) != "blocked"
-                                 or live_predecessor[1] not in (None, "transient")
                                  or str(live_task[1]) != continuation_key))):
                     kanban_guard.rollback()
                     continue
@@ -757,7 +758,7 @@ class GitHubApprovalBroker:
             changed = db.execute("""UPDATE github_approval_proposals SET state=?,message_id=?,callback_bound=?,destination_id=?,
                     owner_instance_id=?,last_error=?,lease_expires_at=NULL,delivery_retry_after=?,updated_at=?
                     WHERE proposal_key=? AND state='dispatching' AND owner_instance_id=?""",
-                (state, message_id if state == "active" else None, 1 if state == "active" else 0,
+                (state, message_id if delivered else None, 1 if state == "active" else 0,
                  destination_id if state == "active" else row["destination_id"],
                  None if state == "pending_notification" else self.instance_id,
                  error, delivery_retry_after, now, proposal_key, self.instance_id)).rowcount

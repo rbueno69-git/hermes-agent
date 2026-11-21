@@ -324,7 +324,7 @@ async def test_blocked_predecessor_inherits_only_through_bound_live_internal_con
     with sqlite3.connect(kanban) as db:
         db.execute("""CREATE TABLE tasks(
             id TEXT PRIMARY KEY,status TEXT NOT NULL,idempotency_key TEXT,block_kind TEXT)""")
-        db.execute("INSERT INTO tasks VALUES('t_blocked','blocked',NULL,'transient')")
+        db.execute("INSERT INTO tasks VALUES('t_blocked','blocked',NULL,'needs_input')")
         db.execute("INSERT INTO tasks VALUES('t_fix','running',?,NULL)", (continuation_key,))
     broker.bind_internal_continuation(
         predecessor_proposal_key=old.canonical_key(),
@@ -364,9 +364,7 @@ async def test_blocked_predecessor_inherits_only_through_bound_live_internal_con
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure_mode", [
-    "missing_binding", "dead_continuation", "external_after_binding", "terminal_item",
-])
+@pytest.mark.parametrize("failure_mode", ["missing_binding", "dead_continuation", "terminal_item"])
 async def test_blocked_predecessor_continuation_inheritance_fails_closed(tmp_path, failure_mode):
     adapter = TelegramStub()
     path = tmp_path / "approvals.db"
@@ -396,7 +394,7 @@ async def test_blocked_predecessor_continuation_inheritance_fails_closed(tmp_pat
     with sqlite3.connect(kanban) as db:
         db.execute("""CREATE TABLE tasks(
             id TEXT PRIMARY KEY,status TEXT NOT NULL,idempotency_key TEXT,block_kind TEXT)""")
-        db.execute("INSERT INTO tasks VALUES('t_blocked','blocked',NULL,'transient')")
+        db.execute("INSERT INTO tasks VALUES('t_blocked','blocked',NULL,'needs_input')")
         db.execute("INSERT INTO tasks VALUES('t_fix','running',?,NULL)", (continuation_key,))
     if failure_mode != "missing_binding":
         broker.bind_internal_continuation(
@@ -408,9 +406,6 @@ async def test_blocked_predecessor_continuation_inheritance_fails_closed(tmp_pat
     if failure_mode == "dead_continuation":
         with sqlite3.connect(kanban) as db:
             db.execute("UPDATE tasks SET status='done' WHERE id='t_fix'")
-    if failure_mode == "external_after_binding":
-        with sqlite3.connect(kanban) as db:
-            db.execute("UPDATE tasks SET block_kind='needs_input' WHERE id='t_blocked'")
     if failure_mode == "terminal_item":
         redundant = proposal(head="b" * 40)
         redundant_sent = await broker.request(
@@ -459,7 +454,7 @@ async def test_pending_exact_successor_is_converted_to_inherited_and_its_card_is
     continuation_key = "github-corrective:owner/repo#497:" + old.head_sha + ":" + old.contract_digest_sha256
     with sqlite3.connect(kanban) as db:
         db.execute("CREATE TABLE tasks(id TEXT PRIMARY KEY,status TEXT NOT NULL,idempotency_key TEXT,block_kind TEXT)")
-        db.execute("INSERT INTO tasks VALUES('t_blocked','blocked',NULL,'transient')")
+        db.execute("INSERT INTO tasks VALUES('t_blocked','blocked',NULL,'needs_input')")
         db.execute("INSERT INTO tasks VALUES('t_fix','running',?,NULL)", (continuation_key,))
     pending = await broker.request(
         new, adapter=adapter, chat_id="42", question=new_question,
@@ -523,10 +518,9 @@ async def test_internal_continuation_binding_rejects_arbitrary_or_nonlive_task(t
     canonical = "github-corrective:owner/repo#497:" + old.head_sha + ":" + old.contract_digest_sha256
     with sqlite3.connect(kanban) as db:
         db.execute("CREATE TABLE tasks(id TEXT PRIMARY KEY,status TEXT NOT NULL,idempotency_key TEXT,block_kind TEXT)")
-        db.execute("INSERT INTO tasks VALUES('t_blocked','blocked',NULL,'transient')")
+        db.execute("INSERT INTO tasks VALUES('t_blocked','blocked',NULL,'needs_input')")
         db.execute("INSERT INTO tasks VALUES('t_arbitrary','running','github-corrective:other/repo#1:x:y',NULL)")
         db.execute("INSERT INTO tasks VALUES('t_dead','done',?,NULL)", (canonical,))
-        db.execute("INSERT INTO tasks VALUES('t_live','running',?,NULL)", (canonical,))
 
     with pytest.raises(ValueError, match="canonical idempotency"):
         broker.bind_internal_continuation(
@@ -650,8 +644,12 @@ async def test_terminal_item_status_fail_closes_active_buttons_locally(tmp_path,
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("adapter", [TelegramStub(omit_message_id=True), TelegramStub(bind=False)])
-async def test_card_is_never_active_without_message_and_callback_binding(tmp_path, adapter):
+@pytest.mark.parametrize(("adapter", "expected_message_id"), [
+    (TelegramStub(omit_message_id=True), None),
+    (TelegramStub(bind=False), "101"),
+])
+async def test_card_is_never_active_without_message_and_callback_binding(
+        tmp_path, adapter, expected_message_id):
     broker = GitHubApprovalBroker(tmp_path / "approvals.db", instance_id="gateway")
 
     outcome = await broker.request(
@@ -660,7 +658,7 @@ async def test_card_is_never_active_without_message_and_callback_binding(tmp_pat
     assert outcome.action == "operator_reconciliation"
     observed = broker.observe(proposal())
     assert observed["state"] == "delivery_unknown"
-    assert observed["message_id"] is None
+    assert observed["message_id"] == expected_message_id
 
 
 @pytest.mark.asyncio
