@@ -175,3 +175,42 @@ def test_snapshot_only_contract_is_not_replayed_without_new_change(tmp_path, mon
 
     assert result["emitted"] == []
     assert result["candidates"] == []
+
+
+def test_bind_internal_continuation_cli_persists_exact_explicit_lane(tmp_path, monkeypatch, capsys):
+    module = _load()
+    module.BROKER = tmp_path / "broker.db"
+    kanban = tmp_path / "kanban.db"
+    calls = []
+
+    class BrokerStub:
+        def __init__(self, path, *, instance_id):
+            calls.append(("init", path, instance_id))
+
+        def bind_internal_continuation(self, **kwargs):
+            calls.append(("bind", kwargs))
+
+    monkeypatch.setattr(module, "GitHubApprovalBroker", BrokerStub)
+    monkeypatch.setattr(module, "kanban_db_path", lambda: kanban)
+    monkeypatch.setattr(module, "run_once", lambda **_kwargs: (_ for _ in ()).throw(
+        AssertionError("binding must not run ordinary maintenance")))
+
+    assert module.main([
+        "--bind-internal-continuation", "proposal-key", "t_blocked", "t_fix",
+    ]) == 0
+
+    assert calls == [
+        ("init", module.BROKER, "github-approval-maintenance:continuation-binding"),
+        ("bind", {
+            "predecessor_proposal_key": "proposal-key",
+            "predecessor_task_id": "t_blocked",
+            "continuation_task_id": "t_fix",
+            "kanban_path": kanban,
+        }),
+    ]
+    assert json.loads(capsys.readouterr().out) == {
+        "action": "internal_continuation_bound",
+        "continuation_task_id": "t_fix",
+        "predecessor_proposal_key": "proposal-key",
+        "predecessor_task_id": "t_blocked",
+    }

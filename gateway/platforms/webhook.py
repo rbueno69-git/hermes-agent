@@ -1148,6 +1148,8 @@ class WebhookAdapter(BasePlatformAdapter):
                             thread_id=str(thread_id) if thread_id is not None else None,
                             kanban_path=kanban_db_path(),
                             ancestry_checker=_github_head_is_descendant)
+                        if inherited is not None:
+                            await broker.retire_inherited_cards(inherited, adapter=target)
                     outcome = inherited or broker.admit(
                         proposal, adapter=target, chat_id=str(target_chat_id),
                         question=question, session_key=session_key,

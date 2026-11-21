@@ -55,6 +55,7 @@ class RequestOutcome:
     clarify_id: Optional[str] = None
     message_id: Optional[str] = None
     response: Optional[str] = None
+    retired_clarify_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -120,6 +121,7 @@ class GitHubApprovalBroker:
                     last_error TEXT,
                     retirement_pending INTEGER NOT NULL DEFAULT 0 CHECK(retirement_pending IN (0,1)),
                     retirement_retry_after REAL,
+                    retirement_action TEXT CHECK(retirement_action IN ('resolve','delete')),
                     resolution_original_text TEXT,
                     resolution_decision_text TEXT,
                     resolution_parse_mode TEXT,
@@ -143,6 +145,17 @@ class GitHubApprovalBroker:
                     task_id TEXT NOT NULL,
                     created_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS github_approval_continuations (
+                    predecessor_proposal_key TEXT PRIMARY KEY
+                        REFERENCES github_approval_proposals(proposal_key),
+                    item_key TEXT NOT NULL,
+                    contract_digest_sha256 TEXT NOT NULL,
+                    predecessor_task_id TEXT NOT NULL,
+                    continuation_task_id TEXT NOT NULL UNIQUE,
+                    continuation_idempotency_key TEXT NOT NULL UNIQUE,
+                    blocker_class TEXT NOT NULL CHECK(blocker_class IN ('internal','external')),
+                    created_at REAL NOT NULL
+                );
                 COMMIT;
             """)
             columns = {str(row[1]) for row in db.execute("PRAGMA table_info(github_approval_proposals)")}
@@ -152,6 +165,9 @@ class GitHubApprovalBroker:
                 db.execute("ALTER TABLE github_approval_proposals ADD COLUMN retirement_pending INTEGER NOT NULL DEFAULT 0")
             if "retirement_retry_after" not in columns:
                 db.execute("ALTER TABLE github_approval_proposals ADD COLUMN retirement_retry_after REAL")
+            if "retirement_action" not in columns:
+                db.execute("ALTER TABLE github_approval_proposals ADD COLUMN retirement_action TEXT "
+                           "CHECK(retirement_action IN ('resolve','delete'))")
             if "delivery_retry_after" not in columns:
                 db.execute("ALTER TABLE github_approval_proposals ADD COLUMN delivery_retry_after REAL")
             if "resolution_original_text" not in columns:
@@ -261,6 +277,109 @@ class GitHubApprovalBroker:
             for line in str(question).splitlines()
         )
 
+    def bind_internal_continuation(
+        self,
+        *,
+        predecessor_proposal_key: str,
+        predecessor_task_id: str,
+        continuation_task_id: str,
+        kanban_path: Path,
+    ) -> None:
+        """Persist the diagnosed corrective lane for one reconciled approval.
+
+        This binding is intentionally explicit and immutable. A blocked task is not authority;
+        inheritance may use only the exact continuation recorded here and later proven live in
+        Kanban. The caller diagnoses the blocker as internal, while this method verifies all
+        machine-checkable authorities: the approved predecessor is blocked, the exact
+        corrective task is live, and its idempotency key binds the same item, head, and
+        contract digest.  External blockers therefore have no binding to inherit.
+        """
+        values = (
+            predecessor_proposal_key,
+            predecessor_task_id,
+            continuation_task_id,
+        )
+        if not all(isinstance(value, str) and value for value in values):
+            raise ValueError("continuation binding requires complete durable identities")
+        with self._connect() as db:
+            authority = db.execute(
+                """SELECT p.item_key,p.head_sha,p.contract_digest_sha256,r.task_id
+                   FROM github_approval_proposals p
+                   JOIN github_approval_decisions d USING(proposal_key)
+                   JOIN github_approval_reconciliations r USING(decision_id)
+                   WHERE p.proposal_key=? AND p.state IN ('answered','superseded')
+                     AND p.response='Approve' AND r.outcome='approved'
+                     AND COALESCE(p.origin_status,'') NOT IN ('closed','merged','superseded')""",
+                (predecessor_proposal_key,),
+            ).fetchone()
+            if authority is None or str(authority["task_id"]) != predecessor_task_id:
+                raise ValueError("continuation predecessor is not the reconciled approved task")
+        expected_key = (
+            f"github-corrective:{authority['item_key']}:{authority['head_sha']}:"
+            f"{authority['contract_digest_sha256']}"
+        )
+        try:
+            with sqlite3.connect(f"file:{Path(kanban_path)}?mode=ro", uri=True) as kanban:
+                predecessor = kanban.execute(
+                    "SELECT status,block_kind FROM tasks WHERE id=?", (predecessor_task_id,)
+                ).fetchone()
+                continuation = kanban.execute(
+                    "SELECT status,idempotency_key FROM tasks WHERE id=?", (continuation_task_id,)
+                ).fetchone()
+        except sqlite3.Error as exc:
+            raise ValueError("Kanban continuation state is unavailable") from exc
+        if predecessor is None or str(predecessor[0]) != "blocked":
+            raise ValueError("approved predecessor must be blocked before binding a continuation")
+        if predecessor[1] not in (None, "transient"):
+            raise ValueError("approved predecessor is not an internal blocker")
+        if continuation is None or str(continuation[0]) not in {"ready", "in_progress", "running"}:
+            raise ValueError("internal continuation must be live")
+        if str(continuation[1]) != expected_key:
+            raise ValueError("internal continuation lacks the canonical idempotency binding")
+        continuation_idempotency_key = expected_key
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = db.execute(
+                """SELECT r.task_id,p.origin_status
+                   FROM github_approval_proposals p
+                   JOIN github_approval_decisions d USING(proposal_key)
+                   JOIN github_approval_reconciliations r USING(decision_id)
+                   WHERE p.proposal_key=? AND p.response='Approve' AND r.outcome='approved'""",
+                (predecessor_proposal_key,),
+            ).fetchone()
+            if (current is None or str(current["task_id"]) != predecessor_task_id
+                    or current["origin_status"] in {"closed", "merged", "superseded"}):
+                db.rollback()
+                raise ValueError("continuation predecessor approval changed during binding")
+            record = (
+                predecessor_proposal_key,
+                str(authority["item_key"]),
+                str(authority["contract_digest_sha256"]),
+                predecessor_task_id,
+                continuation_task_id,
+                continuation_idempotency_key,
+                "internal",
+            )
+            db.execute(
+                """INSERT OR IGNORE INTO github_approval_continuations(
+                    predecessor_proposal_key,item_key,contract_digest_sha256,
+                    predecessor_task_id,continuation_task_id,continuation_idempotency_key,
+                    blocker_class,created_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (*record, time.time()),
+            )
+            persisted = db.execute(
+                """SELECT predecessor_proposal_key,item_key,contract_digest_sha256,
+                          predecessor_task_id,continuation_task_id,continuation_idempotency_key,
+                          blocker_class
+                   FROM github_approval_continuations WHERE predecessor_proposal_key=?""",
+                (predecessor_proposal_key,),
+            ).fetchone()
+            if persisted is None or tuple(persisted) != record:
+                db.rollback()
+                raise ValueError("approved predecessor already has a different continuation binding")
+            db.commit()
+
     def try_inherit_successor(
         self,
         proposal: ApprovalProposal,
@@ -286,10 +405,21 @@ class GitHubApprovalBroker:
             raise ValueError("successor inheritance requires complete durable bindings")
         key = proposal.canonical_key()
         with self._connect() as db:
-            if db.execute(
-                "SELECT 1 FROM github_approval_proposals WHERE proposal_key=?", (key,)
-            ).fetchone() is not None:
-                return None
+            exact = db.execute(
+                "SELECT * FROM github_approval_proposals WHERE proposal_key=?", (key,)
+            ).fetchone()
+            if exact is not None:
+                expected = (
+                    question, session_key, chat_id, thread_id, authorized_user_id, destination_id,
+                )
+                observed = (
+                    str(exact["question"]), str(exact["session_key"]), str(exact["chat_id"]),
+                    str(exact["thread_id"]) if exact["thread_id"] is not None else None,
+                    str(exact["authorized_user_id"]),
+                    str(exact["destination_id"]) if exact["destination_id"] is not None else None,
+                )
+                if str(exact["state"]) not in {"pending_notification", "active"} or observed != expected:
+                    return None
             if db.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' "
                 "AND name='github_approval_reconciliations'"
@@ -301,7 +431,12 @@ class GitHubApprovalBroker:
                    JOIN github_approval_decisions d USING(proposal_key)
                    JOIN github_approval_reconciliations r USING(decision_id)
                    WHERE p.item_key=? AND p.contract_digest_sha256=? AND p.executor=?
-                     AND p.head_sha!=? AND p.state='answered' AND p.response='Approve'
+                     AND p.head_sha!=? AND p.response='Approve'
+                     AND (p.state='answered' OR EXISTS (
+                         SELECT 1 FROM github_approval_continuations c
+                         WHERE c.predecessor_proposal_key=p.proposal_key
+                           AND c.blocker_class='internal'))
+                     AND COALESCE(p.origin_status,'') NOT IN ('closed','merged','superseded')
                      AND r.outcome='approved'
                      AND r.task_id IS NOT NULL
                    ORDER BY d.decision_id DESC""",
@@ -312,15 +447,41 @@ class GitHubApprovalBroker:
         for candidate in candidates:
             if self._authority_question(str(candidate["question"])) != normalized:
                 continue
-            task_id = str(candidate["task_id"])
+            predecessor_task_id = str(candidate["task_id"])
+            task_id = predecessor_task_id
+            continuation_key: Optional[str] = None
             try:
                 with sqlite3.connect(f"file:{Path(kanban_path)}?mode=ro", uri=True) as kanban:
                     task = kanban.execute(
-                        "SELECT status FROM tasks WHERE id=?", (task_id,)
+                        "SELECT status,block_kind FROM tasks WHERE id=?", (predecessor_task_id,)
                     ).fetchone()
+                    if (task is not None and str(task[0]) == "blocked"
+                            and task[1] in (None, "transient")):
+                        with self._connect() as db:
+                            binding = db.execute(
+                                """SELECT continuation_task_id,continuation_idempotency_key
+                                   FROM github_approval_continuations
+                                   WHERE predecessor_proposal_key=? AND predecessor_task_id=?
+                                     AND item_key=? AND contract_digest_sha256=?
+                                     AND blocker_class='internal'""",
+                                (str(candidate["proposal_key"]), predecessor_task_id,
+                                 proposal.item_key, proposal.contract_digest_sha256),
+                            ).fetchone()
+                        if binding is not None:
+                            continuation = kanban.execute(
+                                "SELECT status,idempotency_key FROM tasks WHERE id=?",
+                                (str(binding["continuation_task_id"]),),
+                            ).fetchone()
+                            if (continuation is not None
+                                    and str(continuation[0]) in {"ready", "in_progress", "running"}
+                                    and str(continuation[1]) == str(binding["continuation_idempotency_key"])):
+                                task_id = str(binding["continuation_task_id"])
+                                continuation_key = str(binding["continuation_idempotency_key"])
             except sqlite3.Error:
                 return None
-            if task is None or str(task[0]) not in {"ready", "in_progress", "running"}:
+            if (task is None or (
+                    str(task[0]) not in {"ready", "in_progress", "running"}
+                    and task_id == predecessor_task_id)):
                 continue
             try:
                 descendant = ancestry_checker(
@@ -335,57 +496,123 @@ class GitHubApprovalBroker:
             kanban_guard = sqlite3.connect(Path(kanban_path), timeout=30.0)
             try:
                 kanban_guard.execute("BEGIN IMMEDIATE")
+                live_predecessor = kanban_guard.execute(
+                    "SELECT status,block_kind FROM tasks WHERE id=?", (predecessor_task_id,)
+                ).fetchone()
                 live_task = kanban_guard.execute(
-                    "SELECT status FROM tasks WHERE id=?", (task_id,)
+                    ("SELECT status,idempotency_key FROM tasks WHERE id=?"
+                     if continuation_key is not None else
+                     "SELECT status FROM tasks WHERE id=?"),
+                    (task_id,),
                 ).fetchone()
                 if (live_task is None
-                        or str(live_task[0]) not in {"ready", "in_progress", "running"}):
+                        or str(live_task[0]) not in {"ready", "in_progress", "running"}
+                        or (continuation_key is not None
+                            and (live_predecessor is None
+                                 or str(live_predecessor[0]) != "blocked"
+                                 or live_predecessor[1] not in (None, "transient")
+                                 or str(live_task[1]) != continuation_key))):
                     kanban_guard.rollback()
                     continue
                 now = time.time()
                 with self._connect() as db:
                     db.execute("BEGIN IMMEDIATE")
-                    if db.execute(
-                        "SELECT 1 FROM github_approval_proposals WHERE proposal_key=?", (key,)
-                    ).fetchone() is not None:
-                        db.commit()
-                        return None
+                    exact = db.execute(
+                        "SELECT * FROM github_approval_proposals WHERE proposal_key=?", (key,)
+                    ).fetchone()
+                    if exact is not None:
+                        expected = (
+                            question, session_key, chat_id, thread_id,
+                            authorized_user_id, destination_id,
+                        )
+                        observed = (
+                            str(exact["question"]), str(exact["session_key"]),
+                            str(exact["chat_id"]),
+                            str(exact["thread_id"]) if exact["thread_id"] is not None else None,
+                            str(exact["authorized_user_id"]),
+                            (str(exact["destination_id"])
+                             if exact["destination_id"] is not None else None),
+                        )
+                        if (str(exact["state"]) not in {"pending_notification", "active"}
+                                or observed != expected):
+                            db.rollback()
+                            return None
                     predecessor = db.execute(
-                        """SELECT p.state,p.response,p.approver,r.outcome,r.task_id
+                        """SELECT p.state,p.response,p.approver,p.origin_status,r.outcome,r.task_id,
+                                  c.continuation_task_id,c.continuation_idempotency_key,
+                                  c.blocker_class
                            FROM github_approval_proposals p
                            JOIN github_approval_decisions d USING(proposal_key)
                            JOIN github_approval_reconciliations r USING(decision_id)
+                           LEFT JOIN github_approval_continuations c
+                             ON c.predecessor_proposal_key=p.proposal_key
                            WHERE p.proposal_key=?""", (predecessor_key,)
                     ).fetchone()
-                    if (predecessor is None or predecessor["state"] != "answered"
+                    if (predecessor is None
+                            or (predecessor["state"] != "answered"
+                                and continuation_key is None)
                             or predecessor["response"] != "Approve"
+                            or predecessor["origin_status"] in {"closed", "merged", "superseded"}
                             or predecessor["outcome"] != "approved"
-                            or str(predecessor["task_id"]) != task_id):
+                            or str(predecessor["task_id"]) != predecessor_task_id
+                            or (continuation_key is not None and (
+                                predecessor["blocker_class"] != "internal"
+                                or str(predecessor["continuation_task_id"]) != task_id
+                                or str(predecessor["continuation_idempotency_key"])
+                                != continuation_key))):
                         db.rollback()
                         return None
+                    retired = [str(row["clarify_id"]) for row in db.execute(
+                        """SELECT clarify_id FROM github_approval_proposals
+                           WHERE item_key=? AND proposal_key!=?
+                             AND state IN ('dispatching','delivery_unknown','active')
+                             AND message_id IS NOT NULL""",
+                        (proposal.item_key, key),
+                    ).fetchall()]
+                    if (exact is not None and exact["state"] == "active"
+                            and exact["message_id"] is not None):
+                        retired.append(str(exact["clarify_id"]))
                     db.execute(
                         "UPDATE github_approval_proposals SET state='superseded',callback_bound=0,"
-                        "retirement_pending=0,retirement_retry_after=NULL,updated_at=? "
-                        "WHERE item_key=? AND state IN "
+                        "retirement_pending=CASE WHEN message_id IS NOT NULL THEN 1 ELSE 0 END,"
+                        "retirement_action=CASE WHEN message_id IS NOT NULL THEN 'delete' ELSE NULL END,"
+                        "retirement_retry_after=NULL,updated_at=? "
+                        "WHERE item_key=? AND proposal_key!=? AND state IN "
                         "('pending_notification','dispatching','delivery_unknown','active')",
-                        (now, proposal.item_key),
+                        (now, proposal.item_key, key),
                     )
-                    clarify_id = f"gha-{key[:24]}"
-                    db.execute(
-                        """INSERT INTO github_approval_proposals(
-                            proposal_key,item_key,head_sha,contract_digest_sha256,executor,state,
-                            clarify_id,session_key,chat_id,thread_id,authorized_user_id,destination_id,
-                            question,message_id,callback_bound,response,approver,created_at,updated_at)
-                           VALUES(?,?,?,?,?,'answered',?,?,?,?,?,?,?,NULL,0,'Approve',?,?,?)""",
-                        (key, proposal.item_key, proposal.head_sha,
-                         proposal.contract_digest_sha256, proposal.executor, clarify_id,
-                         session_key, chat_id, thread_id, authorized_user_id, destination_id,
-                         question, str(predecessor["approver"]), now, now),
-                    )
+                    if exact is None:
+                        clarify_id = f"gha-{key[:24]}"
+                        message_id = None
+                        db.execute(
+                            """INSERT INTO github_approval_proposals(
+                                proposal_key,item_key,head_sha,contract_digest_sha256,executor,state,
+                                clarify_id,session_key,chat_id,thread_id,authorized_user_id,destination_id,
+                                question,message_id,callback_bound,response,approver,created_at,updated_at)
+                               VALUES(?,?,?,?,?,'answered',?,?,?,?,?,?,?,NULL,0,'Approve',?,?,?)""",
+                            (key, proposal.item_key, proposal.head_sha,
+                             proposal.contract_digest_sha256, proposal.executor, clarify_id,
+                             session_key, chat_id, thread_id, authorized_user_id, destination_id,
+                             question, str(predecessor["approver"]), now, now),
+                        )
+                    else:
+                        clarify_id = str(exact["clarify_id"])
+                        message_id = (str(exact["message_id"])
+                                      if exact["message_id"] is not None else None)
+                        db.execute(
+                            """UPDATE github_approval_proposals
+                               SET state='answered',callback_bound=0,response='Approve',approver=?,
+                                   owner_instance_id=NULL,lease_expires_at=NULL,last_error=NULL,
+                                   retirement_pending=CASE WHEN message_id IS NOT NULL THEN 1 ELSE 0 END,
+                                   retirement_action=CASE WHEN message_id IS NOT NULL THEN 'delete' ELSE NULL END,
+                                   retirement_retry_after=NULL,updated_at=?
+                               WHERE proposal_key=? AND state IN ('pending_notification','active')""",
+                            (str(predecessor["approver"]), now, key),
+                        )
                     db.execute(
                         """INSERT INTO github_approval_decisions(
                             proposal_key,response,approver,state,decided_at)
-                           VALUES(?,'Approve',?,'pending',?)""",
+                           VALUES(?,'Approve',?,'pending',?) ON CONFLICT(proposal_key) DO NOTHING""",
                         (key, str(predecessor["approver"]), now),
                     )
                     db.execute(
@@ -394,10 +621,42 @@ class GitHubApprovalBroker:
                     )
                     db.commit()
                 kanban_guard.commit()
-                return RequestOutcome("inherited", key, clarify_id, response="Approve")
+                return RequestOutcome(
+                    "inherited", key, clarify_id, message_id=message_id, response="Approve",
+                    retired_clarify_ids=tuple(dict.fromkeys(retired)),
+                )
             finally:
                 kanban_guard.close()
         return None
+
+    async def retire_inherited_cards(self, outcome: RequestOutcome, *, adapter: Any) -> int:
+        """Remove human cards made redundant by a committed inherited decision."""
+        if outcome.action != "inherited" or not outcome.retired_clarify_ids:
+            return 0
+        delete = getattr(adapter, "delete_clarify_card", None)
+        if not callable(delete):
+            logger.warning("Approval adapter cannot retire inherited GitHub approval cards")
+            return 0
+        retired = 0
+        for clarify_id in outcome.retired_clarify_ids:
+            try:
+                deleted = await _await(delete(clarify_id))
+            except Exception:
+                logger.exception("Could not delete GitHub approval card retired by inheritance")
+                continue
+            if deleted is False:
+                logger.warning("Telegram did not delete inherited GitHub approval card %s", clarify_id)
+                continue
+            with self._connect() as db:
+                retired += db.execute(
+                    """UPDATE github_approval_proposals
+                       SET retirement_pending=0,retirement_action=NULL,
+                           retirement_retry_after=NULL,updated_at=?
+                       WHERE clarify_id=? AND retirement_pending=1
+                         AND retirement_action='delete'""",
+                    (time.time(), clarify_id),
+                ).rowcount
+        return retired
 
     def admit(self, proposal: ApprovalProposal, *, adapter: Any, chat_id: str, question: str,
               session_key: str, authorized_user_id: str,
@@ -506,10 +765,12 @@ class GitHubApprovalBroker:
             observed = self.observe_key(proposal_key)
             if delivered and observed is not None and observed.get("state") == "superseded":
                 with self._connect() as db:
-                    db.execute("UPDATE github_approval_proposals SET message_id=?,retirement_pending=0,"
+                    db.execute("UPDATE github_approval_proposals SET message_id=?,"
+                               "retirement_pending=CASE WHEN ? IS NOT NULL THEN 1 ELSE 0 END,"
+                               "retirement_action=CASE WHEN ? IS NOT NULL THEN 'delete' ELSE NULL END,"
                                "retirement_retry_after=NULL,updated_at=? "
                                "WHERE proposal_key=? AND state='superseded'",
-                               (message_id, time.time(), proposal_key))
+                               (message_id, message_id, message_id, time.time(), proposal_key))
                 delete = getattr(adapter, "delete_clarify_card", None)
                 if callable(delete):
                     try:
@@ -521,6 +782,16 @@ class GitHubApprovalBroker:
                             logger.warning(
                                 "Telegram did not delete GitHub approval card superseded during delivery %s",
                                 row["clarify_id"])
+                        else:
+                            with self._connect() as db:
+                                db.execute(
+                                    """UPDATE github_approval_proposals
+                                       SET retirement_pending=0,retirement_action=NULL,
+                                           retirement_retry_after=NULL,updated_at=?
+                                       WHERE proposal_key=? AND state='superseded'
+                                         AND retirement_action='delete'""",
+                                    (time.time(), proposal_key),
+                                )
                 return RequestOutcome("superseded", proposal_key, str(row["clarify_id"]), message_id)
             return RequestOutcome("operator_reconciliation", proposal_key, str(row["clarify_id"]))
         action = "sent" if state == "active" else ("pending_retry" if explicit_failure else "operator_reconciliation")
@@ -554,13 +825,14 @@ class GitHubApprovalBroker:
 
     async def retry_retirements(self, *, adapter: Any, limit: int = 16) -> int:
         """Retry stale-card keyboard removal; success is durably verified by clearing the marker."""
-        # Superseded cards are already fail-closed in the broker. Their Telegram edit is cosmetic,
-        # so never let historical cards create an unbounded outbound retry queue.
+        # Historical cosmetic supersession edits remain non-retryable. Inherited approvals use
+        # an explicit delete action because their redundant authority card is not merely cosmetic.
         with self._connect() as db:
             db.execute(
                 "UPDATE github_approval_proposals SET retirement_pending=0,"
                 "retirement_retry_after=NULL,updated_at=? "
-                "WHERE state='superseded' AND retirement_pending=1",
+                "WHERE state='superseded' AND retirement_pending=1 "
+                "AND COALESCE(retirement_action,'')!='delete'",
                 (time.time(),),
             )
         destination_id = self._destination_identity(adapter, "")
@@ -570,16 +842,17 @@ class GitHubApprovalBroker:
         with self._connect() as db:
             rows = db.execute(
                 "SELECT proposal_key,clarify_id,session_key,chat_id,message_id,thread_id,state,response,question,"
-                "resolution_original_text,resolution_decision_text,resolution_parse_mode "
+                "resolution_original_text,resolution_decision_text,resolution_parse_mode,retirement_action "
                 "FROM github_approval_proposals "
-                "WHERE state='answered' AND retirement_pending=1 "
+                "WHERE state IN ('answered','superseded') AND retirement_pending=1 "
                 "AND message_id IS NOT NULL AND destination_id=? "
                 "AND (retirement_retry_after IS NULL OR retirement_retry_after<=?) "
                 "ORDER BY updated_at LIMIT ?", (destination_id, now, max(1, int(limit)))).fetchall()
         retired = 0
         resolve = getattr(adapter, "resolve_clarify_card", None)
         retire = getattr(adapter, "retire_clarify_card", None)
-        if not callable(resolve) and not callable(retire):
+        delete = getattr(adapter, "delete_clarify_card", None)
+        if not callable(resolve) and not callable(retire) and not callable(delete):
             return 0
         for row in rows:
             restore = getattr(adapter, "recover_approval_retirement", None)
@@ -589,7 +862,13 @@ class GitHubApprovalBroker:
                     str(row["message_id"]),
                     str(row["thread_id"]) if row["thread_id"] is not None else None)
             try:
-                if callable(resolve) and row["state"] == "answered":
+                if row["retirement_action"] == "delete":
+                    if not callable(delete):
+                        continue
+                    deleted = await _await(delete(str(row["clarify_id"])))
+                    if deleted is False:
+                        continue
+                elif callable(resolve) and row["state"] == "answered":
                     original = row["resolution_original_text"]
                     decision = row["resolution_decision_text"]
                     await _await(resolve(
@@ -618,7 +897,7 @@ class GitHubApprovalBroker:
                     with self._connect() as db:
                         db.execute(
                             "UPDATE github_approval_proposals SET retirement_retry_after=?,updated_at=? "
-                            "WHERE state='answered' AND retirement_pending=1 "
+                            "WHERE state IN ('answered','superseded') AND retirement_pending=1 "
                             "AND message_id IS NOT NULL AND destination_id=? "
                             "AND (retirement_retry_after IS NULL OR retirement_retry_after<=?)",
                             (cooldown_started + retry_after, cooldown_started,
@@ -629,8 +908,10 @@ class GitHubApprovalBroker:
                 continue
             with self._connect() as db:
                 retired += db.execute(
-                    "UPDATE github_approval_proposals SET retirement_pending=0,retirement_retry_after=NULL,updated_at=? "
-                    "WHERE proposal_key=? AND state='answered' AND retirement_pending=1",
+                    "UPDATE github_approval_proposals SET retirement_pending=0,retirement_action=NULL,"
+                    "retirement_retry_after=NULL,updated_at=? "
+                    "WHERE proposal_key=? AND state IN ('answered','superseded') "
+                    "AND retirement_pending=1",
                     (time.time(), str(row["proposal_key"]))).rowcount
         return retired
 
@@ -717,6 +998,7 @@ class GitHubApprovalBroker:
                     return None
                 db.execute("UPDATE github_approval_proposals SET state='answered',response=?,approver=?,"
                            "callback_bound=0,retirement_pending=CASE WHEN message_id IS NOT NULL THEN 1 ELSE 0 END,"
+                           "retirement_action=CASE WHEN message_id IS NOT NULL THEN 'resolve' ELSE NULL END,"
                            "resolution_original_text=?,resolution_decision_text=?,resolution_parse_mode=?,"
                            "updated_at=? WHERE clarify_id=? AND state='active'",
                            (response, approver, resolution_original_text, resolution_decision_text,
@@ -756,12 +1038,16 @@ class GitHubApprovalBroker:
         now = time.time()
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "UPDATE github_approval_proposals SET origin_status=?,updated_at=? WHERE item_key=?",
+                (status, now, item_key),
+            )
             changed = db.execute(
                 "UPDATE github_approval_proposals SET state='superseded',callback_bound=0,"
-                "lease_expires_at=NULL,origin_status=?,retirement_pending=0,"
+                "lease_expires_at=NULL,retirement_pending=0,"
                 "retirement_retry_after=NULL,updated_at=? WHERE item_key=? "
                 "AND state IN ('pending_notification','dispatching','delivery_unknown','active','answered')",
-                (status, now, item_key),
+                (now, item_key),
             ).rowcount
             db.execute("UPDATE github_approval_decisions SET state='stale' "
                        "WHERE state IN ('pending','claimed') AND proposal_key IN "

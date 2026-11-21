@@ -17,6 +17,7 @@ import urllib.request
 from pathlib import Path
 from typing import Iterable
 
+from gateway.github_approval_broker import GitHubApprovalBroker
 from gateway.github_approval_reconciler import ApprovalDecisionReconciler, IntakeScriptLiveReader
 from hermes_cli.kanban_db import kanban_db_path
 from hermes_cli.webhook import _load_subscriptions, _route_url
@@ -294,8 +295,32 @@ def run_once(*, dry_run: bool) -> dict:
 
 def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dry-run", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true")
+    mode.add_argument(
+        "--bind-internal-continuation", nargs=3,
+        metavar=("PREDECESSOR_PROPOSAL_KEY", "PREDECESSOR_TASK_ID", "CONTINUATION_TASK_ID"),
+    )
     args = parser.parse_args(argv)
+    if args.bind_internal_continuation is not None:
+        predecessor_proposal_key, predecessor_task_id, continuation_task_id = (
+            args.bind_internal_continuation
+        )
+        broker = GitHubApprovalBroker(
+            BROKER, instance_id="github-approval-maintenance:continuation-binding")
+        broker.bind_internal_continuation(
+            predecessor_proposal_key=predecessor_proposal_key,
+            predecessor_task_id=predecessor_task_id,
+            continuation_task_id=continuation_task_id,
+            kanban_path=kanban_db_path(),
+        )
+        print(json.dumps({
+            "action": "internal_continuation_bound",
+            "predecessor_proposal_key": predecessor_proposal_key,
+            "predecessor_task_id": predecessor_task_id,
+            "continuation_task_id": continuation_task_id,
+        }, sort_keys=True, separators=(",", ":")))
+        return 0
     result = run_once(dry_run=args.dry_run)
     if args.dry_run or result["emitted"] or result["projected"]:
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
