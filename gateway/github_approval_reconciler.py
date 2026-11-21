@@ -460,6 +460,17 @@ class ApprovalDecisionReconciler:
             for value in self._iter_ledger()
         )
 
+    def _ledger_entry(self, request_id: str) -> Optional[dict]:
+        matches = [
+            value for value in self._iter_ledger()
+            if value.get("approval_request_id") == request_id
+        ]
+        if not matches:
+            return None
+        if any(value != matches[0] for value in matches[1:]):
+            raise RuntimeError("canonical approval ledger contains conflicting request entries")
+        return matches[0]
+
     def _append_ledger(self, row: sqlite3.Row, request_id: str) -> None:
         if self._ledger_has(request_id):
             return
@@ -495,7 +506,7 @@ class ApprovalDecisionReconciler:
         if created:
             _fsync_directory(self.ledger_path.parent)
 
-    def _create_task(self, row: sqlite3.Row) -> str:
+    def _create_task(self, row: sqlite3.Row, ledger_entry: Optional[dict] = None) -> str:
         from hermes_cli.kanban_db import create_task
         from hermes_cli.kanban_db_connect import connect
 
@@ -519,6 +530,47 @@ class ApprovalDecisionReconciler:
         )
         conn = connect(self.kanban_path)
         try:
+            if (ledger_entry is not None
+                    and row["inherited_task_id"] is None
+                    and ledger_entry.get("inherited_from_approval_request_id") is not None):
+                expected = {
+                    "work_item": str(row["item_key"]),
+                    "head_sha": str(row["head_sha"]),
+                    "contract_digest_sha256": str(row["contract_digest_sha256"]),
+                }
+                predecessor_request = str(ledger_entry.get("inherited_from_approval_request_id", ""))
+                original_decision = ledger_entry.get("original_decision_id")
+                if (ledger_entry.get("schema") != "hermes.github-approval.v1"
+                        or ledger_entry.get("status") != "approved_terminal_successor_contract"
+                        or any(str(ledger_entry.get(key, "")) != value
+                               for key, value in expected.items())
+                        or str(ledger_entry.get("executor", "")).lower() != str(row["executor"]).lower()
+                        or not predecessor_request.startswith(
+                            f"hermes:github:{row['item_key']}:"
+                        )
+                        or not isinstance(original_decision, int) or original_decision <= 0
+                        or not str(ledger_entry.get("reconciliation_reason", "")).strip()):
+                    raise RuntimeError("canonical approval ledger binding conflicts with pending decision")
+                bound_task_id = ledger_entry.get("inherited_task_id")
+                if bound_task_id is not None:
+                    bound = conn.execute(
+                        "SELECT id,body,idempotency_key,completion_contract FROM tasks "
+                        "WHERE id=? AND status IN ('ready','in_progress','running')",
+                        (str(bound_task_id),),
+                    ).fetchone()
+                    if bound is not None:
+                        body = str(bound["body"] or "")
+                        idempotency_key = str(bound["idempotency_key"] or "")
+                        if (str(row["item_key"]) not in body
+                                or str(row["contract_digest_sha256"]) not in body
+                                or not idempotency_key.startswith("github-")
+                                or str(row["item_key"]) not in idempotency_key
+                                or str(row["contract_digest_sha256"]) not in idempotency_key
+                                or str(bound["completion_contract"]) != "local-only"):
+                            raise RuntimeError(
+                                "canonical approval ledger task conflicts with successor binding"
+                            )
+                        return str(bound["id"])
             inherited_task_id = row["inherited_task_id"]
             if inherited_task_id is not None:
                 inherited = conn.execute(
@@ -621,9 +673,10 @@ class ApprovalDecisionReconciler:
                     results.append(self._finish(row, "stale", reason=reason))
                     continue
                 request_id = self._request_id(row)
+                ledger_entry = self._ledger_entry(request_id)
                 self._append_ledger(row, request_id)
                 if stop_after == "ledger":
                     break
-                task_id = self._create_task(row)
+                task_id = self._create_task(row, ledger_entry=ledger_entry)
                 results.append(self._finish(row, "approved", request_id=request_id, task_id=task_id))
         return results
