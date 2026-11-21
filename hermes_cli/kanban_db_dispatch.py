@@ -1090,6 +1090,12 @@ class _DeadWorker:
     terminal_provider: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
+    infrastructure: bool = False
+    """The owner gateway disappeared after settling this attempt interrupted.
+
+    The replacement dispatcher requeues it without charging the task failure
+    budget; the task itself did not fail.
+    """
 
     @property
     def run_outcome(self) -> str:
@@ -1292,11 +1298,28 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     auto_blocked: list[str] = []
     fp_counts: dict[str, int] = {}
     for _, _, _, dead in crash_details:
+        if dead.infrastructure or dead.protocol_violation or dead.terminal_provider:
+            continue
         fp = _error_fingerprint(dead.error_text)
         fp_counts[fp] = fp_counts.get(fp, 0) + 1
     for tid, pid, claimer, dead in crash_details:
         error_text = dead.error_text
-        if dead.protocol_violation:
+        if dead.infrastructure:
+            tripped = _record_task_failure(
+                conn, tid,
+                error=error_text,
+                outcome="crashed",
+                release_claim=False,
+                end_run=False,
+                infrastructure=True,
+                event_payload_extra={
+                    "pid": pid,
+                    "claimer": claimer,
+                    "infrastructure": True,
+                    "restart_interrupted": True,
+                },
+            )
+        elif dead.protocol_violation:
             streak = _protocol_violation_streak(conn, tid)
             trow = conn.execute("SELECT max_retries FROM tasks WHERE id = ?", (tid,)).fetchone()
             if trow is None:
@@ -1407,6 +1430,90 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
                 **hook_fields,
             )
     return sweep.crashed
+
+
+def recover_restart_interrupted_blocks(conn: sqlite3.Connection) -> int:
+    """Release breaker blocks whose final charged attempt was a gateway restart.
+
+    There is a narrow shutdown race where the old dispatcher can book a dead
+    worker before the owner process exits. At that instant the interruption is
+    indistinguishable from an ordinary worker failure and may trip the breaker.
+    The replacement gateway can inspect the ended run by id, prove that its
+    exact owner is gone, roll back only that failure charge, and restore the
+    run's source lane. Explicit/sticky blocks remain untouched.
+    """
+    from hermes_cli.kanban_owner_recovery import owner_interrupted_by_restart
+
+    recovered = 0
+    with _kb.write_txn(conn):
+        rows = conn.execute(
+            "SELECT id, consecutive_failures FROM tasks WHERE status='blocked'"
+        ).fetchall()
+        for row in rows:
+            task_id = row["id"]
+            if _kb._has_sticky_block(conn, task_id):
+                continue
+            gave_up = conn.execute(
+                "SELECT id, run_id, payload FROM task_events "
+                "WHERE task_id=? AND kind='gave_up' ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            run_id = _kb._row_get(gave_up, "run_id")
+            if run_id is None:
+                continue
+            payload = _kb._json_dict(_kb._row_get(gave_up, "payload"))
+            if payload.get("sticky") or payload.get("trigger_outcome") != "crashed":
+                continue
+            already_recovered = conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id=? AND run_id=? "
+                "AND kind='restart_recovered' AND id>? LIMIT 1",
+                (task_id, run_id, gave_up["id"]),
+            ).fetchone()
+            if already_recovered is not None:
+                continue
+            run = conn.execute(
+                "SELECT outcome FROM task_runs WHERE id=? AND task_id=? AND ended_at IS NOT NULL",
+                (run_id, task_id),
+            ).fetchone()
+            if run is None or run["outcome"] != "crashed":
+                continue
+            worker_lost = conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id=? AND run_id=? "
+                "AND kind='worker_lost' LIMIT 1",
+                (task_id, run_id),
+            ).fetchone()
+            if worker_lost is None:
+                continue
+            if not owner_interrupted_by_restart(conn, task_id, run_id=run_id):
+                continue
+            failures = int(row["consecutive_failures"] or 0)
+            resume_status = _kb._retry_status_for_run(conn, task_id, run_id)
+            cur = conn.execute(
+                "UPDATE tasks SET status=?, consecutive_failures=?, "
+                "last_failure_error=? WHERE id=? AND status='blocked'",
+                (
+                    resume_status,
+                    max(0, failures - 1),
+                    "gateway restart interrupted the prior attempt; resumed automatically",
+                    task_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                continue
+            _kb._append_event(
+                conn,
+                task_id,
+                "restart_recovered",
+                {
+                    "run_id": run_id,
+                    "resume_status": resume_status,
+                    "failures_before": failures,
+                    "failures_after": max(0, failures - 1),
+                },
+                run_id=run_id,
+            )
+            recovered += 1
+    return recovered
 
 
 def _record_task_failure(
@@ -2328,7 +2435,8 @@ def _run_reclaim_phase(
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn)
-    result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
+    result.promoted = recover_restart_interrupted_blocks(conn)
+    result.promoted += _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 
 def _tick_spawn_budget(

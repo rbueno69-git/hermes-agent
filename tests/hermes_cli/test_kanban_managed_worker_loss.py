@@ -15,6 +15,7 @@ lost attempt:
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -97,7 +98,8 @@ class _Board:
         if owner:
             request_id = f'kanban:["default","{tid}",{run_id}]'
             self.event(tid, run_id, "owner_admitted",
-                       {"db": str(self.ledger), "session_id": "sess-1", "pid": owner_pid or _absent_pid(base=3_950_000),
+                       {"db": str(self.ledger), "session_id": "sess-1",
+                        "pid": os.getpid() if owner_pid is None else owner_pid,
                         "request_id": request_id}, started + 3)
             if admission:
                 with sqlite3.connect(self.ledger) as store:
@@ -164,6 +166,171 @@ def test_a_killed_managed_worker_blocks_the_card_at_the_failure_limit(board):
     kinds = [r["kind"] for r in board.conn.execute(
         "SELECT kind FROM task_events WHERE task_id = 't_killed' ORDER BY id")]
     assert "gave_up" in kinds
+
+
+def test_gateway_restart_interruption_requeues_without_spending_failure_budget(board):
+    """A dead gateway that settled the attempt as interrupted is infrastructure, not task failure.
+
+    The replacement gateway must reclaim and immediately make the card dispatchable without
+    tripping the circuit breaker, even when the card was one failure below its limit.
+    """
+    dead_gateway = _absent_pid(base=3_955_000)
+    run_id = board.running(
+        "t_restart", claim_expires_in=900, heartbeat_age=30,
+        owner_pid=dead_gateway, worker_lost="managed_worker_failed",
+    )
+    board.conn.execute(
+        "UPDATE tasks SET consecutive_failures = ? WHERE id = 't_restart'",
+        (kbd.DEFAULT_FAILURE_LIMIT - 1,),
+    )
+    board.conn.commit()
+
+    board.tick()
+
+    row, run = board.state("t_restart"), board.run(run_id)
+    assert row["status"] == "ready"
+    assert row["consecutive_failures"] == kbd.DEFAULT_FAILURE_LIMIT - 1
+    assert json.loads(run["metadata"])["infrastructure"] is True
+    assert not list(board.conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id='t_restart' AND kind='gave_up'"
+    ))
+
+
+def test_deliberate_interruption_without_worker_loss_still_charges_failure(board):
+    """Dead-owner evidence alone must not turn Stop/cancellation into a restart retry."""
+    dead_gateway = _absent_pid(base=3_955_500)
+    run_id = board.running(
+        "t_stopped", claim_expires_in=900, heartbeat_age=30,
+        owner_pid=dead_gateway,
+    )
+
+    board.tick(failure_limit=2)
+
+    row, run = board.state("t_stopped"), board.run(run_id)
+    assert row["status"] == "ready"
+    assert row["consecutive_failures"] == 1
+    assert "infrastructure" not in json.loads(run["metadata"])
+
+
+def test_replacement_gateway_recovers_a_block_already_charged_during_shutdown(board):
+    """A shutdown race may book the interruption before the old owner exits.
+
+    On the replacement gateway's first tick the now-dead owner is authoritative
+    evidence that the last charged failure was infrastructure, so exactly that
+    charge is rolled back and the card becomes dispatchable.
+    """
+    dead_gateway = _absent_pid(base=3_956_000)
+    run_id = board.running(
+        "t_shutdown_race", claim_expires_in=900, heartbeat_age=30,
+        owner_pid=dead_gateway, worker_lost="managed_worker_failed",
+    )
+    board.conn.execute(
+        "UPDATE task_runs SET status='crashed', outcome='crashed', ended_at=? WHERE id=?",
+        (NOW - 1, run_id),
+    )
+    board.conn.execute(
+        "UPDATE tasks SET status='blocked', claim_lock=NULL, claim_expires=NULL, "
+        "worker_pid=NULL, worker_started_at=NULL, current_run_id=NULL, "
+        "consecutive_failures=? WHERE id='t_shutdown_race'",
+        (kbd.DEFAULT_FAILURE_LIMIT,),
+    )
+    board.event(
+        "t_shutdown_race", run_id, "gave_up",
+        {"failures": kbd.DEFAULT_FAILURE_LIMIT, "effective_limit": kbd.DEFAULT_FAILURE_LIMIT,
+         "trigger_outcome": "crashed", "retry_status": "ready"},
+        NOW - 1,
+    )
+    board.conn.commit()
+
+    board.tick()
+
+    row = board.state("t_shutdown_race")
+    assert row["status"] == "ready"
+    assert row["consecutive_failures"] == kbd.DEFAULT_FAILURE_LIMIT - 1
+    event = board.conn.execute(
+        "SELECT payload FROM task_events WHERE task_id='t_shutdown_race' "
+        "AND kind='restart_recovered' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert json.loads(event[0])["run_id"] == run_id
+
+
+def test_terminal_provider_failure_stays_blocked_across_gateway_restart(board):
+    """A dead owner never downgrades an explicit unhealable provider verdict."""
+    dead_gateway = _absent_pid(base=3_957_000)
+    run_id = board.running(
+        "t_provider", claim_expires_in=900, heartbeat_age=30,
+        owner_pid=dead_gateway,
+    )
+    from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+    log = kb.worker_log_path("t_provider")
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text(
+        f"provider rejected configured credential\n{KANBAN_WORKER_EXIT_TRAILER}"
+        f"{kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE}\n",
+        encoding="utf-8",
+    )
+
+    board.tick()
+
+    row, run = board.state("t_provider"), board.run(run_id)
+    assert row["status"] == "blocked"
+    assert row["consecutive_failures"] == 1
+    metadata = json.loads(run["metadata"])
+    assert metadata["terminal_provider"] is True
+    assert "infrastructure" not in metadata
+
+
+def test_explicit_sticky_block_is_not_released_by_restart_recovery(board):
+    dead_gateway = _absent_pid(base=3_958_000)
+    run_id = board.running(
+        "t_sticky", claim_expires_in=900, heartbeat_age=30,
+        owner_pid=dead_gateway, worker_lost="managed_worker_failed",
+    )
+    board.conn.execute(
+        "UPDATE task_runs SET status='crashed', outcome='crashed', ended_at=? WHERE id=?",
+        (NOW - 1, run_id),
+    )
+    board.conn.execute(
+        "UPDATE tasks SET status='blocked', claim_lock=NULL, claim_expires=NULL, "
+        "worker_pid=NULL, worker_started_at=NULL, current_run_id=NULL, "
+        "consecutive_failures=? WHERE id='t_sticky'",
+        (kbd.DEFAULT_FAILURE_LIMIT,),
+    )
+    board.event(
+        "t_sticky", run_id, "gave_up",
+        {"failures": kbd.DEFAULT_FAILURE_LIMIT, "effective_limit": kbd.DEFAULT_FAILURE_LIMIT,
+         "trigger_outcome": "crashed", "retry_status": "ready"},
+        NOW - 2,
+    )
+    board.event("t_sticky", None, "blocked", {"sticky": True, "reason": "operator"}, NOW - 1)
+    board.conn.commit()
+
+    board.tick()
+
+    row = board.state("t_sticky")
+    assert row["status"] == "blocked"
+    assert row["consecutive_failures"] == kbd.DEFAULT_FAILURE_LIMIT
+    assert not list(board.conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id='t_sticky' AND kind='restart_recovered'"
+    ))
+
+
+def test_restart_infrastructure_is_excluded_from_systemic_crash_fingerprint(board):
+    details = []
+    for index, infrastructure in enumerate((True, True, False), start=1):
+        task_id = f"t_wave_{index}"
+        board.running(task_id, claim_expires_in=900, heartbeat_age=30)
+        dead = kbd._DeadWorker(
+            kind="signal", code=-9, error_text="same worker error",
+            event_kind="crashed", event_payload={}, infrastructure=infrastructure,
+        )
+        details.append((task_id, 50_000 + index, f"claim-{index}", dead))
+
+    blocked = kbd._account_crashes(board.conn, details)
+
+    assert blocked == []
+    assert board.state("t_wave_3")["status"] == "running"
+    assert board.state("t_wave_3")["consecutive_failures"] == 1
 
 
 def test_a_lost_worker_that_exited_cleanly_still_charges_the_breaker(board):

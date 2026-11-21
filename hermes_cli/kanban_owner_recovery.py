@@ -7,16 +7,25 @@ import time
 import psutil
 
 
-def _owner_receipt(conn, task_id):
-    """The parsed ``owner_admitted`` receipt of the task's CURRENT run, or None.
+def _owner_receipt(conn, task_id, run_id=None):
+    """The parsed ``owner_admitted`` receipt for one run, or None.
 
-    The receipt is the owner's pointer to its own admission ledger. No receipt means the run
-    never reached an owner (a plain dispatcher worker): nothing about it is ambiguous.
+    With no ``run_id`` this preserves the historical current-run lookup.  A
+    replacement gateway may also inspect the just-ended run after ``_end_run``
+    cleared ``tasks.current_run_id``.
     """
-    marker = conn.execute(
-        "SELECT e.payload FROM task_events e JOIN tasks t ON t.current_run_id=e.run_id "
-        "WHERE t.id=? AND e.task_id=t.id AND e.kind='owner_admitted' ORDER BY e.id DESC LIMIT 1",
-        (task_id,)).fetchone()
+    if run_id is None:
+        marker = conn.execute(
+            "SELECT e.payload FROM task_events e JOIN tasks t ON t.current_run_id=e.run_id "
+            "WHERE t.id=? AND e.task_id=t.id AND e.kind='owner_admitted' ORDER BY e.id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    else:
+        marker = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+            "AND kind='owner_admitted' ORDER BY id DESC LIMIT 1",
+            (task_id, run_id),
+        ).fetchone()
     if marker is None:
         return None
     try:
@@ -117,6 +126,27 @@ def _owner_process_gone(receipt) -> bool:
         return False
     birth = receipt.get('birth')
     return birth is not None and current != birth
+
+
+def owner_interrupted_by_restart(conn, task_id, run_id=None) -> bool:
+    """True only when a dead owner settled the selected attempt as interrupted.
+
+    ``interrupted`` by itself is too broad: a live gateway also uses it when a
+    managed worker fails.  Requiring the receipt's owner process identity to be
+    gone/recycled distinguishes a gateway or host restart from an ordinary task
+    failure, so the replacement dispatcher can retry without spending the
+    card's circuit-breaker budget.
+    """
+    receipt = _owner_receipt(conn, task_id, run_id=run_id)
+    if receipt is None:
+        return False
+    admission = _admission_row(receipt)
+    return bool(
+        admission is not None
+        and admission[0] == "terminal"
+        and admission[1] == "interrupted"
+        and _owner_process_gone(receipt)
+    )
 
 
 def _run_worker_pids(conn, task_row, task_id):
@@ -225,6 +255,15 @@ def apply_attempt_note(conn, task_id, pid, dead) -> None:
     if not note:
         return
     dead.event_payload["attempt_note"] = note
+    if (
+        bool(lost)
+        and not dead.terminal_provider
+        and not dead.rate_limited
+        and owner_interrupted_by_restart(conn, task_id)
+    ):
+        dead.infrastructure = True
+        dead.event_payload["infrastructure"] = True
+        dead.event_payload["restart_interrupted"] = True
     if lost:
         dead.event_payload["worker_lost"] = lost
         if dead.protocol_violation:
