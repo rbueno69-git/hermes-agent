@@ -425,7 +425,8 @@ class WebhookAdapter(BasePlatformAdapter):
                         ledger_path=home / "github-intake" / "approvals.jsonl",
                         kanban_path=kanban_db_path(),
                         live_reader=IntakeScriptLiveReader(
-                            intake_script=home / "scripts" / "github-hermes-intake.py"),
+                            intake_script=home / "scripts" / "github-hermes-intake.py",
+                            continuation_path=broker.path),
                         assignee=profile or "default",
                     )
                     reconcilers[cache_key] = reconciler
@@ -437,7 +438,9 @@ class WebhookAdapter(BasePlatformAdapter):
         from gateway.github_approval_broker import ApprovalProposal
         from gateway.github_approval_reconciler import IntakeScriptLiveReader
         from gateway.github_intake_continuation import (
-            IntakeContinuation, build_merge_only_contract, read_executable_references,
+            IntakeContinuation, build_clarification_contract, build_merge_only_contract,
+            read_approved_tuples,
+            read_executable_references,
         )
         from hermes_constants import get_hermes_home
 
@@ -457,9 +460,11 @@ class WebhookAdapter(BasePlatformAdapter):
         if not isinstance(authorized_user_id, str) or not authorized_user_id or not chat_id:
             return 0
         home = get_hermes_home()
-        references = read_executable_references(home / "github-intake" / "approvals.jsonl")
+        ledger = home / "github-intake" / "approvals.jsonl"
+        references = read_executable_references(ledger)
         if not references:
             return 0
+        approved_tuples = read_approved_tuples(ledger)
         continuation = IntakeContinuation(broker.path)
         github_reader = IntakeScriptLiveReader._github_api
 
@@ -478,13 +483,23 @@ class WebhookAdapter(BasePlatformAdapter):
                 authorized_user_id=authorized_user_id,
                 thread_id=extra.get("message_thread_id") or extra.get("thread_id"))
 
-        def clarification_pending(_question, _choices):
-            # Keep the observation pending until a foreground publisher can own a real waiter.
-            raise RuntimeError("native GitHub intake clarification publisher is unavailable")
+        def send_clarification(observation, question, _choices):
+            clarification = build_clarification_contract(observation, question)
+            authority = ApprovalProposal(
+                observation.item_key, observation.head_sha,
+                clarification["contract_digest_sha256"], "hermes")
+            broker.admit(
+                authority, adapter=target, chat_id=str(chat_id),
+                question=clarification["question"],
+                session_key=f"github-intake:{profile or 'default'}:{authority.canonical_key()}",
+                authorized_user_id=authorized_user_id,
+                thread_id=extra.get("message_thread_id") or extra.get("thread_id"))
+            return clarification["contract_digest_sha256"]
 
         emitted = await asyncio.to_thread(
-            continuation.reconcile, references=references, contract_builder=build,
-            approval_sender=send, clarification_sender=clarification_pending, limit=16)
+            continuation.reconcile, references=references, approved_tuples=approved_tuples,
+            contract_builder=build,
+            approval_sender=send, clarification_sender=send_clarification, limit=16)
         return len(emitted)
 
     async def _github_approval_worker_loop(self) -> None:

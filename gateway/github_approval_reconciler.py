@@ -45,9 +45,11 @@ class IntakeScriptLiveReader:
         github_reader: Optional[Callable[[str], object]] = None,
         intake_runner: Optional[Callable[[dict], dict]] = None,
         intake_script: Optional[Path] = None,
+        continuation_path: Optional[Path] = None,
     ):
         self.github_reader = github_reader or self._github_api
         self.intake_script = Path(intake_script) if intake_script else None
+        self.continuation_path = Path(continuation_path) if continuation_path else None
         self.intake_runner = intake_runner or self._run_intake
 
     @staticmethod
@@ -201,6 +203,37 @@ class IntakeScriptLiveReader:
                 continue
             if candidate.accepted and candidate.contract_digest_sha256 == expected_digest:
                 return candidate
+        if self.continuation_path is not None:
+            from gateway.github_intake_continuation import (
+                IntakeObservation, MissingMaterial, build_clarification_contract,
+                build_merge_only_contract,
+            )
+
+            with sqlite3.connect(self.continuation_path) as db:
+                db.row_factory = sqlite3.Row
+                row = db.execute(
+                    """SELECT item_key,head_sha,reason_code,title,state,detail
+                       FROM github_intake_observations
+                       WHERE item_key=? AND head_sha=?
+                         AND state IN ('approval_proposed','clarification_requested')""",
+                    (item_key, current.head_sha),
+                ).fetchone()
+            if row is not None and str(row["detail"]) == expected_digest:
+                observation = IntakeObservation(
+                    item_key=str(row["item_key"]), head_sha=str(row["head_sha"]),
+                    reason_code=str(row["reason_code"]), title=str(row["title"]),
+                )
+                if str(row["state"]) == "clarification_requested":
+                    proposal = build_clarification_contract(observation, "")
+                else:
+                    try:
+                        proposal = build_merge_only_contract(
+                            observation, "", github_reader=self.github_reader)
+                    except MissingMaterial:
+                        return current
+                if proposal["contract_digest_sha256"] == expected_digest:
+                    return LiveContract(
+                        item_key, "open", current.head_sha, expected_digest, True, current.title)
         return current
 
 
@@ -405,7 +438,7 @@ class ApprovalDecisionReconciler:
     def _iter_ledger(self) -> Iterator[dict]:
         if not self.ledger_path.exists():
             return
-        raw = self.ledger_path.read_text(encoding="utf-8")
+        raw = self.ledger_path.read_text(encoding="utf-8-sig")
         decoder = json.JSONDecoder()
         offset = 0
         while offset < len(raw):
@@ -479,8 +512,9 @@ class ApprovalDecisionReconciler:
                 "## Approved bounded proposal",
                 str(row["question"]),
                 "",
-                "Revalidate the exact live head/digest before every effect. Run all tests, reviews, build, "
-                "merge, deploy and smoke locally; GitHub compute is prohibited. Completion contract is local-only.",
+                "Revalidate the exact live head/digest before every effect. Execute only effects "
+                "explicitly authorized by the approved proposal; run local tests and review as applicable. "
+                "GitHub compute is prohibited. Completion contract is local-only.",
             )
         )
         conn = connect(self.kanban_path)

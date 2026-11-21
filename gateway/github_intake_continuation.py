@@ -16,7 +16,7 @@ _ITEM_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[1-9][0-9]*\Z")
 _SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")
 _REASON_CODES = frozenset({"missing_contract", "ineligible_contract"})
 _TERMINAL_STATES = frozenset({
-    "approval_proposed", "clarification_requested", "ignored_by_policy",
+    "approval_proposed", "approval_reconciled", "clarification_requested", "ignored_by_policy",
 })
 
 
@@ -46,15 +46,13 @@ class MissingMaterial(RuntimeError):
     """A referenced PR needs an operator choice before a bounded contract exists."""
 
 
-def read_executable_references(path: Path) -> list[str]:
-    """Read authority text only from approvals that can represent executable contracts."""
+def _iter_ledger(path: Path):
     path = Path(path)
     if not path.exists():
-        return []
+        return
     raw = path.read_text(encoding="utf-8-sig")
     decoder = json.JSONDecoder()
     offset = 0
-    references: list[str] = []
     while offset < len(raw):
         while offset < len(raw) and raw[offset].isspace():
             offset += 1
@@ -66,11 +64,47 @@ def read_executable_references(path: Path) -> list[str]:
             raise RuntimeError("canonical approval ledger contains malformed JSON") from exc
         if not isinstance(value, dict):
             raise RuntimeError("canonical approval ledger contains a non-object entry")
+        yield value
+
+
+def read_executable_references(path: Path) -> list[str]:
+    """Read authority text only from approvals that can represent executable contracts."""
+    references: list[str] = []
+    for value in _iter_ledger(path):
         status, scope = value.get("status"), value.get("scope")
         if (isinstance(status, str) and status.startswith("approved_terminal")
                 and isinstance(scope, str) and scope):
             references.append(scope)
     return references
+
+
+def read_approved_tuples(path: Path) -> set[tuple[str, str]]:
+    """Return exact approved identities; a prose reference is never approval."""
+    approved = set()
+    for value in _iter_ledger(path):
+        status = value.get("status")
+        item_key, head_sha = value.get("work_item"), value.get("head_sha")
+        if (isinstance(status, str) and status.startswith("approved_terminal")
+                and isinstance(item_key, str) and _ITEM_RE.fullmatch(item_key)
+                and isinstance(head_sha, str) and _SHA40_RE.fullmatch(head_sha)):
+            approved.add((item_key, head_sha))
+    return approved
+
+
+def build_clarification_contract(observation: IntakeObservation, reason: str) -> dict[str, str]:
+    """Build the safe bounded choice used when file-level material is unavailable."""
+    scope = (
+        f"Clarify continuation for {observation.item_key} at exact head "
+        f"{observation.head_sha}: approve the complete PR diff for merge-only execution, "
+        "with no deploy, release, workflow, Actions, checks, or hosted compute; or reject it."
+    )
+    digest = hashlib.sha256(json.dumps({
+        "item_key": observation.item_key,
+        "head_sha": observation.head_sha,
+        "mode": "exact-head-complete-diff-merge-only",
+    }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return {"question": f"{scope}\nMaterial unavailable: {reason}",
+            "contract_digest_sha256": digest}
 
 
 def build_merge_only_contract(
@@ -150,13 +184,44 @@ class IntakeContinuation:
                     reason_code TEXT NOT NULL CHECK(reason_code IN ('missing_contract','ineligible_contract')),
                     title TEXT NOT NULL,
                     state TEXT NOT NULL CHECK(state IN (
-                        'pending','approval_proposed','clarification_requested','ignored_by_policy')),
+                        'pending','approval_proposed','approval_reconciled',
+                        'clarification_requested','ignored_by_policy')),
                     detail TEXT,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     UNIQUE(item_key,head_sha)
                 )"""
             )
+            table_sql = db.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' "
+                "AND name='github_intake_observations'"
+            ).fetchone()[0]
+            if "approval_reconciled" not in table_sql:
+                db.executescript(
+                    """
+                    ALTER TABLE github_intake_observations RENAME TO github_intake_observations_v1;
+                    CREATE TABLE github_intake_observations (
+                        identity TEXT PRIMARY KEY,
+                        item_key TEXT NOT NULL,
+                        head_sha TEXT NOT NULL,
+                        reason_code TEXT NOT NULL CHECK(reason_code IN (
+                            'missing_contract','ineligible_contract')),
+                        title TEXT NOT NULL,
+                        state TEXT NOT NULL CHECK(state IN (
+                            'pending','approval_proposed','approval_reconciled',
+                            'clarification_requested','ignored_by_policy')),
+                        detail TEXT,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL,
+                        UNIQUE(item_key,head_sha)
+                    );
+                    INSERT INTO github_intake_observations
+                        (identity,item_key,head_sha,reason_code,title,state,detail,created_at,updated_at)
+                    SELECT identity,item_key,head_sha,reason_code,title,state,detail,created_at,updated_at
+                    FROM github_intake_observations_v1;
+                    DROP TABLE github_intake_observations_v1;
+                    """
+                )
 
     def record(self, observation: IntakeObservation) -> bool:
         observation.validate()
@@ -213,17 +278,24 @@ class IntakeContinuation:
         self,
         *,
         references: Sequence[str],
+        approved_tuples: set[tuple[str, str]] | None = None,
         contract_builder: Callable[[IntakeObservation, str], Mapping[str, str]],
         approval_sender: Callable[[Mapping[str, str]], object],
-        clarification_sender: Callable[[str, list[str]], object],
+        clarification_sender: Callable[[IntakeObservation, str, list[str]], object],
         limit: int = 16,
     ) -> list[dict[str, str]]:
         emitted: list[dict[str, str]] = []
+        approved_tuples = approved_tuples or set()
         for row in self._pending(limit):
             observation = IntakeObservation(
                 item_key=str(row["item_key"]), head_sha=str(row["head_sha"]),
                 reason_code=str(row["reason_code"]), title=str(row["title"]),
             )
+            if (observation.item_key, observation.head_sha) in approved_tuples:
+                action = "approval_reconciled"
+                if self._finish(observation.identity, action):
+                    emitted.append({"identity": observation.identity, "action": action})
+                continue
             reference = self._reference_for(observation.item_key, references)
             if reference is None:
                 action = "ignored_by_policy"
@@ -235,9 +307,9 @@ class IntakeContinuation:
             except MissingMaterial as exc:
                 question = f"{observation.item_key} at {observation.head_sha}: {exc}"
                 choices = ["Prepare merge-only contract", "Ignore this PR"]
-                clarification_sender(question, choices)
+                detail = clarification_sender(observation, question, choices) or str(exc)
                 action = "clarification_requested"
-                if self._finish(observation.identity, action, str(exc)):
+                if self._finish(observation.identity, action, str(detail)):
                     emitted.append({"identity": observation.identity, "action": action})
                 continue
             required = {"item_key", "head_sha", "contract_digest_sha256", "question"}
