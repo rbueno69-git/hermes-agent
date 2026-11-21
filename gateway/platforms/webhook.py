@@ -403,6 +403,8 @@ class WebhookAdapter(BasePlatformAdapter):
                 broker.recover_callbacks(target)
                 completed += len(await broker.retry_pending(adapter=target, limit=16))
                 completed += await broker.retry_retirements(adapter=target, limit=16)
+                completed += await self._reconcile_github_intake_continuations(
+                    profile=profile, broker=broker, target=target)
                 from gateway.github_approval_reconciler import (
                     ApprovalDecisionReconciler, IntakeScriptLiveReader,
                 )
@@ -429,6 +431,61 @@ class WebhookAdapter(BasePlatformAdapter):
                     reconcilers[cache_key] = reconciler
                 completed += len(await asyncio.to_thread(reconciler.reconcile, limit=16))
         return completed
+
+    async def _reconcile_github_intake_continuations(self, *, profile, broker, target) -> int:
+        """Turn referenced contractless PRs into one durable bounded approval proposal."""
+        from gateway.github_approval_broker import ApprovalProposal
+        from gateway.github_approval_reconciler import IntakeScriptLiveReader
+        from gateway.github_intake_continuation import (
+            IntakeContinuation, build_merge_only_contract, read_executable_references,
+        )
+        from hermes_constants import get_hermes_home
+
+        route = next((value for value in self._routes.values()
+                      if isinstance(value, dict)
+                      and "github_approval" in value
+                      and value.get("profile") == profile), None)
+        if route is None:
+            route = next((value for value in self._routes.values()
+                          if isinstance(value, dict) and "github_approval" in value), None)
+        if not isinstance(route, dict):
+            return 0
+        approval = route.get("github_approval")
+        extra = route.get("deliver_extra") or {}
+        authorized_user_id = approval.get("authorized_user_id") if isinstance(approval, dict) else None
+        chat_id = extra.get("chat_id")
+        if not isinstance(authorized_user_id, str) or not authorized_user_id or not chat_id:
+            return 0
+        home = get_hermes_home()
+        references = read_executable_references(home / "github-intake" / "approvals.jsonl")
+        if not references:
+            return 0
+        continuation = IntakeContinuation(broker.path)
+        github_reader = IntakeScriptLiveReader._github_api
+
+        def build(observation, reference):
+            return build_merge_only_contract(
+                observation, reference, github_reader=github_reader)
+
+        def send(proposal):
+            authority = ApprovalProposal(
+                proposal["item_key"], proposal["head_sha"],
+                proposal["contract_digest_sha256"], "hermes")
+            return broker.admit(
+                authority, adapter=target, chat_id=str(chat_id),
+                question=proposal["question"],
+                session_key=f"github-intake:{profile or 'default'}:{authority.canonical_key()}",
+                authorized_user_id=authorized_user_id,
+                thread_id=extra.get("message_thread_id") or extra.get("thread_id"))
+
+        def clarification_pending(_question, _choices):
+            # Keep the observation pending until a foreground publisher can own a real waiter.
+            raise RuntimeError("native GitHub intake clarification publisher is unavailable")
+
+        emitted = await asyncio.to_thread(
+            continuation.reconcile, references=references, contract_builder=build,
+            approval_sender=send, clarification_sender=clarification_pending, limit=16)
+        return len(emitted)
 
     async def _github_approval_worker_loop(self) -> None:
         """Startup recovery plus bounded periodic retry; SQLite claims fence peer workers."""
@@ -914,6 +971,14 @@ class WebhookAdapter(BasePlatformAdapter):
                 keep, transformed_payload = await asyncio.to_thread(
                     self._route_processor.run_route_script, script, payload)
                 if not keep:
+                    approval = route_config.get("github_approval")
+                    if (isinstance(approval, dict)
+                            and approval.get("schema") == _GITHUB_APPROVAL_SCHEMA):
+                        recorded = self._record_ineligible_github_pr(
+                            payload, profile=profile, route_name=route_name,
+                            delivery_id=delivery_id)
+                        if recorded is not None:
+                            return recorded
                     logger.info("[webhook] script ignored event=%s route=%s", event_type, route_name)
                     return web.json_response({"status": "ignored", "reason": "script", "route": route_name})
                 payload = transformed_payload if transformed_payload is not None else payload
@@ -952,6 +1017,52 @@ class WebhookAdapter(BasePlatformAdapter):
                                       "delivery_id": delivery_id}, status=202)
         return await self._dispatch_agent_run(request, route_config, route_name, profile, payload, prompt, event_type,
                                         delivery_id, now)
+
+    def _record_ineligible_github_pr(
+        self, payload: Any, *, profile: Optional[str], route_name: str, delivery_id: str,
+    ) -> Optional[web.Response]:
+        """Durably retain the exact open PR tuple before fail-closed intake ignores it."""
+        if not isinstance(payload, dict) or payload.get("action") not in {
+            "opened", "reopened", "edited", "ready_for_review", "synchronize",
+        }:
+            return None
+        repository, pull = payload.get("repository"), payload.get("pull_request")
+        if not isinstance(repository, dict) or not isinstance(pull, dict):
+            return None
+        repo, number = repository.get("full_name"), pull.get("number")
+        head = pull.get("head")
+        head_sha = head.get("sha") if isinstance(head, dict) else None
+        if (not isinstance(repo, str) or type(number) is not int or number < 1
+                or not isinstance(head_sha, str)):
+            return None
+        raw_labels = pull.get("labels")
+        labels = raw_labels if isinstance(raw_labels, list) else []
+        label_names = {
+            str(label.get("name")) for label in labels if isinstance(label, dict)
+        }
+        reason_code = "ineligible_contract" if "pink:auto" in label_names else "missing_contract"
+        try:
+            from gateway.github_approval_broker import default_broker
+            from gateway.github_intake_continuation import IntakeContinuation, IntakeObservation
+
+            with self._profile_scope(profile):
+                broker = default_broker(
+                    instance_id=f"webhook-intake:{profile or 'default'}:{route_name}")
+                if broker is None:
+                    return _json_error("GitHub intake continuation unavailable", 503)
+                continuation = IntakeContinuation(broker.path)
+                continuation.record(IntakeObservation(
+                    item_key=f"{repo}#{number}", head_sha=head_sha,
+                    reason_code=reason_code, title=str(pull.get("title") or "")[:500],
+                ))
+        except ValueError as exc:
+            logger.warning("[webhook] Rejected ineligible GitHub PR identity: %s", exc)
+            return _json_error("Malformed GitHub pull request identity", 400)
+        return web.json_response({
+            "status": "ineligible_recorded", "reason": reason_code,
+            "item_key": f"{repo}#{number}", "head_sha": head_sha,
+            "delivery_id": delivery_id,
+        }, status=202)
 
     # health: allow CC -- strict multi-schema authority validation stays fail-closed in one boundary
     async def _handle_github_approval_contract(
