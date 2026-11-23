@@ -277,6 +277,21 @@ class GitHubApprovalBroker:
             for line in str(question).splitlines()
         )
 
+    @staticmethod
+    def _matches_external_blocked_task(
+        *, block_kind: object, idempotency_key: object, body: object,
+        proposal_key: str, item_key: str, contract_digest_sha256: str,
+    ) -> bool:
+        """Verify the producer-owned task that is parked on one human dependency."""
+        lines = set(str(body or "").splitlines())
+        return (
+            str(block_kind) == "needs_input"
+            and str(idempotency_key) == f"github-approval:{proposal_key}"
+            and f"Item: `{item_key}`" in lines
+            and f"Contract digest: `{contract_digest_sha256}`" in lines
+            and f"Proposal key: `{proposal_key}`" in lines
+        )
+
     def bind_internal_continuation(
         self,
         *,
@@ -453,6 +468,7 @@ class GitHubApprovalBroker:
             predecessor_task_id = str(candidate["task_id"])
             task_id = predecessor_task_id
             continuation_key: Optional[str] = None
+            external_blocked_anchor = False
             try:
                 with sqlite3.connect(f"file:{Path(kanban_path)}?mode=ro", uri=True) as kanban:
                     task = kanban.execute(
@@ -479,11 +495,26 @@ class GitHubApprovalBroker:
                                     and str(continuation[1]) == str(binding["continuation_idempotency_key"])):
                                 task_id = str(binding["continuation_task_id"])
                                 continuation_key = str(binding["continuation_idempotency_key"])
+                        if continuation_key is None:
+                            anchored = kanban.execute(
+                                "SELECT block_kind,idempotency_key,body FROM tasks WHERE id=?",
+                                (predecessor_task_id,),
+                            ).fetchone()
+                            external_blocked_anchor = bool(
+                                anchored is not None
+                                and self._matches_external_blocked_task(
+                                    block_kind=anchored[0], idempotency_key=anchored[1],
+                                    body=anchored[2], proposal_key=str(candidate["proposal_key"]),
+                                    item_key=proposal.item_key,
+                                    contract_digest_sha256=proposal.contract_digest_sha256,
+                                )
+                            )
             except sqlite3.Error:
                 return None
             if (task is None or (
                     str(task[0]) not in {"ready", "in_progress", "running"}
-                    and task_id == predecessor_task_id)):
+                    and task_id == predecessor_task_id
+                    and not external_blocked_anchor)):
                 continue
             try:
                 descendant = ancestry_checker(
@@ -501,14 +532,33 @@ class GitHubApprovalBroker:
                 live_predecessor = kanban_guard.execute(
                     "SELECT status FROM tasks WHERE id=?", (predecessor_task_id,)
                 ).fetchone()
-                live_task = kanban_guard.execute(
-                    ("SELECT status,idempotency_key FROM tasks WHERE id=?"
-                     if continuation_key is not None else
-                     "SELECT status FROM tasks WHERE id=?"),
-                    (task_id,),
-                ).fetchone()
+                if continuation_key is not None:
+                    live_task = kanban_guard.execute(
+                        "SELECT status,idempotency_key FROM tasks WHERE id=?", (task_id,)
+                    ).fetchone()
+                elif external_blocked_anchor:
+                    live_task = kanban_guard.execute(
+                        "SELECT status,block_kind,idempotency_key,body FROM tasks WHERE id=?",
+                        (task_id,),
+                    ).fetchone()
+                else:
+                    live_task = kanban_guard.execute(
+                        "SELECT status FROM tasks WHERE id=?", (task_id,)
+                    ).fetchone()
+                external_anchor_still_valid = bool(
+                    external_blocked_anchor
+                    and live_task is not None
+                    and str(live_task[0]) == "blocked"
+                    and self._matches_external_blocked_task(
+                        block_kind=live_task[1], idempotency_key=live_task[2],
+                        body=live_task[3], proposal_key=str(candidate["proposal_key"]),
+                        item_key=proposal.item_key,
+                        contract_digest_sha256=proposal.contract_digest_sha256,
+                    )
+                )
                 if (live_task is None
-                        or str(live_task[0]) not in {"ready", "in_progress", "running"}
+                        or (str(live_task[0]) not in {"ready", "in_progress", "running"}
+                            and not external_anchor_still_valid)
                         or (continuation_key is not None
                             and (live_predecessor is None
                                  or str(live_predecessor[0]) != "blocked"

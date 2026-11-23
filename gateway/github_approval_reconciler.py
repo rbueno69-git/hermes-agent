@@ -574,11 +574,27 @@ class ApprovalDecisionReconciler:
             inherited_task_id = row["inherited_task_id"]
             if inherited_task_id is not None:
                 inherited = conn.execute(
-                    "SELECT id FROM tasks WHERE id=? AND status IN ('ready','in_progress','running')",
+                    "SELECT id,status,block_kind,idempotency_key,body FROM tasks WHERE id=?",
                     (str(inherited_task_id),),
                 ).fetchone()
-                if inherited is not None:
+                if inherited is not None and str(inherited["status"]) in {
+                    "ready", "in_progress", "running",
+                }:
                     return str(inherited["id"])
+                if (inherited is not None and str(inherited["status"]) == "blocked"
+                        and row["predecessor_proposal_key"] is not None):
+                    from gateway.github_approval_broker import GitHubApprovalBroker
+
+                    if GitHubApprovalBroker._matches_external_blocked_task(
+                        block_kind=inherited["block_kind"],
+                        idempotency_key=inherited["idempotency_key"],
+                        body=inherited["body"],
+                        proposal_key=str(row["predecessor_proposal_key"]),
+                        item_key=str(row["item_key"]),
+                        contract_digest_sha256=str(row["contract_digest_sha256"]),
+                    ):
+                        return str(inherited["id"])
+                raise RuntimeError("inherited Kanban task binding is no longer live and canonical")
             idempotency_key = self._idempotency_key(row)
             existing = conn.execute(
                 "SELECT id FROM tasks WHERE idempotency_key=? AND status!='archived' "
