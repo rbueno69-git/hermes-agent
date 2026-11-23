@@ -3939,12 +3939,13 @@ def schedule_task(
     expected_run_id: Optional[int] = None,
 ) -> bool:
     """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
-    until ``unblock_task`` re-gates it."""
+    until ``unblock_task`` re-gates it or a typed deadline becomes due."""
     with write_txn(conn):
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
                SET status       = 'scheduled',
+                   block_kind   = NULL,
                    claim_lock   = NULL,
                    claim_expires= NULL,
                    worker_pid   = NULL
