@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import re
 import secrets
@@ -26,6 +27,7 @@ import logging
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -1979,8 +1981,48 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
     return "ready"
 
 
-def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) -> int:
-    """Promote ``todo``/``blocked`` tasks whose parents are all done/archived;
+_SCHEDULED_UNTIL_RE = re.compile(
+    r"(?:^|\s)SCHEDULED_UNTIL="
+    r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?"
+    r"(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d))"
+    r"(?=\s|$)"
+)
+_GITHUB_PR_COMMENT_RE = re.compile(
+    r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+", re.IGNORECASE,
+)
+
+
+def _latest_scheduled_payload(conn: sqlite3.Connection, task_id: str) -> dict:
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'scheduled' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return _json_dict(_row_get(row, "payload")) if row else {}
+
+
+def _scheduled_until_epoch(payload: dict) -> Optional[int]:
+    """Exact aware ISO-8601 deadline from a scheduled receipt."""
+    reason = payload.get("reason")
+    if not isinstance(reason, str):
+        return None
+    match = _SCHEDULED_UNTIL_RE.search(reason)
+    if not match:
+        return None
+    token = match.group(1)
+    try:
+        parsed = datetime.fromisoformat(token[:-1] + "+00:00" if token.endswith("Z") else token)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return math.ceil(parsed.timestamp())
+
+
+def recompute_ready(
+    conn: sqlite3.Connection, failure_limit: int | None = None, *, now: int | None = None,
+) -> int:
+    """Promote due ``scheduled`` and eligible ``todo``/``blocked`` tasks;
     returns the count. Opens its own IMMEDIATE txn — call OUTSIDE any write txn.
 
     ``blocked`` is skipped when sticky (explicit ``kanban_block``) or when
@@ -1993,15 +2035,26 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
+    if now is None:
+        now = int(time.time())
+    else:
+        now = int(now)
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
+            "FROM tasks WHERE status IN ('todo', 'blocked', 'scheduled')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            scheduled_payload = (
+                _latest_scheduled_payload(conn, task_id)
+                if cur_status == "scheduled" else {}
+            )
+            due_at = _scheduled_until_epoch(scheduled_payload) if cur_status == "scheduled" else None
+            if cur_status == "scheduled" and (due_at is None or due_at > now):
+                continue
             if _triage_invalid_continuation(conn, task_id):
                 continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
@@ -2012,6 +2065,25 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
                 "JOIN task_links l ON l.parent_id = t.id "
                 "WHERE l.child_id = ?", (task_id,),
             ).fetchall()
+            if cur_status == "scheduled":
+                landing_status = (
+                    "ready"
+                    if all(p["status"] in ("done", "archived") for p in parents)
+                    else "todo"
+                )
+                conn.execute(
+                    "UPDATE tasks SET status = ? WHERE id = ? AND status = 'scheduled'",
+                    (landing_status, task_id),
+                )
+                due_payload = {"due_at": due_at, "status": landing_status}
+                pr_comment_id = scheduled_payload.get("active_pr_comment_id")
+                if type(pr_comment_id) is int:
+                    due_payload["active_pr_comment_id"] = pr_comment_id
+                _append_event(conn, task_id, "scheduled_due", due_payload)
+                if landing_status == "ready":
+                    _append_event(conn, task_id, "promoted", {"source": "scheduled_due"})
+                    promoted += 1
+                continue
             if all(p["status"] in ("done", "archived") for p in parents):
                 resume_status = _resume_status_from_events(conn, task_id)
                 if cur_status == "blocked":
@@ -3887,7 +3959,18 @@ def schedule_task(
         run_id = _end_or_synthesize_run(
             conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
         )
-        _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
+        payload = {"reason": reason}
+        comments = conn.execute(
+            "SELECT id, body FROM task_comments WHERE task_id = ? ORDER BY id DESC",
+            (task_id,),
+        ).fetchall()
+        pr_comment = next((
+            row for row in comments
+            if _GITHUB_PR_COMMENT_RE.search(_lossy_text(row["body"]) or "")
+        ), None)
+        if pr_comment is not None:
+            payload["active_pr_comment_id"] = int(pr_comment["id"])
+        _append_event(conn, task_id, "scheduled", payload, run_id=run_id)
         return True
 
 

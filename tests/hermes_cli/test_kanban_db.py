@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 import types
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -201,6 +202,81 @@ def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
         events = kb.list_events(conn, t)
         assert any(e.kind == "scheduled" and e.payload == {"reason": "run next week"} for e in events)
 
+
+def test_recompute_ready_wakes_only_due_typed_scheduled_marker(kanban_home):
+    due = 1_800_000_000
+    due_iso = datetime.fromtimestamp(due, UTC).isoformat()
+    with kbc.connect() as conn:
+        timed = kb.create_task(conn, title="wake at deadline", assignee="ops")
+        malformed = kb.create_task(conn, title="bad marker", assignee="ops")
+        bad_offset = kb.create_task(conn, title="bad offset", assignee="ops")
+        fractional = kb.create_task(conn, title="fractional deadline", assignee="ops")
+        untimed = kb.create_task(conn, title="manual wake only", assignee="ops")
+        assert kb.schedule_task(
+            conn, timed, reason=f"SCHEDULED_UNTIL={due_iso} observe quarantine",
+        )
+        assert kb.schedule_task(
+            conn, malformed, reason="SCHEDULED_UNTIL=tomorrow observe quarantine",
+        )
+        assert kb.schedule_task(
+            conn, bad_offset, reason="SCHEDULED_UNTIL=2030-01-01T00:00:00+00:60",
+        )
+        fractional_iso = due_iso.replace("+00:00", ".900000+00:00")
+        assert kb.schedule_task(
+            conn, fractional, reason=f"SCHEDULED_UNTIL={fractional_iso}",
+        )
+        assert kb.schedule_task(conn, untimed, reason="wait for operator")
+
+        assert kb.recompute_ready(conn, now=due - 1) == 0
+        assert kb.get_task(conn, timed).status == "scheduled"
+
+        assert kb.recompute_ready(conn, now=due) == 1
+        assert kb.get_task(conn, timed).status == "ready"
+        assert kb.get_task(conn, malformed).status == "scheduled"
+        assert kb.get_task(conn, bad_offset).status == "scheduled"
+        assert kb.get_task(conn, fractional).status == "scheduled"
+        assert kb.get_task(conn, untimed).status == "scheduled"
+        assert any(
+            event.kind == "scheduled_due"
+            and event.payload == {"due_at": due, "status": "ready"}
+            for event in kb.list_events(conn, timed)
+        )
+        assert kb.recompute_ready(conn, now=due + 1) == 1
+        assert kb.get_task(conn, fractional).status == "ready"
+
+
+def test_due_schedule_is_explicit_continuation_of_existing_pr(kanban_home):
+    due = 1_800_000_000
+    due_iso = datetime.fromtimestamp(due, UTC).isoformat()
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="observe published PR", assignee="ops")
+        kb.add_comment(
+            conn, task_id, author="ops",
+            body="Continue https://github.com/example/repo/pull/724 after observation.",
+        )
+        assert kb.schedule_task(conn, task_id, reason=f"SCHEDULED_UNTIL={due_iso}")
+
+        assert kb.recompute_ready(conn, now=due) == 1
+        assert kbd.check_respawn_guard(conn, task_id) is None
+
+
+def test_due_schedule_does_not_attest_a_newer_pr_comment(kanban_home):
+    due = 1_800_000_000
+    due_iso = datetime.fromtimestamp(due, UTC).isoformat()
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="new PR after scheduling", assignee="ops")
+        kb.add_comment(
+            conn, task_id, author="ops",
+            body="Initial https://github.com/example/repo/pull/724",
+        )
+        assert kb.schedule_task(conn, task_id, reason=f"SCHEDULED_UNTIL={due_iso}")
+        kb.add_comment(
+            conn, task_id, author="ops",
+            body="Newer https://github.com/example/repo/pull/725",
+        )
+
+        assert kb.recompute_ready(conn, now=due) == 1
+        assert kbd.check_respawn_guard(conn, task_id) == "active_pr"
 
 
 

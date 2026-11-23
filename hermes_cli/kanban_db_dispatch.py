@@ -1791,19 +1791,34 @@ def check_respawn_guard(
     #    so the worker that opened the PR is still not re-spawned against it.
     #    Typed iteration-budget exhaustion is different: it durably states that
     #    this same E2E contract is unfinished, so resume against the existing PR.
-    pr_times = [t for t, c in _rows_since(conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
-                                          cols=", body", unreadable=now)  # duplicate-PR risk: fail closed
-                if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")]
-    if pr_times:
+    pr_comments = [
+        (t, int(c["id"]))
+        for t, c in _rows_since(
+            conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
+            cols=", id, body", unreadable=now,  # duplicate-PR risk: fail closed
+        )
+        if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")
+    ]
+    if pr_comments:
+        latest_pr_time, latest_pr_comment_id = max(pr_comments)
         # Strictly after: a same-second tie stays guarded (fail closed).
         if any(_is_handoff_event(e["kind"], e["payload"]) for _, e in _rows_since(
-                conn, "task_events", task_id, max(pr_times),
-                "AND kind IN ('assigned', 'changes_requested', 'review_reopened')", cols=", kind, payload", strict=True)):
+                conn, "task_events", task_id, latest_pr_time,
+                "AND kind IN ('assigned', 'changes_requested', 'review_reopened')",
+                cols=", kind, payload", strict=True)):
+            return None
+        # ``scheduled_due`` carries a causal attestation written while the PR
+        # comment already existed.  That makes a same-second event safe without
+        # guessing order across the comments/events tables' unrelated row ids.
+        if any(_kb._json_dict(e["payload"]).get("active_pr_comment_id") == latest_pr_comment_id
+               for _, e in _rows_since(
+                   conn, "task_events", task_id, latest_pr_time,
+                   "AND kind = 'scheduled_due'", cols=", payload")):
             return None
         if latest_run is not None and latest_run["outcome"] == "timed_out":
             latest_ended = _kb._to_epoch(latest_run["ended_at"])
             latest_metadata = _kb._json_dict(latest_run["metadata"])
-            if (latest_ended is not None and latest_ended >= max(pr_times)
+            if (latest_ended is not None and latest_ended >= latest_pr_time
                     and latest_metadata.get("active_pr_continuation") is True
                     and _is_budget_exhaustion_data(latest_metadata)):
                 return None

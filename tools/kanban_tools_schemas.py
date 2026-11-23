@@ -203,9 +203,10 @@ KANBAN_SCHEDULE_SCHEMA = _schema(
     "kanban_schedule",
     (
         "Park your task as 'scheduled' while it waits for a time or external event. This ends the current run and makes the "
-        "task non-dispatchable until an orchestrator unblocks it; it does not "
-        "create a timer. Put any wake-up marker such as "
-        "``SCHEDULED_UNTIL=<ISO8601>`` in ``reason``."
+        "task non-dispatchable until an orchestrator unblocks it or a valid "
+        "``SCHEDULED_UNTIL=<ISO8601-with-timezone>`` marker becomes due. The "
+        "dispatcher promotes due markers automatically; no separate OS timer is "
+        "created. Without a valid marker, only an orchestrator can wake it."
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
