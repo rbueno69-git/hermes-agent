@@ -85,6 +85,53 @@ def test_unreferenced_common_pr_is_terminally_ignored_without_card(tmp_path):
     assert continuation.observe(ITEM, HEAD)["state"] == "ignored_by_policy"
 
 
+def test_explicit_review_request_proposes_without_cross_item_reference(tmp_path):
+    continuation = IntakeContinuation(tmp_path / "broker.db")
+    observation = IntakeObservation(
+        item_key=ITEM, head_sha=HEAD, reason_code="review_requested",
+        title="docs(historia): add Tema columns",
+    )
+    continuation.record(observation)
+    cards = []
+
+    result = continuation.reconcile(
+        references=[],
+        contract_builder=lambda observed, reference: {
+            "item_key": observed.item_key,
+            "head_sha": observed.head_sha,
+            "contract_digest_sha256": DIGEST,
+            "question": reference,
+        },
+        approval_sender=cards.append,
+        clarification_sender=lambda *_args: None,
+    )
+
+    assert result == [{"identity": f"{ITEM}+{HEAD}", "action": "approval_proposed"}]
+    assert cards[0]["question"] == "PR body explicitly requests review and merge approval."
+
+
+def test_explicit_review_request_reopens_same_head_previously_ignored(tmp_path):
+    continuation = IntakeContinuation(tmp_path / "broker.db")
+    continuation.record(_observation())
+    continuation.reconcile(
+        references=[],
+        contract_builder=lambda *_args: (_ for _ in ()).throw(AssertionError("not expected")),
+        approval_sender=lambda *_args: None,
+        clarification_sender=lambda *_args: None,
+    )
+    assert continuation.observe(ITEM, HEAD)["state"] == "ignored_by_policy"
+
+    changed = continuation.record(IntakeObservation(
+        item_key=ITEM, head_sha=HEAD, reason_code="review_requested",
+        title="docs(historia): add Tema columns",
+    ))
+
+    assert changed is True
+    row = continuation.observe(ITEM, HEAD)
+    assert row["reason_code"] == "review_requested"
+    assert row["state"] == "pending"
+
+
 def test_expected_pr_with_missing_material_requests_native_clarification_once(tmp_path):
     continuation = IntakeContinuation(tmp_path / "broker.db")
     continuation.record(_observation())

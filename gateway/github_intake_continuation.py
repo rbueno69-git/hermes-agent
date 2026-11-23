@@ -14,7 +14,7 @@ from typing import Callable, Iterable, Mapping, Sequence
 
 _ITEM_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[1-9][0-9]*\Z")
 _SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")
-_REASON_CODES = frozenset({"missing_contract", "ineligible_contract"})
+_REASON_CODES = frozenset({"missing_contract", "ineligible_contract", "review_requested"})
 _TERMINAL_STATES = frozenset({
     "approval_proposed", "approval_reconciled", "clarification_requested", "ignored_by_policy",
 })
@@ -181,7 +181,8 @@ class IntakeContinuation:
                     identity TEXT PRIMARY KEY,
                     item_key TEXT NOT NULL,
                     head_sha TEXT NOT NULL,
-                    reason_code TEXT NOT NULL CHECK(reason_code IN ('missing_contract','ineligible_contract')),
+                    reason_code TEXT NOT NULL CHECK(reason_code IN (
+                        'missing_contract','ineligible_contract','review_requested')),
                     title TEXT NOT NULL,
                     state TEXT NOT NULL CHECK(state IN (
                         'pending','approval_proposed','approval_reconciled',
@@ -205,7 +206,7 @@ class IntakeContinuation:
                         item_key TEXT NOT NULL,
                         head_sha TEXT NOT NULL,
                         reason_code TEXT NOT NULL CHECK(reason_code IN (
-                            'missing_contract','ineligible_contract')),
+                            'missing_contract','ineligible_contract','review_requested')),
                         title TEXT NOT NULL,
                         state TEXT NOT NULL CHECK(state IN (
                             'pending','approval_proposed','approval_reconciled',
@@ -222,6 +223,36 @@ class IntakeContinuation:
                     DROP TABLE github_intake_observations_v1;
                     """
                 )
+            table_sql = db.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' "
+                "AND name='github_intake_observations'"
+            ).fetchone()[0]
+            if "review_requested" not in table_sql:
+                db.executescript(
+                    """
+                    ALTER TABLE github_intake_observations RENAME TO github_intake_observations_v2;
+                    CREATE TABLE github_intake_observations (
+                        identity TEXT PRIMARY KEY,
+                        item_key TEXT NOT NULL,
+                        head_sha TEXT NOT NULL,
+                        reason_code TEXT NOT NULL CHECK(reason_code IN (
+                            'missing_contract','ineligible_contract','review_requested')),
+                        title TEXT NOT NULL,
+                        state TEXT NOT NULL CHECK(state IN (
+                            'pending','approval_proposed','approval_reconciled',
+                            'clarification_requested','ignored_by_policy')),
+                        detail TEXT,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL,
+                        UNIQUE(item_key,head_sha)
+                    );
+                    INSERT INTO github_intake_observations
+                        (identity,item_key,head_sha,reason_code,title,state,detail,created_at,updated_at)
+                    SELECT identity,item_key,head_sha,reason_code,title,state,detail,created_at,updated_at
+                    FROM github_intake_observations_v2;
+                    DROP TABLE github_intake_observations_v2;
+                    """
+                )
 
     def record(self, observation: IntakeObservation) -> bool:
         observation.validate()
@@ -232,8 +263,23 @@ class IntakeContinuation:
                        identity,item_key,head_sha,reason_code,title,state,created_at,updated_at)
                    VALUES(?,?,?,?,?,'pending',?,?)
                    ON CONFLICT(identity) DO UPDATE SET
-                       reason_code=excluded.reason_code,title=excluded.title,updated_at=excluded.updated_at
-                   WHERE github_intake_observations.state='pending'""",
+                       reason_code=excluded.reason_code,title=excluded.title,
+                       state=CASE
+                           WHEN excluded.reason_code='review_requested'
+                                AND github_intake_observations.state='ignored_by_policy'
+                           THEN 'pending'
+                           ELSE github_intake_observations.state
+                       END,
+                       detail=CASE
+                           WHEN excluded.reason_code='review_requested'
+                                AND github_intake_observations.state='ignored_by_policy'
+                           THEN NULL
+                           ELSE github_intake_observations.detail
+                       END,
+                       updated_at=excluded.updated_at
+                   WHERE github_intake_observations.state='pending'
+                      OR (excluded.reason_code='review_requested'
+                          AND github_intake_observations.state='ignored_by_policy')""",
                 (observation.identity, observation.item_key, observation.head_sha,
                  observation.reason_code, observation.title[:500], now, now),
             ).rowcount
@@ -296,7 +342,11 @@ class IntakeContinuation:
                 if self._finish(observation.identity, action):
                     emitted.append({"identity": observation.identity, "action": action})
                 continue
-            reference = self._reference_for(observation.item_key, references)
+            reference = (
+                "PR body explicitly requests review and merge approval."
+                if observation.reason_code == "review_requested"
+                else self._reference_for(observation.item_key, references)
+            )
             if reference is None:
                 action = "ignored_by_policy"
                 if self._finish(observation.identity, action):

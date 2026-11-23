@@ -75,6 +75,26 @@ _GH_TOKEN_VARS = ("GH_TOKEN", "GITHUB_TOKEN")
 _GITHUB_APPROVAL_SCHEMA = "hermes.github-intake.v2"
 
 
+def _explicit_merge_review_requested(body: Any) -> bool:
+    """Recognize the canonical attribution block for an ordinary PR awaiting merge review."""
+    if not isinstance(body, str) or len(body) > 200_000:
+        return False
+    action = re.search(
+        r"(?mi)^\s*(?:[-*]\s*)?A[cç][aã]o pretendida:\s*.*\brevisar\b.*\bmergear\b",
+        body,
+    )
+    waiting = re.search(
+        r"(?mi)^\s*(?:[-*]\s*)?Status:\s*aguardando revis[aã]o\s*$",
+        body,
+    )
+    return (
+        action is not None
+        and waiting is not None
+        and action.end() <= waiting.start()
+        and waiting.start() - action.end() <= 1_000
+    )
+
+
 def _github_approval_question(payload: dict, proposal: Any) -> str:
     """Render the immutable contract identity and bounded operator context."""
     def bounded(value: Any, limit: int, *, structured: bool = False) -> str:
@@ -462,8 +482,6 @@ class WebhookAdapter(BasePlatformAdapter):
         home = get_hermes_home()
         ledger = home / "github-intake" / "approvals.jsonl"
         references = read_executable_references(ledger)
-        if not references:
-            return 0
         approved_tuples = read_approved_tuples(ledger)
         continuation = IntakeContinuation(broker.path)
         github_reader = IntakeScriptLiveReader._github_api
@@ -1055,7 +1073,12 @@ class WebhookAdapter(BasePlatformAdapter):
         label_names = {
             str(label.get("name")) for label in labels if isinstance(label, dict)
         }
-        reason_code = "ineligible_contract" if "pink:auto" in label_names else "missing_contract"
+        if "pink:auto" in label_names:
+            reason_code = "ineligible_contract"
+        elif _explicit_merge_review_requested(pull.get("body")):
+            reason_code = "review_requested"
+        else:
+            reason_code = "missing_contract"
         try:
             from gateway.github_approval_broker import default_broker
             from gateway.github_intake_continuation import IntakeContinuation, IntakeObservation
