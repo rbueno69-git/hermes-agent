@@ -1592,6 +1592,9 @@ def _record_task_failure(
                 detail = {"failures": failures, "retry_status": retry_status}
                 if infrastructure:
                     detail["infrastructure"] = True
+                if event_payload_extra:
+                    detail.update(event_payload_extra)
+                _tag_existing_pr_budget_continuation(conn, task_id, detail)
                 run_id = _kb._end_run(
                     conn, task_id, outcome=outcome, status=outcome, error=error, metadata=detail,
                 )
@@ -1608,33 +1611,28 @@ def _record_task_failure(
             "WHERE id = ? AND status IN ('running', 'ready', 'review')",
             (failures, error, task_id),
         )
-        payload = {
+        detail = {
             "failures": failures,
             "effective_limit": effective_limit,
             "limit_source": limit_source,
-            "error": error,
             "trigger_outcome": outcome,
             "retry_status": retry_status,
         }
+        if event_payload_extra:
+            detail.update(event_payload_extra)
+        _tag_existing_pr_budget_continuation(conn, task_id, detail)
+        payload = {"error": error, **detail}
         run_id = None
         if end_run:
             # Only the spawn path has an open run to close.
             run_id = _kb._end_run(
                 conn, task_id, outcome="gave_up", status="gave_up", error=error,
-                metadata={
-                    "failures": failures,
-                    "trigger_outcome": outcome,
-                    "effective_limit": effective_limit,
-                    "limit_source": limit_source,
-                    "retry_status": retry_status,
-                },
+                metadata=detail,
             )
         if force_trip:
             # The caller applied its own bounded policy, so the counter cannot
             # judge this block: ``recompute_ready`` holds it for an operator.
             payload["sticky"] = True
-        if event_payload_extra:
-            payload.update(event_payload_extra)
         _kb._append_event(conn, task_id, "gave_up", payload, run_id=run_id)
         return True
 
@@ -1740,7 +1738,7 @@ def check_respawn_guard(
     latest_run = conn.execute(
         "SELECT outcome, ended_at, metadata FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
-        "ORDER BY ended_at DESC LIMIT 1",
+        "ORDER BY ended_at DESC, id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
     if latest_run is not None and latest_run["outcome"] == "spawn_failed":
@@ -1791,6 +1789,8 @@ def check_respawn_guard(
     #    now work on THAT PR — a closer or the implementer finishing it, not a
     #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
     #    so the worker that opened the PR is still not re-spawned against it.
+    #    Typed iteration-budget exhaustion is different: it durably states that
+    #    this same E2E contract is unfinished, so resume against the existing PR.
     pr_times = [t for t, c in _rows_since(conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
                                           cols=", body", unreadable=now)  # duplicate-PR risk: fail closed
                 if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")]
@@ -1800,6 +1800,13 @@ def check_respawn_guard(
                 conn, "task_events", task_id, max(pr_times),
                 "AND kind IN ('assigned', 'changes_requested', 'review_reopened')", cols=", kind, payload", strict=True)):
             return None
+        if latest_run is not None and latest_run["outcome"] == "timed_out":
+            latest_ended = _kb._to_epoch(latest_run["ended_at"])
+            latest_metadata = _kb._json_dict(latest_run["metadata"])
+            if (latest_ended is not None and latest_ended >= max(pr_times)
+                    and latest_metadata.get("active_pr_continuation") is True
+                    and _is_budget_exhaustion_data(latest_metadata)):
+                return None
         return "active_pr"
 
     return None
@@ -1837,6 +1844,35 @@ def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
         return False
     to = data.get("assignee")
     return bool(to) and "from" in data and data["from"] != to
+
+
+def _is_budget_exhaustion_data(data: Mapping[str, Any]) -> bool:
+    """Recognize the finalizer's typed exhaustion receipt, not error prose."""
+    used = data.get("budget_used")
+    maximum = data.get("budget_max")
+    if type(used) is not int or type(maximum) is not int:
+        return False
+    return maximum > 0 and used >= maximum
+
+
+def _tag_existing_pr_budget_continuation(
+    conn: sqlite3.Connection, task_id: str, detail: dict,
+) -> None:
+    """Attest that a typed budget timeout happened after a PR was published.
+
+    Comments and events use second-resolution timestamps and unrelated row ids,
+    so the failure transaction records the causal fact explicitly.  The respawn
+    guard can then handle same-second writes without guessing their order.
+    """
+    if not _is_budget_exhaustion_data(detail):
+        return
+    now = int(time.time())
+    rows = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        (task_id, now - _RESPAWN_GUARD_PR_WINDOW),
+    ).fetchall()
+    if any(_RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(row["body"]) or "") for row in rows):
+        detail["active_pr_continuation"] = True
 
 
 def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
