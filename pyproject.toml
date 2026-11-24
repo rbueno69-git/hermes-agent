@@ -268,6 +268,9 @@ vercel = ["vercel==0.12.0"]
 google-meet = ["playwright==1.64.0; sys_platform != 'android'", "websockets==15.0.1; sys_platform != 'android'"]
 messaging = [
   "python-telegram-bot[webhooks]==22.8",
+  # PTB's webhook server imports Tornado directly. Pin the patched release so
+  # lazy messaging installs cannot resolve the vulnerable 6.6 lock again.
+  "tornado==6.6.1",
   "discord.py[voice]==2.7.1",
   "aiohttp==3.14.5",
   "brotlicffi==1.2.1.0",
@@ -342,7 +345,7 @@ wake = [
 # lazy-installed at first use via pm.ensure_import(name) and therefore
 # deliberately NOT in [all] (see tests/test_project_metadata.py's
 # lazy_covered_extras list — keep that list in sync when adding here).
-telegram = ["python-telegram-bot[webhooks]==22.8"]
+telegram = ["python-telegram-bot[webhooks]==22.8", "tornado==6.6.1"]
 discord = ["discord.py[voice]==2.7.1"]
 # stt-whisper + audio-io compose [voice] (faster-whisper / sounddevice / numpy).
 stt-whisper = [
@@ -472,6 +475,7 @@ azure-identity = ["azure-identity==1.26.0"]
 termux = [
   # Baseline Android / Termux path for reliable fresh installs.
   "python-telegram-bot[webhooks]==22.8",
+  "tornado==6.6.1",
   "hermes-agent[cron]",
   "hermes-agent[mcp]",
   "hermes-agent[acp]",
