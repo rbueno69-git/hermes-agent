@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import tracemalloc
 import urllib.parse
+from importlib.metadata import version
 
 import pytest
 from tornado.escape import parse_qs_bytes
@@ -19,6 +20,18 @@ from tornado.web import (
     addslash,
     removeslash,
 )
+
+
+def test_telegram_webhook_loads_patched_tornado_http_stack() -> None:
+    """Bind the upstream regressions to Hermes' real PTB webhook boundary."""
+    from telegram.ext._utils.webhookhandler import (
+        TelegramHandler,
+        WebhookAppClass,
+    )
+
+    assert version("tornado") == "6.6.1"
+    assert issubclass(WebhookAppClass, Application)
+    assert issubclass(TelegramHandler, RequestHandler)
 
 
 class _RemoveSlashHandler(RequestHandler):
