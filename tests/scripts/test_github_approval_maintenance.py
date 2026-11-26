@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import importlib.util
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -253,3 +254,39 @@ def test_bind_item_succession_cli_uses_live_broker_and_kanban_paths(tmp_path, mo
         "successor_item_key": "owner/repo#3",
         "successor_task_id": "t_successor",
     }
+
+
+def test_bind_item_succession_cli_waits_for_canonical_approval_ledger_lock(
+        tmp_path, monkeypatch):
+    module = _load()
+    module.BROKER = tmp_path / "broker.db"  # type: ignore[attr-defined]
+    module.LEDGER = tmp_path / "approvals.jsonl"  # type: ignore[attr-defined]
+    entered = threading.Event()
+    completed = threading.Event()
+
+    class BrokerStub:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def bind_item_succession(self, **_kwargs):
+            entered.set()
+
+    monkeypatch.setattr(module, "GitHubApprovalBroker", BrokerStub)
+    monkeypatch.setattr(module, "kanban_db_path", lambda: tmp_path / "kanban.db")
+    from gateway.github_approval_reconciler import _exclusive_lock
+
+    with _exclusive_lock(Path(f"{module.LEDGER}.lock")):
+        worker = threading.Thread(
+            target=lambda: (
+                module.main(["--bind-item-succession", "owner/repo#2", "owner/repo#3", "task"]),
+                completed.set(),
+            ),
+            daemon=True,
+        )
+        worker.start()
+        assert not entered.wait(1.0)
+        assert not completed.is_set()
+    worker.join(timeout=5.0)
+
+    assert entered.is_set()
+    assert completed.is_set()

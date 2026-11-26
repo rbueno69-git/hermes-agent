@@ -651,6 +651,27 @@ class ApprovalDecisionReconciler:
             db.commit()
         return ProjectionResult(int(row["decision_id"]), outcome, reason, task_id)
 
+    def _fresh_stale_reason(self, row: sqlite3.Row) -> Optional[str]:
+        with self._connect() as db:
+            current = db.execute(
+                """SELECT d.state AS decision_state,p.state AS proposal_state,
+                          EXISTS(SELECT 1 FROM github_approval_item_successions s
+                                 WHERE s.predecessor_item_key=p.item_key) AS has_succession
+                   FROM github_approval_decisions d
+                   JOIN github_approval_proposals p USING(proposal_key)
+                   WHERE d.decision_id=? AND p.proposal_key=?""",
+                (row["decision_id"], row["proposal_key"]),
+            ).fetchone()
+        if current is None:
+            return "approval_missing"
+        if bool(current["has_succession"]):
+            return "item_succession"
+        if str(current["proposal_state"]) == "superseded":
+            return "proposal_superseded"
+        if str(current["decision_state"]) != "pending":
+            return "decision_not_pending"
+        return None
+
     @staticmethod
     def _stale_reason(row: sqlite3.Row, live: LiveContract) -> Optional[str]:
         if live.state != "open" or not live.accepted:
@@ -688,11 +709,19 @@ class ApprovalDecisionReconciler:
                 if reason is not None:
                     results.append(self._finish(row, "stale", reason=reason))
                     continue
+                reason = self._fresh_stale_reason(row)
+                if reason is not None:
+                    results.append(self._finish(row, "stale", reason=reason))
+                    continue
                 request_id = self._request_id(row)
                 ledger_entry = self._ledger_entry(request_id)
                 self._append_ledger(row, request_id)
                 if stop_after == "ledger":
                     break
+                reason = self._fresh_stale_reason(row)
+                if reason is not None:
+                    results.append(self._finish(row, "stale", reason=reason))
+                    continue
                 task_id = self._create_task(row, ledger_entry=ledger_entry)
                 results.append(self._finish(row, "approved", request_id=request_id, task_id=task_id))
         return results

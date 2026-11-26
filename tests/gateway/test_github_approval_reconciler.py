@@ -195,6 +195,86 @@ def test_reconciler_waits_for_the_canonical_ledger_lock(tmp_path):
     assert len(_ledger_rows(tmp_path / "approvals.jsonl")) == 1
 
 
+def _seed_bindable_cross_item_successor(
+        reconciler: ApprovalDecisionReconciler,
+        *, successor_item: str = "owner/repo#520") -> tuple[str, str]:
+    successor = ApprovalProposal(successor_item, "7" * 40, "8" * 64)
+    broker = GitHubApprovalBroker(reconciler.broker_path, instance_id="successor-seed")
+    now = 1_794_591_244.0
+    with broker._connect() as db:
+        key = successor.canonical_key()
+        db.execute(
+            """INSERT INTO github_approval_proposals(
+                proposal_key,item_key,head_sha,contract_digest_sha256,executor,state,clarify_id,
+                session_key,chat_id,authorized_user_id,destination_id,question,message_id,
+                callback_bound,response,approver,created_at,updated_at)
+                VALUES(?,?,?,?,?,'answered',?,?,?,?,?,?,?,0,'Approve','telegram:7',?,?)""",
+            (key, successor.item_key, successor.head_sha, successor.contract_digest_sha256,
+             "hermes", "gha-successor", "github:successor", "42", "7", "telegram-bot:test",
+             "Approve successor?", "9070", now, now),
+        )
+        decision_id = db.execute(
+            """INSERT INTO github_approval_decisions(
+                proposal_key,response,approver,state,decided_at)
+                VALUES(?,'Approve','telegram:7','pending',?) RETURNING decision_id""",
+            (key, now),
+        ).fetchone()[0]
+    conn = connect_kanban(reconciler.kanban_path)
+    try:
+        from hermes_cli.kanban_db import create_task
+        task_id = create_task(
+            conn, title="successor",
+            body=f"Predecessor: `{ITEM}`\nSuccessor: `{successor.item_key}`",
+            assignee="default", initial_status="running",
+        )
+    finally:
+        conn.close()
+    with broker._connect() as db:
+        db.execute(
+            "INSERT INTO github_approval_reconciliations VALUES(?,?, 'approved',NULL,'successor',?,?)",
+            (decision_id, key, task_id, now),
+        )
+    return successor.item_key, task_id
+
+
+def test_binding_during_projection_marks_selected_decision_stale_without_task(tmp_path):
+    reconciler = _reconciler(tmp_path, _live())
+    successor_item, successor_task_id = _seed_bindable_cross_item_successor(reconciler)
+    broker = GitHubApprovalBroker(reconciler.broker_path, instance_id="binder")
+
+    def bind_while_row_is_in_flight(_item):
+        broker.bind_item_succession(
+            predecessor_item_key=ITEM,
+            successor_item_key=successor_item,
+            successor_task_id=successor_task_id,
+            kanban_path=reconciler.kanban_path,
+        )
+        return _live()
+
+    reconciler.live_reader = bind_while_row_is_in_flight
+    result = reconciler.reconcile()
+
+    assert [(item.outcome, item.reason) for item in result] == [("stale", "item_succession")]
+    assert not (tmp_path / "approvals.jsonl").exists()
+    assert [row["id"] for row in _task_rows(reconciler.kanban_path)] == [successor_task_id]
+
+
+def test_binding_after_projection_rejects_live_predecessor_task(tmp_path):
+    reconciler = _reconciler(tmp_path, _live())
+    successor_item, successor_task_id = _seed_bindable_cross_item_successor(reconciler)
+    projected = reconciler.reconcile()
+    assert projected[0].outcome == "approved"
+
+    broker = GitHubApprovalBroker(reconciler.broker_path, instance_id="binder")
+    with pytest.raises(ValueError, match="predecessor.*nonterminal"):
+        broker.bind_item_succession(
+            predecessor_item_key=ITEM,
+            successor_item_key=successor_item,
+            successor_task_id=successor_task_id,
+            kanban_path=reconciler.kanban_path,
+        )
+
+
 def test_replay_after_task_creation_reuses_existing_task_without_mutation(tmp_path, monkeypatch):
     reconciler = _reconciler(tmp_path, _live())
     reconciler.reconcile(stop_after="ledger")

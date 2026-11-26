@@ -18,7 +18,11 @@ from pathlib import Path
 from typing import Iterable
 
 from gateway.github_approval_broker import GitHubApprovalBroker
-from gateway.github_approval_reconciler import ApprovalDecisionReconciler, IntakeScriptLiveReader
+from gateway.github_approval_reconciler import (
+    ApprovalDecisionReconciler,
+    IntakeScriptLiveReader,
+    _exclusive_lock,
+)
 from hermes_cli.kanban_db import kanban_db_path
 from hermes_cli.webhook import _load_subscriptions, _route_url
 
@@ -308,14 +312,15 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.bind_item_succession is not None:
         predecessor_item_key, successor_item_key, successor_task_id = args.bind_item_succession
-        broker = GitHubApprovalBroker(
-            BROKER, instance_id="github-approval-maintenance:item-succession-binding")
-        broker.bind_item_succession(
-            predecessor_item_key=predecessor_item_key,
-            successor_item_key=successor_item_key,
-            successor_task_id=successor_task_id,
-            kanban_path=kanban_db_path(),
-        )
+        with _exclusive_lock(Path(f"{LEDGER}.lock")):
+            broker = GitHubApprovalBroker(
+                BROKER, instance_id="github-approval-maintenance:item-succession-binding")
+            broker.bind_item_succession(
+                predecessor_item_key=predecessor_item_key,
+                successor_item_key=successor_item_key,
+                successor_task_id=successor_task_id,
+                kanban_path=kanban_db_path(),
+            )
         print(json.dumps({
             "action": "item_succession_bound",
             "predecessor_item_key": predecessor_item_key,

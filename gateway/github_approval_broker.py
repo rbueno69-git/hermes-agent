@@ -19,6 +19,7 @@ _ITEM_KEY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[1-9][0-9]*\Z")
 _NONTERMINAL_TASK_STATUSES = frozenset({
     "triage", "todo", "scheduled", "ready", "running", "blocked", "review",
 })
+_TERMINAL_TASK_STATUSES = frozenset({"done", "archived"})
 logger = logging.getLogger(__name__)
 
 
@@ -343,10 +344,9 @@ class GitHubApprovalBroker:
         if not isinstance(successor_task_id, str) or not successor_task_id:
             raise ValueError("successor_task_id is required")
         existing = self._item_succession(predecessor_item_key)
-        if existing is not None:
-            if (str(existing["successor_item_key"]), str(existing["successor_task_id"])) == (
-                    successor_item_key, successor_task_id):
-                return
+        if existing is not None and (
+                str(existing["successor_item_key"]), str(existing["successor_task_id"])) != (
+                successor_item_key, successor_task_id):
             raise ValueError("predecessor item already has a different successor mapping")
 
         with self._connect() as db:
@@ -360,9 +360,13 @@ class GitHubApprovalBroker:
                    FROM github_approval_proposals p
                    JOIN github_approval_decisions d USING(proposal_key)
                    JOIN github_approval_reconciliations r USING(decision_id)
-                   WHERE p.item_key=? AND p.response='Approve' AND d.response='Approve'
+                   WHERE p.item_key=? AND p.state='answered'
+                     AND p.response='Approve' AND d.response='Approve'
+                     AND COALESCE(p.origin_status,'') NOT IN ('closed','merged','superseded')
                      AND r.outcome='approved' AND r.task_id=?
-                   ORDER BY d.decision_id DESC LIMIT 1""",
+                     AND p.rowid=(SELECT newest.rowid FROM github_approval_proposals newest
+                                  WHERE newest.item_key=p.item_key
+                                  ORDER BY newest.created_at DESC,newest.rowid DESC LIMIT 1)""",
                 (successor_item_key, successor_task_id),
             ).fetchone()
         if authority is None:
@@ -394,13 +398,40 @@ class GitHubApprovalBroker:
                        JOIN github_approval_decisions d USING(proposal_key)
                        JOIN github_approval_reconciliations r USING(decision_id)
                        WHERE p.proposal_key=? AND p.item_key=?
+                         AND p.state='answered'
                          AND p.response='Approve' AND d.response='Approve'
-                         AND r.outcome='approved' AND r.task_id=?""",
+                         AND COALESCE(p.origin_status,'') NOT IN ('closed','merged','superseded')
+                         AND r.outcome='approved' AND r.task_id=?
+                         AND p.rowid=(SELECT newest.rowid FROM github_approval_proposals newest
+                                      WHERE newest.item_key=p.item_key
+                                      ORDER BY newest.created_at DESC,newest.rowid DESC LIMIT 1)""",
                     (successor_proposal_key, successor_item_key, successor_task_id),
                 ).fetchone()
                 if current is None:
                     db.rollback()
                     raise ValueError("successor approval changed during succession binding")
+                predecessor_task_ids = [str(row["task_id"]) for row in db.execute(
+                    """SELECT r.task_id
+                       FROM github_approval_proposals p
+                       JOIN github_approval_decisions d USING(proposal_key)
+                       JOIN github_approval_reconciliations r USING(decision_id)
+                       WHERE p.item_key=? AND r.outcome='approved' AND r.task_id IS NOT NULL""",
+                    (predecessor_item_key,),
+                ).fetchall()]
+                for predecessor_task_id in predecessor_task_ids:
+                    predecessor_task = kanban_guard.execute(
+                        "SELECT status FROM tasks WHERE id=?", (predecessor_task_id,)
+                    ).fetchone()
+                    if predecessor_task is None:
+                        db.rollback()
+                        raise ValueError("reconciled predecessor task state is unavailable")
+                    predecessor_status = str(predecessor_task[0])
+                    if predecessor_status in _NONTERMINAL_TASK_STATUSES:
+                        db.rollback()
+                        raise ValueError("reconciled predecessor task is nonterminal")
+                    if predecessor_status not in _TERMINAL_TASK_STATUSES:
+                        db.rollback()
+                        raise ValueError("reconciled predecessor task has an unknown status")
                 db.execute(
                     """INSERT OR IGNORE INTO github_approval_item_successions(
                         predecessor_item_key,successor_item_key,successor_proposal_key,
@@ -570,6 +601,8 @@ class GitHubApprovalBroker:
         if not all(isinstance(value, str) and value for value in required):
             raise ValueError("successor inheritance requires complete durable bindings")
         key = proposal.canonical_key()
+        if self._item_succession(proposal.item_key) is not None:
+            return None
         with self._connect() as db:
             exact = db.execute(
                 "SELECT * FROM github_approval_proposals WHERE proposal_key=?", (key,)
@@ -747,7 +780,13 @@ class GitHubApprovalBroker:
                              ON c.predecessor_proposal_key=p.proposal_key
                            WHERE p.proposal_key=?""", (predecessor_key,)
                     ).fetchone()
-                    if (predecessor is None
+                    succession = db.execute(
+                        "SELECT 1 FROM github_approval_item_successions "
+                        "WHERE predecessor_item_key=?",
+                        (proposal.item_key,),
+                    ).fetchone()
+                    if (succession is not None
+                            or predecessor is None
                             or (predecessor["state"] != "answered"
                                 and continuation_key is None)
                             or predecessor["response"] != "Approve"
