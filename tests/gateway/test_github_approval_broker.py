@@ -1004,6 +1004,84 @@ async def test_cross_item_succession_suppresses_all_future_heads_and_retires_exi
 
 
 @pytest.mark.asyncio
+async def test_cross_item_succession_reuses_live_canonical_task_after_terminal_duplicate(tmp_path):
+    path = tmp_path / "approvals.db"
+    kanban = tmp_path / "kanban.db"
+    broker = GitHubApprovalBroker(path, instance_id="gateway")
+    predecessor_item = "owner/repo#497"
+    successor = replace(proposal(head="c" * 40), item_key="owner/repo#498")
+    adapter, _sent = await _bindable_successor(
+        broker, path, kanban, predecessor_item=predecessor_item, successor=successor)
+
+    newer = replace(successor, head_sha="d" * 40)
+    sent = await broker.request(
+        newer, adapter=adapter, chat_id="42", question="approve successor",
+        session_key="webhook:new-successor", authorized_user_id="7")
+    decision = broker.resolve_callback(
+        sent.clarify_id, 0, approver="telegram:7", user_id="7", chat_id="42",
+        thread_id=None, message_id="102", destination_id="telegram-bot:101")
+    assert decision is not None
+    with sqlite3.connect(path) as db:
+        db.execute(
+            "INSERT INTO github_approval_reconciliations VALUES(?,?, 'approved',NULL,'new',?,?)",
+            (decision.decision_id, newer.canonical_key(), "t_duplicate", time.time()))
+    with sqlite3.connect(kanban) as db:
+        db.execute(
+            "INSERT INTO tasks VALUES(?, 'done', ?)",
+            ("t_duplicate", f"Successor: `{successor.item_key}`"),
+        )
+
+    broker.bind_item_succession(
+        predecessor_item_key=predecessor_item,
+        successor_item_key=successor.item_key,
+        successor_task_id="t_successor",
+        kanban_path=kanban,
+    )
+    binding = broker._item_succession(predecessor_item)
+    assert binding is not None
+    assert binding["successor_proposal_key"] == newer.canonical_key()
+    assert binding["successor_task_id"] == "t_successor"
+
+
+@pytest.mark.asyncio
+async def test_cross_item_succession_rejects_live_duplicate_successor_task(tmp_path):
+    path = tmp_path / "approvals.db"
+    kanban = tmp_path / "kanban.db"
+    broker = GitHubApprovalBroker(path, instance_id="gateway")
+    predecessor_item = "owner/repo#497"
+    successor = replace(proposal(head="c" * 40), item_key="owner/repo#498")
+    adapter, _sent = await _bindable_successor(
+        broker, path, kanban, predecessor_item=predecessor_item, successor=successor)
+    newer = replace(successor, head_sha="d" * 40)
+    sent = await broker.request(
+        newer, adapter=adapter, chat_id="42", question="approve successor",
+        session_key="webhook:new-successor", authorized_user_id="7")
+    assert sent.clarify_id is not None
+    decision = broker.resolve_callback(
+        sent.clarify_id, 0, approver="telegram:7", user_id="7", chat_id="42",
+        thread_id=None, message_id="102", destination_id="telegram-bot:101")
+    assert decision is not None
+    with sqlite3.connect(path) as db:
+        db.execute(
+            "INSERT INTO github_approval_reconciliations VALUES(?,?, 'approved',NULL,'new',?,?)",
+            (decision.decision_id, newer.canonical_key(), "t_duplicate", time.time()))
+    with sqlite3.connect(kanban) as db:
+        db.execute(
+            "INSERT INTO tasks VALUES(?, 'running', ?)",
+            ("t_duplicate", f"Successor: `{successor.item_key}`"),
+        )
+
+    with pytest.raises(ValueError, match="newer reconciled successor task is not terminal"):
+        broker.bind_item_succession(
+            predecessor_item_key=predecessor_item,
+            successor_item_key=successor.item_key,
+            successor_task_id="t_successor",
+            kanban_path=kanban,
+        )
+    assert broker._item_succession(predecessor_item) is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure_mode", ["unreconciled", "arbitrary_task", "terminal_task", "missing_items"])
 async def test_cross_item_succession_rejects_unproven_successor_authority(tmp_path, failure_mode):
     path = tmp_path / "approvals.db"

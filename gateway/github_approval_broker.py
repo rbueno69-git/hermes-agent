@@ -356,22 +356,36 @@ class GitHubApprovalBroker:
             ).fetchone() is None:
                 raise ValueError("successor has no reconciled approved proposal")
             authority = db.execute(
-                """SELECT p.proposal_key
+                """SELECT p.proposal_key,r.task_id AS latest_task_id
                    FROM github_approval_proposals p
                    JOIN github_approval_decisions d USING(proposal_key)
                    JOIN github_approval_reconciliations r USING(decision_id)
                    WHERE p.item_key=? AND p.state='answered'
                      AND p.response='Approve' AND d.response='Approve'
                      AND COALESCE(p.origin_status,'') NOT IN ('closed','merged','superseded')
-                     AND r.outcome='approved' AND r.task_id=?
+                     AND r.outcome='approved'
+                     AND (r.task_id=? OR EXISTS(
+                         SELECT 1 FROM github_approval_proposals canonical_p
+                         JOIN github_approval_decisions canonical_d
+                           ON canonical_d.proposal_key=canonical_p.proposal_key
+                         JOIN github_approval_reconciliations canonical_r
+                           ON canonical_r.decision_id=canonical_d.decision_id
+                         WHERE canonical_p.item_key=p.item_key
+                           AND canonical_p.contract_digest_sha256=p.contract_digest_sha256
+                           AND canonical_p.executor=p.executor
+                           AND canonical_p.response='Approve'
+                           AND canonical_d.response='Approve'
+                           AND canonical_r.outcome='approved'
+                           AND canonical_r.task_id=?))
                      AND p.rowid=(SELECT newest.rowid FROM github_approval_proposals newest
                                   WHERE newest.item_key=p.item_key
                                   ORDER BY newest.created_at DESC,newest.rowid DESC LIMIT 1)""",
-                (successor_item_key, successor_task_id),
+                (successor_item_key, successor_task_id, successor_task_id),
             ).fetchone()
         if authority is None:
             raise ValueError("successor task is not the reconciled approved proposal task")
         successor_proposal_key = str(authority["proposal_key"])
+        latest_successor_task_id = str(authority["latest_task_id"])
 
         kanban_guard = sqlite3.connect(Path(kanban_path), timeout=30.0)
         try:
@@ -384,6 +398,12 @@ class GitHubApprovalBroker:
             if not all(self._body_contains_item_key(task[1], item_key) for item_key in (
                     predecessor_item_key, successor_item_key)):
                 raise ValueError("successor task body must include both exact item keys")
+            if latest_successor_task_id != successor_task_id:
+                latest_task = kanban_guard.execute(
+                    "SELECT status FROM tasks WHERE id=?", (latest_successor_task_id,)
+                ).fetchone()
+                if latest_task is None or str(latest_task[0]) not in _TERMINAL_TASK_STATUSES:
+                    raise ValueError("newer reconciled successor task is not terminal")
 
             now = time.time()
             record = (
@@ -393,7 +413,7 @@ class GitHubApprovalBroker:
             with self._connect() as db:
                 db.execute("BEGIN IMMEDIATE")
                 current = db.execute(
-                    """SELECT p.proposal_key
+                    """SELECT p.proposal_key,r.task_id AS latest_task_id
                        FROM github_approval_proposals p
                        JOIN github_approval_decisions d USING(proposal_key)
                        JOIN github_approval_reconciliations r USING(decision_id)
@@ -402,10 +422,24 @@ class GitHubApprovalBroker:
                          AND p.response='Approve' AND d.response='Approve'
                          AND COALESCE(p.origin_status,'') NOT IN ('closed','merged','superseded')
                          AND r.outcome='approved' AND r.task_id=?
+                         AND EXISTS(
+                             SELECT 1 FROM github_approval_proposals canonical_p
+                             JOIN github_approval_decisions canonical_d
+                               ON canonical_d.proposal_key=canonical_p.proposal_key
+                             JOIN github_approval_reconciliations canonical_r
+                               ON canonical_r.decision_id=canonical_d.decision_id
+                             WHERE canonical_p.item_key=p.item_key
+                               AND canonical_p.contract_digest_sha256=p.contract_digest_sha256
+                               AND canonical_p.executor=p.executor
+                               AND canonical_p.response='Approve'
+                               AND canonical_d.response='Approve'
+                               AND canonical_r.outcome='approved'
+                               AND canonical_r.task_id=?)
                          AND p.rowid=(SELECT newest.rowid FROM github_approval_proposals newest
-                                      WHERE newest.item_key=p.item_key
-                                      ORDER BY newest.created_at DESC,newest.rowid DESC LIMIT 1)""",
-                    (successor_proposal_key, successor_item_key, successor_task_id),
+                                     WHERE newest.item_key=p.item_key
+                                     ORDER BY newest.created_at DESC,newest.rowid DESC LIMIT 1)""",
+                    (successor_proposal_key, successor_item_key,
+                     latest_successor_task_id, successor_task_id),
                 ).fetchone()
                 if current is None:
                     db.rollback()
