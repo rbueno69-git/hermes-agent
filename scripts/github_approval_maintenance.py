@@ -301,7 +301,28 @@ def main(argv: Iterable[str] | None = None) -> int:
         "--bind-internal-continuation", nargs=3,
         metavar=("PREDECESSOR_PROPOSAL_KEY", "PREDECESSOR_TASK_ID", "CONTINUATION_TASK_ID"),
     )
+    mode.add_argument(
+        "--bind-item-succession", nargs=3,
+        metavar=("PREDECESSOR_ITEM_KEY", "SUCCESSOR_ITEM_KEY", "SUCCESSOR_TASK_ID"),
+    )
     args = parser.parse_args(argv)
+    if args.bind_item_succession is not None:
+        predecessor_item_key, successor_item_key, successor_task_id = args.bind_item_succession
+        broker = GitHubApprovalBroker(
+            BROKER, instance_id="github-approval-maintenance:item-succession-binding")
+        broker.bind_item_succession(
+            predecessor_item_key=predecessor_item_key,
+            successor_item_key=successor_item_key,
+            successor_task_id=successor_task_id,
+            kanban_path=kanban_db_path(),
+        )
+        print(json.dumps({
+            "action": "item_succession_bound",
+            "predecessor_item_key": predecessor_item_key,
+            "successor_item_key": successor_item_key,
+            "successor_task_id": successor_task_id,
+        }, sort_keys=True, separators=(",", ":")))
+        return 0
     if args.bind_internal_continuation is not None:
         predecessor_proposal_key, predecessor_task_id, continuation_task_id = (
             args.bind_internal_continuation

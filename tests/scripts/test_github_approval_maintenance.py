@@ -214,3 +214,42 @@ def test_bind_internal_continuation_cli_persists_exact_explicit_lane(tmp_path, m
         "predecessor_proposal_key": "proposal-key",
         "predecessor_task_id": "t_blocked",
     }
+
+
+def test_bind_item_succession_cli_uses_live_broker_and_kanban_paths(tmp_path, monkeypatch, capsys):
+    module = _load()
+    module.BROKER = tmp_path / "broker.db"
+    kanban = tmp_path / "kanban.db"
+    calls = []
+
+    class BrokerStub:
+        def __init__(self, path, *, instance_id):
+            calls.append(("init", path, instance_id))
+
+        def bind_item_succession(self, **kwargs):
+            calls.append(("bind", kwargs))
+
+    monkeypatch.setattr(module, "GitHubApprovalBroker", BrokerStub)
+    monkeypatch.setattr(module, "kanban_db_path", lambda: kanban)
+    monkeypatch.setattr(module, "run_once", lambda **_kwargs: (_ for _ in ()).throw(
+        AssertionError("binding must not run ordinary maintenance")))
+
+    assert module.main([
+        "--bind-item-succession", "owner/repo#2", "owner/repo#3", "t_successor",
+    ]) == 0
+
+    assert calls == [
+        ("init", module.BROKER, "github-approval-maintenance:item-succession-binding"),
+        ("bind", {
+            "predecessor_item_key": "owner/repo#2",
+            "successor_item_key": "owner/repo#3",
+            "successor_task_id": "t_successor",
+            "kanban_path": kanban,
+        }),
+    ]
+    assert json.loads(capsys.readouterr().out) == {
+        "action": "item_succession_bound",
+        "predecessor_item_key": "owner/repo#2",
+        "successor_item_key": "owner/repo#3",
+        "successor_task_id": "t_successor",
+    }

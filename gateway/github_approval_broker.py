@@ -16,6 +16,9 @@ from typing import Any, Callable, Optional
 
 _CHOICES = ("Approve", "Do not approve")
 _ITEM_KEY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[1-9][0-9]*\Z")
+_NONTERMINAL_TASK_STATUSES = frozenset({
+    "triage", "todo", "scheduled", "ready", "running", "blocked", "review",
+})
 logger = logging.getLogger(__name__)
 
 
@@ -156,6 +159,14 @@ class GitHubApprovalBroker:
                     blocker_class TEXT NOT NULL CHECK(blocker_class IN ('internal','external')),
                     created_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS github_approval_item_successions (
+                    predecessor_item_key TEXT PRIMARY KEY,
+                    successor_item_key TEXT NOT NULL,
+                    successor_proposal_key TEXT NOT NULL
+                        REFERENCES github_approval_proposals(proposal_key),
+                    successor_task_id TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                );
                 COMMIT;
             """)
             columns = {str(row[1]) for row in db.execute("PRAGMA table_info(github_approval_proposals)")}
@@ -203,6 +214,12 @@ class GitHubApprovalBroker:
         key, now = proposal.canonical_key(), time.time()
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if db.execute(
+                "SELECT 1 FROM github_approval_item_successions WHERE predecessor_item_key=?",
+                (proposal.item_key,),
+            ).fetchone() is not None:
+                db.commit()
+                return RequestOutcome("superseded", key), []
             exact = db.execute("SELECT * FROM github_approval_proposals WHERE proposal_key=?", (key,)).fetchone()
             if exact is not None:
                 requested_binding = (chat_id, thread_id, authorized_user_id, question)
@@ -291,6 +308,137 @@ class GitHubApprovalBroker:
             and f"Contract digest: `{contract_digest_sha256}`" in lines
             and f"Proposal key: `{proposal_key}`" in lines
         )
+
+    @staticmethod
+    def _body_contains_item_key(body: object, item_key: str) -> bool:
+        return re.search(
+            rf"(?<![A-Za-z0-9_.#/-]){re.escape(item_key)}(?![A-Za-z0-9_.#/-])",
+            str(body or ""),
+        ) is not None
+
+    def _item_succession(self, item_key: str) -> Optional[sqlite3.Row]:
+        with self._connect() as db:
+            return db.execute(
+                "SELECT * FROM github_approval_item_successions WHERE predecessor_item_key=?",
+                (item_key,),
+            ).fetchone()
+
+    def bind_item_succession(
+        self,
+        *,
+        predecessor_item_key: str,
+        successor_item_key: str,
+        successor_task_id: str,
+        kanban_path: Path,
+    ) -> None:
+        """Bind one retired GitHub item to an independently approved durable successor."""
+        for name, value in (
+            ("predecessor_item_key", predecessor_item_key),
+            ("successor_item_key", successor_item_key),
+        ):
+            if not isinstance(value, str) or _ITEM_KEY_RE.fullmatch(value) is None:
+                raise ValueError(f"{name} must be owner/repo#number with a positive canonical number")
+        if predecessor_item_key == successor_item_key:
+            raise ValueError("item succession requires distinct predecessor and successor item keys")
+        if not isinstance(successor_task_id, str) or not successor_task_id:
+            raise ValueError("successor_task_id is required")
+        existing = self._item_succession(predecessor_item_key)
+        if existing is not None:
+            if (str(existing["successor_item_key"]), str(existing["successor_task_id"])) == (
+                    successor_item_key, successor_task_id):
+                return
+            raise ValueError("predecessor item already has a different successor mapping")
+
+        with self._connect() as db:
+            if db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='github_approval_reconciliations'"
+            ).fetchone() is None:
+                raise ValueError("successor has no reconciled approved proposal")
+            authority = db.execute(
+                """SELECT p.proposal_key
+                   FROM github_approval_proposals p
+                   JOIN github_approval_decisions d USING(proposal_key)
+                   JOIN github_approval_reconciliations r USING(decision_id)
+                   WHERE p.item_key=? AND p.response='Approve' AND d.response='Approve'
+                     AND r.outcome='approved' AND r.task_id=?
+                   ORDER BY d.decision_id DESC LIMIT 1""",
+                (successor_item_key, successor_task_id),
+            ).fetchone()
+        if authority is None:
+            raise ValueError("successor task is not the reconciled approved proposal task")
+        successor_proposal_key = str(authority["proposal_key"])
+
+        kanban_guard = sqlite3.connect(Path(kanban_path), timeout=30.0)
+        try:
+            kanban_guard.execute("BEGIN IMMEDIATE")
+            task = kanban_guard.execute(
+                "SELECT status,body FROM tasks WHERE id=?", (successor_task_id,)
+            ).fetchone()
+            if task is None or str(task[0]) not in _NONTERMINAL_TASK_STATUSES:
+                raise ValueError("successor task must be durable and nonterminal")
+            if not all(self._body_contains_item_key(task[1], item_key) for item_key in (
+                    predecessor_item_key, successor_item_key)):
+                raise ValueError("successor task body must include both exact item keys")
+
+            now = time.time()
+            record = (
+                predecessor_item_key, successor_item_key,
+                successor_proposal_key, successor_task_id,
+            )
+            with self._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                current = db.execute(
+                    """SELECT p.proposal_key
+                       FROM github_approval_proposals p
+                       JOIN github_approval_decisions d USING(proposal_key)
+                       JOIN github_approval_reconciliations r USING(decision_id)
+                       WHERE p.proposal_key=? AND p.item_key=?
+                         AND p.response='Approve' AND d.response='Approve'
+                         AND r.outcome='approved' AND r.task_id=?""",
+                    (successor_proposal_key, successor_item_key, successor_task_id),
+                ).fetchone()
+                if current is None:
+                    db.rollback()
+                    raise ValueError("successor approval changed during succession binding")
+                db.execute(
+                    """INSERT OR IGNORE INTO github_approval_item_successions(
+                        predecessor_item_key,successor_item_key,successor_proposal_key,
+                        successor_task_id,created_at) VALUES(?,?,?,?,?)""",
+                    (*record, now),
+                )
+                persisted = db.execute(
+                    """SELECT predecessor_item_key,successor_item_key,successor_proposal_key,
+                              successor_task_id
+                       FROM github_approval_item_successions WHERE predecessor_item_key=?""",
+                    (predecessor_item_key,),
+                ).fetchone()
+                if persisted is None or tuple(persisted) != record:
+                    db.rollback()
+                    raise ValueError("predecessor item already has a different successor mapping")
+                db.execute(
+                    """UPDATE github_approval_proposals
+                       SET state='superseded',callback_bound=0,owner_instance_id=NULL,
+                           lease_expires_at=NULL,
+                           retirement_pending=CASE WHEN message_id IS NOT NULL THEN 1 ELSE 0 END,
+                           retirement_action=CASE WHEN message_id IS NOT NULL THEN 'delete' ELSE NULL END,
+                           retirement_retry_after=NULL,updated_at=?
+                       WHERE item_key=?""",
+                    (now, predecessor_item_key),
+                )
+                db.execute(
+                    """UPDATE github_approval_decisions SET state='stale'
+                       WHERE state='pending' AND proposal_key IN (
+                           SELECT proposal_key FROM github_approval_proposals
+                           WHERE item_key=? AND state='superseded')""",
+                    (predecessor_item_key,),
+                )
+                db.commit()
+            kanban_guard.commit()
+        except sqlite3.Error as exc:
+            raise ValueError("Kanban successor task state is unavailable") from exc
+        finally:
+            kanban_guard.close()
 
     def bind_internal_continuation(
         self,
@@ -717,6 +865,8 @@ class GitHubApprovalBroker:
         if not all(isinstance(value, str) and value for value in required):
             raise ValueError("chat_id, question, session_key, and authorized_user_id are required")
         key = proposal.canonical_key()
+        if self._item_succession(proposal.item_key) is not None:
+            return RequestOutcome("superseded", key)
         destination_id = self._destination_identity(adapter, f"gha-{key[:24]}")
         if destination_id is None:
             raise ValueError("approval destination identity is unavailable")
@@ -733,6 +883,8 @@ class GitHubApprovalBroker:
         if not all(isinstance(value, str) and value for value in required):
             raise ValueError("chat_id, question, session_key, and authorized_user_id are required")
         key = proposal.canonical_key()
+        if self._item_succession(proposal.item_key) is not None:
+            return RequestOutcome("superseded", key)
         destination_id = self._destination_identity(adapter, f"gha-{key[:24]}")
         claim, retired = self._claim(proposal, chat_id=chat_id, question=question, session_key=session_key,
                                      thread_id=str(thread_id) if thread_id is not None else None,

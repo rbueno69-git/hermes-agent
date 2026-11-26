@@ -80,6 +80,33 @@ def proposal(*, head="a" * 40, digest="b" * 64):
     )
 
 
+async def _bindable_successor(broker, path, kanban, *, predecessor_item, successor, task_id="t_successor"):
+    adapter = TelegramStub()
+    sent = await broker.request(
+        successor, adapter=adapter, chat_id="42", question="approve successor",
+        session_key="webhook:successor", authorized_user_id="7")
+    assert sent.clarify_id is not None
+    decision = broker.resolve_callback(
+        sent.clarify_id, 0, approver="telegram:7", user_id="7", chat_id="42",
+        thread_id=None, message_id="101", destination_id="telegram-bot:101")
+    assert decision is not None
+    with sqlite3.connect(path) as db:
+        db.execute("""CREATE TABLE IF NOT EXISTS github_approval_reconciliations (
+            decision_id INTEGER PRIMARY KEY, proposal_key TEXT NOT NULL UNIQUE,
+            outcome TEXT NOT NULL, reason TEXT, approval_request_id TEXT,
+            task_id TEXT, completed_at REAL NOT NULL)""")
+        db.execute(
+            "INSERT INTO github_approval_reconciliations VALUES(?,?, 'approved',NULL,'req',?,?)",
+            (decision.decision_id, successor.canonical_key(), task_id, time.time()))
+    with sqlite3.connect(kanban) as db:
+        db.execute("CREATE TABLE tasks(id TEXT PRIMARY KEY,status TEXT NOT NULL,body TEXT)")
+        db.execute(
+            "INSERT INTO tasks VALUES(?, 'running', ?)",
+            (task_id, f"Predecessor: `{predecessor_item}`\nSuccessor: `{successor.item_key}`"),
+        )
+    return adapter, sent
+
+
 @pytest.mark.asyncio
 async def test_local_broker_invocation_publishes_one_telegram_native_card(tmp_path):
     adapter = TelegramStub()
@@ -915,3 +942,124 @@ async def test_supersession_never_calls_failing_cosmetic_edit(tmp_path):
     assert observed_old is not None and observed_new is not None
     assert observed_old["retirement_pending"] == 0
     assert observed_new["state"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_cross_item_succession_suppresses_all_future_heads_and_retires_existing_cards(tmp_path):
+    path = tmp_path / "approvals.db"
+    kanban = tmp_path / "kanban.db"
+    broker = GitHubApprovalBroker(path, instance_id="gateway")
+    predecessor_item = "owner/repo#497"
+    successor = replace(proposal(head="c" * 40), item_key="owner/repo#498")
+    adapter, _successor_sent = await _bindable_successor(
+        broker, path, kanban, predecessor_item=predecessor_item, successor=successor)
+    existing = proposal(head="d" * 40)
+    existing_sent = await broker.request(
+        existing, adapter=adapter, chat_id="42", question="approve predecessor",
+        session_key="webhook:predecessor", authorized_user_id="7")
+    assert existing_sent.clarify_id is not None
+    assert broker.resolve_callback(
+        existing_sent.clarify_id, 0, approver="telegram:7", user_id="7", chat_id="42",
+        thread_id=None, message_id="102", destination_id="telegram-bot:101") is not None
+
+    broker.bind_item_succession(
+        predecessor_item_key=predecessor_item,
+        successor_item_key=successor.item_key,
+        successor_task_id="t_successor",
+        kanban_path=kanban,
+    )
+    later = [proposal(head="e" * 40), proposal(head="f" * 40, digest="9" * 64)]
+    outcomes = [await broker.request(
+        candidate, adapter=adapter, chat_id="42", question="changed predecessor",
+        session_key=f"webhook:later-{index}", authorized_user_id="7")
+        for index, candidate in enumerate(later)]
+    admitted = broker.admit(
+        proposal(head="1" * 40), adapter=adapter, chat_id="42",
+        question="another changed predecessor", session_key="webhook:admit",
+        authorized_user_id="7")
+
+    assert [outcome.action for outcome in outcomes] == ["superseded", "superseded"]
+    assert admitted.action == "superseded"
+    assert len(adapter.sent) == 2
+    assert all(broker.observe(candidate) is None for candidate in later)
+    observed = broker.observe(existing)
+    assert observed["state"] == "superseded"
+    assert observed["retirement_pending"] == 1
+    assert observed["retirement_action"] == "delete"
+    assert broker.resolve_callback(
+        existing_sent.clarify_id, 0, approver="telegram:7", user_id="7", chat_id="42",
+        thread_id=None, message_id="102", destination_id="telegram-bot:101") is None
+    with sqlite3.connect(path) as db:
+        binding = db.execute(
+            "SELECT successor_item_key,successor_proposal_key,successor_task_id "
+            "FROM github_approval_item_successions WHERE predecessor_item_key=?",
+            (predecessor_item,),
+        ).fetchone()
+        decision_state = db.execute(
+            "SELECT state FROM github_approval_decisions WHERE proposal_key=?",
+            (existing.canonical_key(),),
+        ).fetchone()
+    assert binding == (successor.item_key, successor.canonical_key(), "t_successor")
+    assert decision_state == ("stale",)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_mode", ["unreconciled", "arbitrary_task", "terminal_task", "missing_items"])
+async def test_cross_item_succession_rejects_unproven_successor_authority(tmp_path, failure_mode):
+    path = tmp_path / "approvals.db"
+    kanban = tmp_path / "kanban.db"
+    broker = GitHubApprovalBroker(path, instance_id="gateway")
+    predecessor_item = "owner/repo#497"
+    successor = replace(proposal(head="c" * 40), item_key="owner/repo#498")
+    _adapter, _sent = await _bindable_successor(
+        broker, path, kanban, predecessor_item=predecessor_item, successor=successor)
+    task_id = "t_successor"
+    if failure_mode == "unreconciled":
+        with sqlite3.connect(path) as db:
+            db.execute("DELETE FROM github_approval_reconciliations")
+    elif failure_mode == "arbitrary_task":
+        task_id = "t_arbitrary"
+        with sqlite3.connect(kanban) as db:
+            db.execute("INSERT INTO tasks VALUES(?, 'running', ?)", (
+                task_id, f"{predecessor_item}\n{successor.item_key}"))
+    elif failure_mode == "terminal_task":
+        with sqlite3.connect(kanban) as db:
+            db.execute("UPDATE tasks SET status='done' WHERE id=?", (task_id,))
+    else:
+        with sqlite3.connect(kanban) as db:
+            db.execute("UPDATE tasks SET body='mentions neither item' WHERE id=?", (task_id,))
+
+    with pytest.raises(ValueError):
+        broker.bind_item_succession(
+            predecessor_item_key=predecessor_item,
+            successor_item_key=successor.item_key,
+            successor_task_id=task_id,
+            kanban_path=kanban,
+        )
+
+
+@pytest.mark.asyncio
+async def test_cross_item_succession_is_idempotent_but_conflicting_mapping_fails_closed(tmp_path):
+    path = tmp_path / "approvals.db"
+    kanban = tmp_path / "kanban.db"
+    broker = GitHubApprovalBroker(path, instance_id="gateway")
+    predecessor_item = "owner/repo#497"
+    successor = replace(proposal(head="c" * 40), item_key="owner/repo#498")
+    await _bindable_successor(
+        broker, path, kanban, predecessor_item=predecessor_item, successor=successor)
+    broker.bind_item_succession(
+        predecessor_item_key=predecessor_item, successor_item_key=successor.item_key,
+        successor_task_id="t_successor", kanban_path=kanban)
+    broker.bind_item_succession(
+        predecessor_item_key=predecessor_item, successor_item_key=successor.item_key,
+        successor_task_id="t_successor", kanban_path=kanban)
+
+    other = replace(proposal(head="4" * 40), item_key="owner/repo#499")
+    other_kanban = tmp_path / "other-kanban.db"
+    await _bindable_successor(
+        broker, path, other_kanban, predecessor_item=predecessor_item,
+        successor=other, task_id="t_other")
+    with pytest.raises(ValueError, match="different successor"):
+        broker.bind_item_succession(
+            predecessor_item_key=predecessor_item, successor_item_key=other.item_key,
+            successor_task_id="t_other", kanban_path=other_kanban)
