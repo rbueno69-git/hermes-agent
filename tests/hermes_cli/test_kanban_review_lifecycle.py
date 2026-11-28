@@ -483,6 +483,93 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         ) == "rate_limit_cooldown"
 
 
+def test_retriable_failure_preserves_budget_metadata(kanban_home: Path) -> None:
+    """The budget-exhaustion producer's typed metadata must reach both durable
+    authorities: the closed run and its terminal event."""
+    for invalid in (
+        {"budget_used": True, "budget_max": True},
+        {"budget_used": "150", "budget_max": "150"},
+        {"budget_used": 150.0, "budget_max": 150.0},
+    ):
+        assert not kbd._is_budget_exhaustion_data(invalid)
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="long e2e", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+
+        assert not kbd._record_task_failure(
+            conn, tid,
+            error="Iteration budget exhausted (150/150) — task could not complete",
+            outcome="timed_out", release_claim=True, end_run=True,
+            event_payload_extra={"budget_used": 150, "budget_max": 150},
+        )
+
+        event = _events(conn, tid, "timed_out")[-1][1]
+        assert event["budget_used"] == 150
+        assert event["budget_max"] == 150
+        run = conn.execute(
+            "SELECT metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        metadata = json.loads(run["metadata"])
+        assert metadata["budget_used"] == 150
+        assert metadata["budget_max"] == 150
+
+        tripped = kb.create_task(conn, title="budget breaker", assignee="worker")
+        assert kb.claim_task(conn, tripped) is not None
+        assert kbd._record_task_failure(
+            conn, tripped,
+            error="Iteration budget exhausted (150/150) — task could not complete",
+            outcome="timed_out", release_claim=True, end_run=True, failure_limit=1,
+            event_payload_extra={"budget_used": 150, "budget_max": 150},
+        )
+        tripped_run = conn.execute(
+            "SELECT metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (tripped,),
+        ).fetchone()
+        tripped_metadata = json.loads(tripped_run["metadata"])
+        assert tripped_metadata["budget_used"] == 150
+        assert tripped_metadata["budget_max"] == 150
+
+
+def test_active_pr_guard_resumes_only_after_typed_budget_exhaustion(
+    kanban_home: Path,
+) -> None:
+    """A long E2E task that opened a PR and exhausted its iteration budget is
+    unfinished and must resume; an ordinary timeout still stays fail-closed."""
+    pr_comment = "Opened https://github.com/example/repo/pull/878 during E2E work."
+    with kbc.connect() as conn:
+        resumable = kb.create_task(conn, title="resume after budget", assignee="worker")
+        assert kb.claim_task(conn, resumable) is not None
+        kb.add_comment(conn, resumable, author="worker", body=pr_comment)
+        assert not kbd._record_task_failure(
+            conn, resumable,
+            error="Iteration budget exhausted (150/150) — task could not complete",
+            outcome="timed_out", release_claim=True, end_run=True,
+            event_payload_extra={"budget_used": 150, "budget_max": 150},
+        )
+        assert kbd.check_respawn_guard(conn, resumable) is None
+
+        # A later untyped terminal attempt supersedes the older continuation
+        # receipt and restores fail-closed duplicate-PR protection.
+        assert kb.claim_task(conn, resumable) is not None
+        assert kbd._record_task_failure(
+            conn, resumable, error="worker exceeded max runtime",
+            outcome="timed_out", release_claim=True, end_run=True,
+        )
+        assert kbd.check_respawn_guard(conn, resumable) == "active_pr"
+
+        generic = kb.create_task(conn, title="generic timeout", assignee="worker")
+        assert kb.claim_task(conn, generic) is not None
+        kb.add_comment(conn, generic, author="worker", body=pr_comment)
+        _backdate_comments(conn, generic)
+        assert not kbd._record_task_failure(
+            conn, generic, error="worker exceeded max runtime",
+            outcome="timed_out", release_claim=True, end_run=True,
+        )
+        assert kbd.check_respawn_guard(conn, generic) == "active_pr"
+
+
 def _backdate_comments(conn, tid, seconds=60):
     """Second-granularity timestamps: make the PR comment older than the
     handoff that follows it in the same test."""
@@ -649,7 +736,6 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
 
     def spawn(task, workspace):
         captured.append(list(task.skills or []))
-        return None
 
     with kbc.connect() as conn:
         task_id = kb.create_task(

@@ -13,7 +13,7 @@ import pytest
 
 from gateway.config import PlatformConfig
 from plugins.platforms.telegram import adapter as tg_adapter
-from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
+from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
 def _make_adapter() -> TelegramAdapter:
@@ -60,6 +60,35 @@ async def test_send_long_flood_fails_closed_without_inline_sleep(monkeypatch):
     assert result.retry_after == 5827.0
     assert result.retryable is False
     sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_control_prompt_preserves_flood_retry_after_and_arms_chat_window():
+    """Clarify/button sends must not strip RetryAfter and hot-loop the Bot API."""
+    adapter = _make_adapter()
+    adapter._send_control_message = AsyncMock(side_effect=_FloodError(3600.0))
+
+    result = await adapter._send_prompt(
+        "send_clarify", "123", None,
+        lambda: ("Approve?", None, None),
+    )
+
+    assert result.success is False
+    assert result.error == "flood_control:3600.0"
+    assert result.retry_after == 3600.0
+    assert result.retryable is False
+    # The durable flood window is deliberately clamped to five minutes even
+    # when Telegram asks the caller to retry later; the original retry_after
+    # remains on the SendResult for ledger/redelivery scheduling.
+    remaining = adapter._send_flood_cooldown_remaining("123")
+    assert remaining is not None and 0 < remaining <= 300.0
+    adapter._send_control_message.reset_mock()
+    refused = await adapter._send_prompt(
+        "send_clarify", "123", None,
+        lambda: ("Approve?", None, None),
+    )
+    assert refused.error.startswith("flood_control:")
+    adapter._send_control_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio

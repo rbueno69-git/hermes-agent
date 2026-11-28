@@ -5,6 +5,16 @@ import sqlite3
 import time
 from typing import Any, Optional
 
+
+class ContinuationParentInUse(ValueError):
+    """Raised when deleting a task would orphan a declared continuation."""
+
+    def __init__(self, parent_id: str, child_id: str):
+        self.parent_id = parent_id
+        self.child_id = child_id
+        super().__init__(f"task {parent_id} is the declared continuation parent of {child_id}")
+
+
 def inherit_creator_origin(
     conn: sqlite3.Connection, task_id: str, creator_task_id: Optional[str], *,
     created_at: int,

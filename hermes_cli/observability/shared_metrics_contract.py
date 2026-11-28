@@ -13,7 +13,16 @@ from agent.relay_runtime import (
     RUNTIME_SCHEMA_VERSION,
 )
 from hermes_cli.platforms import PLATFORMS
+from tools.connectors.gateway.names import CONNECTOR_NAME_PREFIX
 from toolsets import BUILTIN_TOOL_NAMES, BUILTIN_TOOLSET_NAMES
+
+from .shared_metrics_prepared_compaction import (
+    PREPARED_COMPACTION_DIMENSIONS, PREPARED_COMPACTION_MARK, PREPARED_COMPACTION_METRIC,
+    PREPARED_COMPACTION_SNAPSHOT_DIMENSIONS,
+)
+from .shared_metrics_group_chats import GROUP_CHAT_SNAPSHOT_FIELDS
+from .shared_metrics_busy import BUSY_ARRIVAL_DISPOSITIONS, BUSY_ARRIVAL_METRIC, BUSY_PEAK_FIELD, BUSY_WAIT_BUCKETS
+from .shared_metrics_desktop_frames import DESKTOP_LONG_FRAME_ROW_BUCKETS, DESKTOP_LONG_FRAMES_METRIC
 
 SCHEMA_KEY = "hermes.metrics.schema_version"
 # A random per-emit token (no payload) on rows whose producer waits to learn they were SAVED: facts
@@ -116,7 +125,7 @@ DURATION_BUCKETS = frozenset({
 })
 COUNT_BUCKETS = frozenset({"0", "1", "2", "3_to_5", "6_to_10", "gte_11"})
 TOOL_CATEGORIES = frozenset({
-    "browser", "code_execution", "communication", "computer_use", "delegation", "file",
+    "browser", "code_execution", "communication", "computer_use", "connector", "delegation", "file",
     "home_automation", "mcp", "media", "memory", "other", "planning", "project", "scheduler",
     "skill", "terminal", "unknown", "web",
 })
@@ -137,7 +146,7 @@ SKILL_POST_PATCH_STATES = frozenset({"no_new_patch", "not_applicable", "reused_a
 CLIENT_OS_FAMILIES = frozenset({"linux", "macos", "unknown", "windows"})
 CLIENT_ARCHITECTURES = frozenset({"arm", "arm64", "unknown", "x86", "x86_64"})
 CLIENT_INSTALL_METHODS = frozenset({
-    "apt", "docker", "git", "home-manager", "homebrew", "nixos", "pip", "unknown",
+    "apt", "docker", "git", "home-manager", "homebrew", "microsoft-store", "nixos", "pip", "unknown",
 })
 CLIENT_RESOURCE_KEYS = frozenset({"architecture", "hermes_version", "install_method", "os_family"})
 
@@ -153,10 +162,28 @@ TASK_FAILURE_CLASSES = MODEL_ERROR_CLASSES | frozenset({
 # Surfaces that are not messaging platforms keep their own execution_surface value.
 # ``relay``: a connector inbound whose platform neither the inbound nor a single-platform connector names.
 _CORE_GATEWAY_PLATFORMS = (frozenset(PLATFORMS) - {"api_server", "cli", "cron"}) | {"none", "plugin", "relay"}
-TOOL_NAMES = BUILTIN_TOOL_NAMES | {"mcp", "plugin", "unknown"}
+# The Tool Search bridge tools are not in a toolset; every hosted connector tool reads ``connector``.
+BRIDGE_TOOL_NAMES = frozenset({"tool_call", "tool_describe", "tool_search"})
+# Core tools a stable release shipped that core no longer has: setup_choose/start_chat with the old setup flow;
+# the built-in browser_* tools with agent-browser (the camofox plugin's same-named tools record as ``plugin``);
+# the five browser_vault_* tools folded into one browser_vault; spotify_* / yb_* when Spotify and Yuanbao left
+# core for their catalog plugins. v4 only adds values, and rows older releases saved with these names must still
+# package; recording maps through the live sets (tool_metric_name, toolset_metric_name).
+RETIRED_TOOL_NAMES = frozenset({
+    "setup_choose", "start_chat",
+    "browser_back", "browser_click", "browser_console", "browser_get_images", "browser_navigate",
+    "browser_press", "browser_scroll", "browser_snapshot", "browser_type", "browser_vision",
+    "browser_vault_enter_code", "browser_vault_fill", "browser_vault_list", "browser_vault_save_login",
+    "browser_vault_unlock",
+    "spotify_albums", "spotify_devices", "spotify_library", "spotify_playback", "spotify_playlists",
+    "spotify_queue", "spotify_search", "yb_query_group_info", "yb_query_group_members", "yb_search_sticker",
+    "yb_send_dm", "yb_send_sticker"})
+RETIRED_TOOLSET_NAMES = frozenset({"hermes-yuanbao", "setup", "spotify", "start_chat", "yuanbao"})
+_LIVE_TOOL_NAMES = BUILTIN_TOOL_NAMES | BRIDGE_TOOL_NAMES | {"connector", "mcp", "plugin", "unknown"}
+TOOL_NAMES = _LIVE_TOOL_NAMES | RETIRED_TOOL_NAMES
 TOOL_ERROR_CLASSES = frozenset({
-    "blocked", "contract_violation", "exception", "interrupted", "invalid_arguments", "none",
-    "timeout", "tool_error", "unknown",
+    "alias", "blocked", "connection_required", "connector_backend", "contract_violation", "exception",
+    "interrupted", "invalid_arguments", "none", "not_allowed", "timeout", "tool_error", "unknown",
 })
 SIZE_BUCKETS = frozenset({
     "0", "1", "2", "3_to_5", "6_to_10", "11_to_25", "26_to_100", "101_to_250", "gte_251",
@@ -164,9 +191,9 @@ SIZE_BUCKETS = frozenset({
 
 
 def _bundled_memory_providers() -> frozenset[str]:
-    from pathlib import Path
+    from hermes_cli.plugins import get_bundled_plugins_dir
 
-    root = Path(__file__).resolve().parents[2] / "plugins" / "memory"
+    root = get_bundled_plugins_dir() / "memory"
     try:
         return frozenset(p.name for p in root.iterdir() if (p / "__init__.py").is_file())
     except OSError:
@@ -219,7 +246,8 @@ COMPRESSION_SKIP_CLASSES = frozenset({
     "lock_contended", "no_compressible_window", "snapshot_stale",
 })
 COMPRESSION_FAILURE_CLASSES = COMPRESSION_SKIP_CLASSES | frozenset({
-    "aux_model_fallback", "commit_fence_cancelled", "exception", "feasibility_skip", "no_progress", "none",
+    "aux_model_fallback", "commit_fence_cancelled", "empty_transcript", "exception", "feasibility_skip",
+    "no_progress", "none",
     "other", "pool_saturated", "rollback", "session_split_failed", "stall_deterministic_fallback",
     "stall_interrupted", "summary_auth_failure", "summary_empty_content_failure", "summary_generation_aborted",
     "summary_generation_failed", "summary_network_failure", "summary_overload_degraded",
@@ -270,8 +298,9 @@ DELEGATION_OUTCOMES = frozenset({"cancelled", "failed", "partial", "success"})
 DELEGATION_DEPTHS = frozenset({"1", "2", "3", "gte_4"})
 DELEGATION_MODES = frozenset({"background", "foreground"})
 EXECUTION_KINDS = frozenset({"browser", "code", "terminal"})
-# Shipped browser backends: tools/browser_{camofox,lightpanda,tool_cdp,tool_cloud,extension_router}.py
-# plus the bundled cloud providers in plugins/browser/.
+# Browser backend labels: tools/browser_{lightpanda,session_cdp,session_cloud}.py plus the bundled cloud
+# providers in plugins/browser/. ``camofox`` (now the catalog plugin) and ``extension`` (the removed
+# browser-extension control) stay as legacy values: removing a shipped schema value breaks older relays.
 BROWSER_BACKENDS = frozenset({
     "browser-use", "browserbase", "camofox", "cdp", "extension", "firecrawl", "lightpanda", "local", "other",
 })
@@ -313,7 +342,7 @@ PLATFORM_ERROR_CLASSES = frozenset({"none", "auth", "network", "rate_limited", "
 DELIVERY_OUTCOMES = frozenset({"sent", "failed"})
 DELIVERY_FAILURE_CLASSES = frozenset({"none", "rate_limited", "too_long", "auth", "network", "forbidden", "other"})
 REPLY_LATENCY_BUCKETS = frozenset({"lt_2s", "2s_to_5s", "5s_to_15s", "15s_to_60s", "gte_60s"})
-CRON_RUN_OUTCOMES = frozenset({"success", "failed", "missed", "skipped"})
+CRON_RUN_OUTCOMES = frozenset({"success", "failed", "missed", "skipped", "cancelled"})
 CRON_DELIVERY_KINDS = frozenset({"local", "platform", "webhook", "none", "other"})
 
 # ---- v4 install ----
@@ -329,6 +358,8 @@ RAM_BUCKETS = frozenset({
 })
 GPU_CLASSES = frozenset({"amd", "apple_silicon", "intel", "none", "nvidia", "unknown"})
 YES_NO = frozenset({"no", "yes"})
+# Who hosts the install, from HERMES_HOSTING (set by the hosting platform); anything else is self-hosted.
+HOSTINGS = frozenset({"nous_cloud", "self_hosted"})
 _INSTALL_V4_SNAPSHOT_DIMENSIONS = {
     "behind_bucket": BEHIND_BUCKETS, "gpu_class": GPU_CLASSES, "local_model_provider_used": YES_NO,
     "ram_bucket": RAM_BUCKETS, "release_channel": RELEASE_CHANNELS, "version_age_bucket": VERSION_AGE_BUCKETS,
@@ -357,6 +388,9 @@ UPDATE_STAGE_MARK = UPDATE_STAGE_METRIC = "hermes.update.stage"
 PROCESS_EXIT_MARK = PROCESS_EXIT_METRIC = "hermes.process.exit"
 UPDATE_KINDS = frozenset({"cli", "desktop"})
 UPDATE_OUTCOMES = frozenset({"failed", "noop", "refused", "success"})
+# ``partial``: committed, but interrupted after the commit point or the user's changes stay parked
+# (only `hermes update` receipts; the Desktop RPC keeps UPDATE_OUTCOMES).
+UPDATE_RUN_OUTCOMES = UPDATE_OUTCOMES | {"partial"}
 # `hermes update` pipeline stages, in pipeline order (the receipt's stage marks use these names).
 UPDATE_STAGE_ORDER = ("plan", "snapshot", "apply", "deps", "build", "restart", "verify")
 UPDATE_STAGES = frozenset(UPDATE_STAGE_ORDER)
@@ -461,9 +495,9 @@ EXTENSION_REGISTRY_IDS = frozenset({
 })
 EXTENSION_REGISTRIES = EXTENSION_REGISTRY_IDS | frozenset({"none", "other", "unresolved"})
 # Why a `hermes update` run failed or was refused, derived from the FINAL receipt only
-# (shared_metrics_update.update_failure_class); ``none`` unless outcome is failed/refused.
+# (shared_metrics_update.update_failure_class); ``none`` unless outcome is failed/refused/partial.
 UPDATE_FAILURE_CLASSES = frozenset({
-    "aborted_before_apply",  # exited before the checkout moved (fetch, channel, branch, merge, HEAD checks)
+    "aborted_before_apply",  # fallback: exited before the checkout moved with no reason recorded
     "build_failed",          # the build stage reported failure
     "deps_failed",           # PM dependency preparation failed (no deps mark, or a PM error type)
     "exception",             # the run ended on an uncaught exception (type name dropped)
@@ -478,7 +512,45 @@ UPDATE_FAILURE_CLASSES = frozenset({
     "restart_failed",        # the gateway restart failed, or a skipped restart left the fleet owing one
     "subprocess_failed",     # a subprocess error (CalledProcessError, TimeoutExpired) reached the boundary
     "unknown",               # the reporter sent no reason (Desktop packaged updaters)
+    "disk_full",             # out of disk space (ENOSPC, or no room to stage the ZIP)
+    "local_changes_parked",  # committed, but the user's stashed changes could not be re-applied (partial)
+    "permission_denied",     # the run ended on a PermissionError
 })
+# The exit that stopped a run before its apply stage mark, recorded at the exit itself as one of
+# these tokens (update_receipt.record_stop_reason -> the receipt's ``stop_class``).
+UPDATE_STOP_CLASSES = frozenset({
+    "branch_missing",         # the target branch exists neither locally nor on origin
+    "branch_unsupported",     # --branch on the Windows ZIP fallback
+    "channel_unresolved",     # the update channel could not be resolved
+    "checkout_move_failed",   # git could not move the checkout (ff refused, reset or switch failed)
+    "commit_point_refused",   # the commit point could not be armed durably; nothing moved
+    "detached_head",          # a detached checkout stayed put, or its commits could not be backed up
+    "disk_full",              # (see above)
+    "downgrade_refused",      # the target predates the gateway runtime a state.db already uses
+    "download_failed",        # the ZIP fallback download failed
+    "fetch_failed",           # git fetch failed
+    "gateway_pause_failed",   # Windows: the gateways could not be paused safely before the venv moves
+    "git_in_progress",        # a merge/rebase/cherry-pick/... was already in progress
+    "git_index_locked",       # git refused: another git process's .git/index.lock exists
+    "git_timeout",            # a network git call hit the updater's time limit
+    "head_moved",             # a ref moved during the update; HEAD is not the selected commit
+    "local_changes_blocked",  # local changes git could not stash, or a dirty tree the ZIP will not overwrite
+    "lock_held",              # (see above)
+    "managed_install",        # (see above): HERMES_MANAGED installs refuse before any receipt
+    "merge_conflict",         # local commits on a custom branch conflict with upstream
+    "not_git_checkout",       # the install is not a git checkout (non-Windows)
+    "old_version_handoff",    # an older updater's hand-off to this version could not finish
+    "parked_branch_blocked",  # the checkout is parked on another branch that is unsafe to switch
+    "permission_denied",      # (see above): git could not write a file it needs (e.g. index.lock's directory)
+    "stash_restore_rejected",  # re-applied local changes broke Hermes; the update stopped
+    "syntax_rollback",        # the pulled code failed the syntax check and was rolled back
+    "target_syntax_error",    # the target failed the syntax check before anything moved
+    "target_unresolved",      # the fetched target ref did not resolve to a commit
+    "unexpected_branch",      # the checkout ended on a branch that is not the target
+    "venv_foreign_owner",     # the venv belongs to another OS user
+    "zip_failed",             # the ZIP fallback swap failed and was rolled back
+})
+UPDATE_FAILURE_CLASSES |= UPDATE_STOP_CLASSES
 # ---- end iuf c1 ----
 # ---- iuf c2 ----
 # One fresh-install run of scripts/install.sh / install.ps1, from the local receipt the installer
@@ -545,6 +617,14 @@ LOOP_GUARD_DETECTORS = frozenset({
 })
 TOOL_RECOVERY_OUTCOMES = frozenset({"error", "gave_up", "no_tool_call", "success"})
 TOOL_RECOVERY_NEXT_TOOLS = frozenset({"different", "none", "same"})
+# ---- v4 connectors ----
+TOOL_SEARCH_MARK = TOOL_SEARCH_METRIC = "hermes.tool_search.count"
+TOOL_BATCH_MARK = TOOL_BATCH_METRIC = "hermes.tool_batch.count"
+CONNECTOR_CHAIN_MARK = CONNECTOR_CHAIN_METRIC = "hermes.connector_chain.count"
+TOOL_SEARCH_SCOPES = frozenset({"both", "connector", "local"})
+TOOL_SEARCH_OUTCOMES = frozenset({"connector_unavailable", "error", "hits", "no_hits"})
+CONNECTOR_SHARES = frozenset({"all", "none", "some"})
+# ---- end v4 connectors ----
 TERMINAL_COMMAND_KINDS = frozenset({
     "build", "container", "file_ops", "git", "network", "node", "other", "package_manager", "python",
     "shell", "shell_builtin", "test_runner",
@@ -577,7 +657,7 @@ TOOL_SCHEMA_TOKEN_BUCKETS = frozenset({
     "0", "lt_2k", "2k_to_5k", "5k_to_10k", "10k_to_20k", "20k_to_40k", "gte_40k",
 })
 # Toolsets Hermes ships; MCP servers and plugin toolsets collapse to custom.
-TOOLSET_NAMES = BUILTIN_TOOLSET_NAMES | {"custom"}
+TOOLSET_NAMES = BUILTIN_TOOLSET_NAMES | RETIRED_TOOLSET_NAMES | {"custom"}
 # compression is the expected cause; the rest are Hermes invalidating a warm prefix (bugs or
 # user-driven), or the provider reporting a cold read Hermes did not cause.
 CACHE_BREAK_CAUSES = frozenset({
@@ -639,20 +719,17 @@ DESKTOP_FRICTION_DETAILS: dict[str, frozenset[str]] = {
 DESKTOP_FRICTION_KINDS = frozenset(DESKTOP_FRICTION_DETAILS)
 DESKTOP_FRICTION_DETAIL_VALUES = frozenset().union(*DESKTOP_FRICTION_DETAILS.values())
 # The Desktop first-run flows: the classic provider overlay (store/onboarding.ts), the guided flow
-# (store/onboarding-gate.ts phases + committed guide cards), free-tier sign-in, then the consent
-# answer and the first message.
+# (store/onboarding-gate.ts phases), free-tier sign-in, then the consent answer and the first message.
 DESKTOP_ONBOARDING_STEPS = frozenset({
-    "choose_later", "consent", "first_message", "free_tier_ready", "guide", "guide_connectors",
-    "guide_first_build", "guide_layout", "guide_look", "guide_skip", "model_pick", "provider_api_key",
-    "provider_local", "provider_oauth", "provider_setup", "sign_in",
+    "choose_later", "consent", "first_message", "free_tier_ready", "guide", "guide_skip", "model_pick",
+    "provider_api_key", "provider_local", "provider_oauth", "provider_setup", "sign_in",
 })
 DESKTOP_ONBOARDING_EVENTS = frozenset({"abandoned", "completed", "reached"})
 # Bot Mode (a bot's canonical chat or a bot side-chat in front) vs regular Sessions mode, per day.
 DESKTOP_MODE_USE_MARK = DESKTOP_MODE_USE_METRIC = "hermes.desktop.mode_use"
 DESKTOP_MODES = frozenset({"bots", "sessions"})
 DESKTOP_ACTIVE_MINUTES_BUCKETS = frozenset({"0", "lt_5m", "5m_to_30m", "30m_to_2h", "2h_to_6h", "gte_6h"})
-_DESKTOP_ACTIVE_THRESHOLDS = ((300_000, "lt_5m"), (1_800_000, "5m_to_30m"), (7_200_000, "30m_to_2h"),
-                              (21_600_000, "2h_to_6h"))
+_DESKTOP_ACTIVE_THRESHOLDS = ((300_000, "lt_5m"), (1_800_000, "5m_to_30m"), (7_200_000, "30m_to_2h"), (21_600_000, "2h_to_6h"))
 
 
 def desktop_active_minutes_bucket(active_ms: Any) -> str:
@@ -839,7 +916,8 @@ _COUNTER_DIMENSION_VALUES: dict[str, dict[str, frozenset[str]]] = {
         "memory_provider": MEMORY_PROVIDERS, "messaging_platform_count_bucket": SIZE_BUCKETS,
         "plugin_count_bucket": SIZE_BUCKETS, "profile_count_bucket": SIZE_BUCKETS,
         "skill_count_bucket": SIZE_BUCKETS, "terminal_backend": TERMINAL_BACKENDS,
-        **_INSTALL_V4_SNAPSHOT_DIMENSIONS,
+        **_INSTALL_V4_SNAPSHOT_DIMENSIONS, **PREPARED_COMPACTION_SNAPSHOT_DIMENSIONS,
+        **dict.fromkeys(GROUP_CHAT_SNAPSHOT_FIELDS, SIZE_BUCKETS), "hosting": HOSTINGS,
     },
     SESSION_METRIC: {
         "active_duration_bucket": SESSION_DURATION_BUCKETS, "entrypoint": TASK_ENTRYPOINTS,
@@ -906,7 +984,7 @@ _COUNTER_DIMENSION_VALUES: dict[str, dict[str, frozenset[str]]] = {
     UPDATE_RUN_METRIC: {
         "apply_mode": UPDATE_APPLY_MODES, "duration_bucket": UPDATE_DURATION_BUCKETS,
         "failed_stage": UPDATE_FAILED_STAGES, "from_version_age_bucket": VERSION_AGE_BUCKETS,
-        "kind": UPDATE_KINDS, "outcome": UPDATE_OUTCOMES,
+        "kind": UPDATE_KINDS, "outcome": UPDATE_RUN_OUTCOMES,
         # ---- iuf c1 ----
         "failure_class": UPDATE_FAILURE_CLASSES,
         # ---- end iuf c1 ----
@@ -951,7 +1029,7 @@ _COUNTER_DIMENSION_VALUES: dict[str, dict[str, frozenset[str]]] = {
     # ---- v5 engagement ----
     ENGAGEMENT_DAY_METRIC: {
         "active_minutes_bucket": ACTIVE_MINUTES_BUCKETS, "active_profile_count_bucket": SIZE_BUCKETS,
-        "surfaces_used_count": SURFACES_USED_BUCKETS,
+        "surfaces_used_count": SURFACES_USED_BUCKETS, BUSY_PEAK_FIELD: COUNT_BUCKETS,
     },
     ENGAGEMENT_SURFACE_METRIC: {"active_minutes_bucket": ACTIVE_MINUTES_BUCKETS, "surface": ENGAGEMENT_SURFACES},
     MODEL_SWITCH_AFTER_METRIC: {"turns_before_switch_bucket": TURNS_BEFORE_SWITCH_BUCKETS},
@@ -960,17 +1038,15 @@ _COUNTER_DIMENSION_VALUES: dict[str, dict[str, frozenset[str]]] = {
     DESKTOP_FEATURE_USE_METRIC: {"area": DESKTOP_FEATURE_AREAS},
     DESKTOP_FRICTION_METRIC: {"detail": DESKTOP_FRICTION_DETAIL_VALUES, "kind": DESKTOP_FRICTION_KINDS},
     DESKTOP_ONBOARDING_METRIC: {"event": DESKTOP_ONBOARDING_EVENTS, "step": DESKTOP_ONBOARDING_STEPS},
-    DESKTOP_MODE_USE_METRIC: {
-        "active_minutes_bucket": DESKTOP_ACTIVE_MINUTES_BUCKETS, "bot_count_bucket": SIZE_BUCKETS,
-        "messages_sent_bucket": SIZE_BUCKETS, "mode": DESKTOP_MODES,
-    },
+    DESKTOP_MODE_USE_METRIC: {"active_minutes_bucket": DESKTOP_ACTIVE_MINUTES_BUCKETS, "bot_count_bucket": SIZE_BUCKETS, "messages_sent_bucket": SIZE_BUCKETS, "mode": DESKTOP_MODES},
+    DESKTOP_LONG_FRAMES_METRIC: {"frame_bucket": DESKTOP_LONG_FRAME_ROW_BUCKETS, "visible_minutes_bucket": DESKTOP_ACTIVE_MINUTES_BUCKETS},
     DESKTOP_ACTION_USE_METRIC: {"action": DESKTOP_ACTION_IDS, "count_bucket": SIZE_BUCKETS, "via": DESKTOP_ACTION_VIAS},
     DESKTOP_DISLIKE_METRIC: {
         "direction": DESKTOP_DISLIKE_DIRECTIONS, "signal": DESKTOP_DISLIKE_SIGNALS, "target": DESKTOP_DISLIKE_TARGET_VALUES,
     },
     # ---- end v5 desktop ----
     # ---- v5 signals ----
-    TOOL_UNAVAILABLE_METRIC: {"tool_name": BUILTIN_TOOL_NAMES},
+    TOOL_UNAVAILABLE_METRIC: {"tool_name": BUILTIN_TOOL_NAMES | RETIRED_TOOL_NAMES},
     PROVIDER_SETUP_METRIC: {
         "event": PROVIDER_SETUP_EVENTS, "failure_class": PROVIDER_SETUP_FAILURE_CLASSES,
         "surface": PROVIDER_SETUP_SURFACES,
@@ -987,6 +1063,15 @@ _COUNTER_DIMENSION_VALUES: dict[str, dict[str, frozenset[str]]] = {
         "outcome": INSTALL_RUN_OUTCOMES,
     },
     # ---- end iuf c2 ----
+    # ---- v4 connectors ----
+    TOOL_SEARCH_METRIC: {"hits_bucket": COUNT_BUCKETS, "outcome": TOOL_SEARCH_OUTCOMES, "scope": TOOL_SEARCH_SCOPES},
+    TOOL_BATCH_METRIC: {"connector_share": CONNECTOR_SHARES, "size_bucket": COUNT_BUCKETS},
+    CONNECTOR_CHAIN_METRIC: {
+        "described_first": YES_NO, "outcome": TOOL_OUTCOMES, "searches_before_bucket": COUNT_BUCKETS,
+    },
+    # ---- end v4 connectors ----
+    PREPARED_COMPACTION_METRIC: {**PREPARED_COMPACTION_DIMENSIONS, "failure_class": COMPRESSION_FAILURE_CLASSES},
+    BUSY_ARRIVAL_METRIC: {"disposition": BUSY_ARRIVAL_DISPOSITIONS, "platform": ADAPTER_PLATFORMS, "wait_bucket": BUSY_WAIT_BUCKETS},
 }
 _MODEL_ROUTE_MAX_LENGTHS = {
     "model": MODEL_IDENTIFIER_MAX_LENGTH, "provider": PROVIDER_IDENTIFIER_MAX_LENGTH,
@@ -1028,6 +1113,7 @@ _IDENTIFIER_FIELDS: dict[str, dict[str, int]] = {
     PROVIDER_SETUP_METRIC: {"provider": PROVIDER_IDENTIFIER_MAX_LENGTH},
     FEATURE_DISABLED_METRIC: {"name": FEATURE_DISABLED_NAME_MAX_LENGTH},
     # ---- end v5 signals ----
+    TOOL_BATCH_METRIC: _MODEL_ROUTE_MAX_LENGTHS,
 }
 # ---- v5 engagement ----
 # Conversation volume on the session row: new fields, so rows recorded before them still package.
@@ -1065,12 +1151,18 @@ _LEGACY_METRIC_FIELDS: dict[str, tuple[frozenset[str], ...]] = {
     SKILL_LOAD_METRIC: (_METRIC_FIELDS[SKILL_LOAD_METRIC] - {"skill_name"},),
     INSTALL_SNAPSHOT_METRIC: (_METRIC_FIELDS[INSTALL_SNAPSHOT_METRIC] - {
         "display_language", "install_age_bucket", "main_provider", "messaging_platform_count_bucket",
-        "terminal_backend", *_INSTALL_V4_SNAPSHOT_DIMENSIONS,
+        "terminal_backend", *_INSTALL_V4_SNAPSHOT_DIMENSIONS, *PREPARED_COMPACTION_SNAPSHOT_DIMENSIONS,
     },
         # ---- v4 install ----
-        _METRIC_FIELDS[INSTALL_SNAPSHOT_METRIC] - set(_INSTALL_V4_SNAPSHOT_DIMENSIONS),
+        _METRIC_FIELDS[INSTALL_SNAPSHOT_METRIC] - {*_INSTALL_V4_SNAPSHOT_DIMENSIONS, *PREPARED_COMPACTION_SNAPSHOT_DIMENSIONS},
+        _METRIC_FIELDS[INSTALL_SNAPSHOT_METRIC] - set(PREPARED_COMPACTION_SNAPSHOT_DIMENSIONS),
     ),
 }
+# The group chat counts and hosting arrived together: every earlier shape lacks both, and an unreadable
+# room store leaves out only the group chat counts.
+_LEGACY_METRIC_FIELDS[INSTALL_SNAPSHOT_METRIC] = (*(s - {*GROUP_CHAT_SNAPSHOT_FIELDS, "hosting"} for s in (
+    *_LEGACY_METRIC_FIELDS[INSTALL_SNAPSHOT_METRIC], _METRIC_FIELDS[INSTALL_SNAPSHOT_METRIC])),
+    _METRIC_FIELDS[INSTALL_SNAPSHOT_METRIC] - set(GROUP_CHAT_SNAPSHOT_FIELDS))
 # ---- v5 engagement ----
 _LEGACY_METRIC_FIELDS[SESSION_METRIC] = (_METRIC_FIELDS[SESSION_METRIC] - set(SESSION_VOLUME_DIMENSIONS),)
 # ---- end v5 engagement ----
@@ -1081,9 +1173,10 @@ _LEGACY_METRIC_FIELDS[EXTENSION_INSTALL_METRIC] = (
 )
 _LEGACY_METRIC_FIELDS[UPDATE_RUN_METRIC] = (_METRIC_FIELDS[UPDATE_RUN_METRIC] - {"failure_class"},)
 # ---- end iuf c1 ----
+_LEGACY_METRIC_FIELDS[ENGAGEMENT_DAY_METRIC] = (_METRIC_FIELDS[ENGAGEMENT_DAY_METRIC] - {BUSY_PEAK_FIELD},)  # busy-wait
 COUNTER_METRICS = frozenset(_METRIC_FIELDS) - {LEGACY_MODEL_CALL_METRIC}
 # Counters whose value is a summed quantity rather than an event count.
-SUM_METRICS = frozenset({MODEL_TOKENS_METRIC})
+SUM_METRICS = frozenset({MODEL_TOKENS_METRIC, DESKTOP_LONG_FRAMES_METRIC})  # long frames: the day's frame count
 _SKILL_MARK_METRICS = {
     SKILL_LIFECYCLE_MARK: SKILL_LIFECYCLE_METRIC, SKILL_LOAD_MARK: SKILL_LOAD_METRIC,
 }
@@ -1135,6 +1228,9 @@ _DECISION_MARK_METRICS = {
     # ---- iuf c2 ----
     INSTALL_RUN_MARK: INSTALL_RUN_METRIC,
     # ---- end iuf c2 ----
+    TOOL_SEARCH_MARK: TOOL_SEARCH_METRIC, TOOL_BATCH_MARK: TOOL_BATCH_METRIC,
+    CONNECTOR_CHAIN_MARK: CONNECTOR_CHAIN_METRIC, PREPARED_COMPACTION_MARK: PREPARED_COMPACTION_METRIC,
+    BUSY_ARRIVAL_METRIC: BUSY_ARRIVAL_METRIC,  # busy-wait: the gateway marks under the metric's own name
 }
 
 
@@ -1204,6 +1300,8 @@ def _event_shape_matches(event: Any, **expected: Any) -> bool:
 def _bounded_dimensions(metric_name: str, data: Any) -> dict[str, str] | None:
     """Project ``data`` onto the metric's closed field set, or None when it does not fit."""
     expected_fields = _METRIC_FIELDS[metric_name]
+    if metric_name == INSTALL_SNAPSHOT_METRIC and isinstance(data, dict) and not set(data) & set(GROUP_CHAT_SNAPSHOT_FIELDS):
+        expected_fields -= set(GROUP_CHAT_SNAPSHOT_FIELDS)  # an unreadable room store leaves out only these
     if not isinstance(data, dict) or set(data) != expected_fields:
         return None
     dimensions = {field: data.get(field) for field in sorted(expected_fields)}
@@ -1659,6 +1757,8 @@ _TOOL_CATEGORY_PREFIXES = (
 
 def tool_category(kwargs: dict[str, Any]) -> str:
     """Map Hermes registry toolset metadata to a low-cardinality category."""
+    if _norm(kwargs.get("tool_name")).startswith(CONNECTOR_NAME_PREFIX):
+        return "connector"
     toolset = _norm(kwargs.get("toolset"))
     if not toolset:
         return "unknown"
@@ -1711,18 +1811,20 @@ def tool_terminal_fields(
         "outcome": outcome,
         "retry_count_bucket": tool_retry_bucket(kwargs.get("retry_count")),
         "tool_category": category if category in TOOL_CATEGORIES else tool_category(kwargs),
-        "tool_name": tool_name if tool_name is not None and tool_name in TOOL_NAMES
+        "tool_name": tool_name if tool_name is not None and tool_name in _LIVE_TOOL_NAMES
         else tool_metric_name(kwargs),
     }
 
 
 def tool_metric_name(kwargs: dict[str, Any]) -> str:
-    """A built-in tool's own name; MCP and plugin tools collapse to their source kind."""
+    """A built-in or bridge tool's own name; connector, MCP and plugin tools collapse to their kind."""
     name = _norm(kwargs.get("tool_name"))
-    if name in BUILTIN_TOOL_NAMES:
+    if name in BUILTIN_TOOL_NAMES or name in BRIDGE_TOOL_NAMES:
         return name
     if not name:
         return "unknown"
+    if name.startswith(CONNECTOR_NAME_PREFIX):
+        return "connector"
     return "mcp" if name.startswith("mcp_") or tool_category(kwargs) == "mcp" else "plugin"
 
 
@@ -1739,14 +1841,59 @@ _TOOL_ERROR_TYPES = {
 
 def tool_error_class(kwargs: dict[str, Any], outcome: str | None = None) -> str:
     """Closed failure class from Hermes's own error_type; exception class names become
-    ``exception`` so plugin-defined identifiers never leave the machine."""
+    ``exception`` so plugin-defined identifiers never leave the machine. A connector entry's
+    gateway error code names its class instead of ``tool_error``."""
     outcome = outcome or tool_outcome(kwargs)
     if outcome in _TOOL_STATUS_ERROR_CLASSES:
         return _TOOL_STATUS_ERROR_CLASSES[outcome]
     if outcome != "failed":
         return "unknown"
     error_type = _norm(kwargs.get("error_type"))
+    if error_type == "tool_error" and (connector_class := connector_error_class(kwargs)):
+        return connector_class
     return _TOOL_ERROR_TYPES.get(error_type, "exception" if error_type else "unknown")
+
+
+# The tool gateway's execute codes (``tools.connectors.gateway.wire.EXECUTE_ERROR_CODES``) by class;
+# a code not listed here keeps ``tool_error`` unless its family is backend.
+_CONNECTOR_CODE_CLASSES = {
+    **dict.fromkeys(("CONNECTION_REQUIRED", "CONNECTION_EXPIRED"), "connection_required"),
+    "TOOL_NOT_ALLOWED": "not_allowed",
+    **dict.fromkeys(("ALIAS_REQUIRED", "ALIAS_UNKNOWN"), "alias"),
+    "INVALID_ARGUMENTS": "invalid_arguments",
+    # Agent-side file input refusals (``tools.connectors.gateway.wire.FILE_ERROR_FAMILIES``).
+    "FILE_NOT_ALLOWED": "not_allowed",
+    **dict.fromkeys(("FILE_NOT_FOUND", "FILE_TOO_LARGE"), "invalid_arguments"),
+}
+_CONNECTOR_FAMILY_CLASSES = {"backend": "connector_backend"}
+
+
+def connector_error_class(kwargs: dict[str, Any]) -> str | None:
+    """The class of a failed connector entry from its result's ``error.code``; None when the call is
+    not a connector call or its result names no code."""
+    if not _norm(kwargs.get("tool_name")).startswith(CONNECTOR_NAME_PREFIX):
+        return None
+    error = _result_error(kwargs.get("result"))
+    code = str(error.get("code") or "").strip().upper()
+    if not code:
+        return None
+    # Late import: the wire module pulls pydantic, which the contract does not need at import.
+    from tools.connectors.gateway.wire import execute_error_family
+
+    family = execute_error_family(code, error.get("family") if isinstance(error.get("family"), str) else None)
+    return _CONNECTOR_FAMILY_CLASSES.get(family or "") or _CONNECTOR_CODE_CLASSES.get(code)
+
+
+def _result_error(result: Any) -> dict[str, Any]:
+    if isinstance(result, str):
+        try:
+            import json
+
+            result = json.loads(result)
+        except ValueError:
+            return {}
+    error = result.get("error") if isinstance(result, dict) else None
+    return error if isinstance(error, dict) else {}
 
 
 def tool_latency_bucket(value: Any, *, fallback_duration_ms: int | None = None) -> str:
@@ -1818,32 +1965,6 @@ _SIZE_THRESHOLDS = (
 def size_bucket(count: int) -> str:
     """Bucket a non-negative install-scale count."""
     return _bucket(max(0, int(count)), _SIZE_THRESHOLDS, "gte_251")
-
-
-def install_snapshot_fields(
-    *, memory_provider: Any, mcp_servers: int, plugins: int, skills: int, cron_jobs: int,
-    profiles: int, messaging_platforms: int, install_age_bucket: str, main_provider: Any,
-    terminal_backend: Any, display_language: Any,
-) -> dict[str, str]:
-    """Bounded daily configuration snapshot: counts, closed enums and public names only."""
-    from .shared_metrics_catalog import display_language_metric_name, provider_metric_name
-
-    provider = _norm(memory_provider)
-    backend = _norm(terminal_backend) or "local"
-    return {
-        "cron_job_count_bucket": size_bucket(cron_jobs),
-        "display_language": display_language_metric_name(display_language),
-        "install_age_bucket": install_age_bucket if install_age_bucket in INSTALL_AGE_BUCKETS else "unknown",
-        "main_provider": provider_metric_name(main_provider) if main_provider else "none",
-        "mcp_server_count_bucket": size_bucket(mcp_servers),
-        "memory_provider": "builtin" if not provider
-        else provider if provider in MEMORY_PROVIDERS else "plugin",
-        "messaging_platform_count_bucket": size_bucket(messaging_platforms),
-        "plugin_count_bucket": size_bucket(plugins),
-        "profile_count_bucket": size_bucket(profiles),
-        "skill_count_bucket": size_bucket(skills),
-        "terminal_backend": backend if backend in TERMINAL_BACKENDS else "other",
-    }
 
 
 def _metric_identifier(value: Any, *, max_length: int) -> str:

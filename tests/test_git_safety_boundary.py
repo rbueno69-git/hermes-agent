@@ -69,3 +69,4 @@ def test_checkout_guard_covers_write_verbs_without_blocking_queries(tmp_path):
                  ["worktree", "list"], ["branch", "--show-current"], ["tag", "-l"],
                  ["tag", "--merged", "HEAD", "--list", "v[0-9]*"]):
         assert blocked_git_mutation(["git", *argv], options, (root,)) is None
+    assert blocked_git_mutation([None, "lock"], options, (root,)) is None

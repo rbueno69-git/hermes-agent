@@ -9,11 +9,12 @@ import subprocess
 import sys
 import time
 import types
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-import hermes_state_wal
+import sqlite_support
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
@@ -193,14 +194,92 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
 def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
     with kbc.connect() as conn:
         t = kb.create_task(conn, title="delayed recheck", assignee="ops")
+        assert kb.block_task(conn, t, reason="waiting for human", kind="needs_input")
+        assert kb.get_task(conn, t).block_kind == "needs_input"
         assert kb.schedule_task(conn, t, reason="run next week") is True
         task = kb.get_task(conn, t)
         assert task.status == "scheduled"
+        assert task.block_kind is None
         assert kb.claim_task(conn, t) is None
 
         events = kb.list_events(conn, t)
         assert any(e.kind == "scheduled" and e.payload == {"reason": "run next week"} for e in events)
 
+
+def test_recompute_ready_wakes_only_due_typed_scheduled_marker(kanban_home):
+    due = 1_800_000_000
+    due_iso = datetime.fromtimestamp(due, UTC).isoformat()
+    with kbc.connect() as conn:
+        timed = kb.create_task(conn, title="wake at deadline", assignee="ops")
+        malformed = kb.create_task(conn, title="bad marker", assignee="ops")
+        bad_offset = kb.create_task(conn, title="bad offset", assignee="ops")
+        fractional = kb.create_task(conn, title="fractional deadline", assignee="ops")
+        untimed = kb.create_task(conn, title="manual wake only", assignee="ops")
+        assert kb.schedule_task(
+            conn, timed, reason=f"SCHEDULED_UNTIL={due_iso} observe quarantine",
+        )
+        assert kb.schedule_task(
+            conn, malformed, reason="SCHEDULED_UNTIL=tomorrow observe quarantine",
+        )
+        assert kb.schedule_task(
+            conn, bad_offset, reason="SCHEDULED_UNTIL=2030-01-01T00:00:00+00:60",
+        )
+        fractional_iso = due_iso.replace("+00:00", ".900000+00:00")
+        assert kb.schedule_task(
+            conn, fractional, reason=f"SCHEDULED_UNTIL={fractional_iso}",
+        )
+        assert kb.schedule_task(conn, untimed, reason="wait for operator")
+
+        assert kb.recompute_ready(conn, now=due - 1) == 0
+        assert kb.get_task(conn, timed).status == "scheduled"
+
+        assert kb.recompute_ready(conn, now=due) == 1
+        assert kb.get_task(conn, timed).status == "ready"
+        assert kb.get_task(conn, malformed).status == "scheduled"
+        assert kb.get_task(conn, bad_offset).status == "scheduled"
+        assert kb.get_task(conn, fractional).status == "scheduled"
+        assert kb.get_task(conn, untimed).status == "scheduled"
+        assert any(
+            event.kind == "scheduled_due"
+            and event.payload == {"due_at": due, "status": "ready"}
+            for event in kb.list_events(conn, timed)
+        )
+        assert kb.recompute_ready(conn, now=due + 1) == 1
+        assert kb.get_task(conn, fractional).status == "ready"
+
+
+def test_due_schedule_is_explicit_continuation_of_existing_pr(kanban_home):
+    due = 1_800_000_000
+    due_iso = datetime.fromtimestamp(due, UTC).isoformat()
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="observe published PR", assignee="ops")
+        kb.add_comment(
+            conn, task_id, author="ops",
+            body="Continue https://github.com/example/repo/pull/724 after observation.",
+        )
+        assert kb.schedule_task(conn, task_id, reason=f"SCHEDULED_UNTIL={due_iso}")
+
+        assert kb.recompute_ready(conn, now=due) == 1
+        assert kbd.check_respawn_guard(conn, task_id) is None
+
+
+def test_due_schedule_does_not_attest_a_newer_pr_comment(kanban_home):
+    due = 1_800_000_000
+    due_iso = datetime.fromtimestamp(due, UTC).isoformat()
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="new PR after scheduling", assignee="ops")
+        kb.add_comment(
+            conn, task_id, author="ops",
+            body="Initial https://github.com/example/repo/pull/724",
+        )
+        assert kb.schedule_task(conn, task_id, reason=f"SCHEDULED_UNTIL={due_iso}")
+        kb.add_comment(
+            conn, task_id, author="ops",
+            body="Newer https://github.com/example/repo/pull/725",
+        )
+
+        assert kb.recompute_ready(conn, now=due) == 1
+        assert kbd.check_respawn_guard(conn, task_id) == "active_pr"
 
 
 
@@ -560,7 +639,7 @@ def test_infrastructure_spawn_refusal_never_charges_the_card(
     never parks the card as a bare ``blocked``, the run is tagged
     ``infrastructure`` and the guard spaces the retries. A control spawn
     failure on the same card still counts."""
-    import tools.process_registry as process_registry
+    from tools import process_registry
 
     monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
     monkeypatch.setenv("INVOCATION_ID", "managed-gateway")
@@ -1187,7 +1266,7 @@ class TestSharedBoardPaths:
 
 
 # ---------------------------------------------------------------------------
-# NFS / network-filesystem fallback (see hermes_state_wal.apply_wal_with_fallback)
+# NFS / network-filesystem fallback (see sqlite_support.apply_wal_with_fallback)
 # ---------------------------------------------------------------------------
 
 def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch, caplog):
@@ -1217,16 +1296,15 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
 
     # These tests exercise the WAL-attempt path; assume a fixed SQLite so the
     # WAL-reset vulnerability gate doesn't short-circuit before the pragma.
-    import hermes_state_wal as _hermes_state_wal
     monkeypatch.setattr(
-        _hermes_state_wal, "is_sqlite_wal_reset_vulnerable",
+        sqlite_support, "is_sqlite_wal_reset_vulnerable",
         lambda version_info=None: False,
     )
-    _hermes_state_wal._wal_fallback_warned_paths.clear()
+    sqlite_support._wal_fallback_warned_paths.clear()
 
     # Clear module cache so a fresh connect() is attempted
     kb._INITIALIZED_PATHS.clear()
-    hermes_state_wal._wal_fallback_warned_paths.clear()
+    sqlite_support._wal_fallback_warned_paths.clear()
 
     real_connect = _sqlite3.connect
 
@@ -1277,10 +1355,10 @@ def test_connect_works_when_wal_is_silently_refused(tmp_path, monkeypatch, caplo
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
     kb._INITIALIZED_PATHS.clear()
-    hermes_state_wal._wal_fallback_warned_paths.clear()
+    sqlite_support._wal_fallback_warned_paths.clear()
     # Assume a fixed SQLite so the WAL-reset gate doesn't short-circuit.
     monkeypatch.setattr(
-        hermes_state_wal, "is_sqlite_wal_reset_vulnerable",
+        sqlite_support, "is_sqlite_wal_reset_vulnerable",
         lambda version_info=None: False,
     )
 
@@ -1593,7 +1671,6 @@ def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
 
 
 
-
 def test_resolve_hermes_argv_module_actually_runs():
     """The fallback module name must be importable + runnable.
 
@@ -1606,13 +1683,14 @@ def test_resolve_hermes_argv_module_actually_runs():
     import subprocess
     from hermes_cli import kanban_db_dispatch as kbd
     import shutil
-    import unittest.mock as mock
+    from unittest import mock
 
     with mock.patch.dict(os.environ, {}, clear=False):
         os.environ.pop("HERMES_BIN", None)
         with mock.patch.object(shutil, "which", return_value=None):
             argv = kbd._resolve_hermes_argv()
-    r = subprocess.run(argv + ["--version"], capture_output=True, text=True, timeout=30)
+    offline = {**os.environ, "HTTPS_PROXY": "http://127.0.0.1:9", "https_proxy": "http://127.0.0.1:9", "NO_PROXY": "", "no_proxy": ""}
+    r = subprocess.run(argv + ["--version"], capture_output=True, text=True, timeout=30, check=False, env=offline)
     assert r.returncode == 0, (
         f"`{' '.join(argv)} --version` failed (rc={r.returncode}); "
         f"stderr={r.stderr[:200]!r}"
@@ -1620,15 +1698,15 @@ def test_resolve_hermes_argv_module_actually_runs():
 
 
 def test_default_spawn_pins_repo_root_on_module_worker_pythonpath(tmp_path, monkeypatch):
-    """A module-form worker must carry the import context that selected it.
+    """The dispatcher's worker must carry the import context of the install that spawned it.
 
-    ``_resolve_hermes_argv`` proves ``hermes_cli`` importable in the gateway,
-    where a store-python shim has the repo root on ``sys.path`` in-process;
-    the worker env scrub strips Hermes-owned PYTHONPATH entries, so the bare
-    ``sys.executable -m hermes_cli.main`` child died on import and the board
-    auto-blocked (#122299, #122487, #122500). The spawned env must put the
-    running install's root first on PYTHONPATH — and never for a resolved shim
-    path, which owns its own imports.
+    The worker is always ``sys.executable -m hermes_cli.kanban_worker_client`` (it only submits
+    the claim to the profile owner), and the worker env scrub strips Hermes-owned PYTHONPATH
+    entries, so a bare module child died on import and the board auto-blocked (#122299,
+    #122487, #122500). The spawned env must put the running install's root first on
+    PYTHONPATH. Main's carve-out for a resolved ``hermes`` shim path does not apply here: the
+    worker never runs the resolved CLI argv, so a ``$HERMES_BIN``/PATH shim can neither replace
+    the module child nor drop the pin.
     """
     import os
     import sys
@@ -1662,13 +1740,11 @@ def test_default_spawn_pins_repo_root_on_module_worker_pythonpath(tmp_path, monk
         claim_expires=None, tenant=None, branch_name=None,
     )
 
-    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: [sys.executable, "-m", "hermes_cli.main"])
-    kbd._default_spawn(task, str(tmp_path / "ws"))
-    assert captured["env"]["PYTHONPATH"].split(os.pathsep)[0] == root
-
-    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["/opt/hermes/bin/hermes"])
-    kbd._default_spawn(task, str(tmp_path / "ws"))
-    assert root not in captured["env"].get("PYTHONPATH", "").split(os.pathsep)
+    for resolved in ([sys.executable, "-m", "hermes_cli.main"], ["/opt/hermes/bin/hermes"]):
+        monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda resolved=resolved: resolved)
+        kbd._default_spawn(task, str(tmp_path / "ws"))
+        assert captured["cmd"][-3:] == [sys.executable, "-m", "hermes_cli.kanban_worker_client"]
+        assert captured["env"]["PYTHONPATH"].split(os.pathsep)[0] == root
 
 
 # ---------------------------------------------------------------------------

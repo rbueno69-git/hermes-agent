@@ -157,15 +157,101 @@ def test_max_in_progress_partial_budget_across_boards(
     assert len(res.spawned) == 1
 
 
-def test_count_running_tasks_other_boards_fails_open(
+def test_per_profile_cap_is_atomic_across_concurrent_boards(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """Two boards must not both admit the same profile from stale snapshots."""
+    kb.create_board("second")
+    for board in (None, "second"):
+        with kbc.connect(board=board) as conn:
+            kb.create_task(conn, title=f"work-{board or 'default'}", assignee="alpha")
+
+    snapshot_barrier = threading.Barrier(2)
+    real_count = kbd.count_running_tasks_by_assignee_other_boards
+
+    def synchronized_snapshot(board=None):
+        counts = real_count(board)
+        try:
+            snapshot_barrier.wait(timeout=0.5)
+        except threading.BrokenBarrierError:
+            pass
+        return counts
+
+    monkeypatch.setattr(
+        kbd, "count_running_tasks_by_assignee_other_boards", synchronized_snapshot,
+    )
+    spawns: list[str] = []
+    results: list[kb.DispatchResult] = []
+
+    def tick(board):
+        with kbc.connect(board=board) as conn:
+            results.append(kbd.dispatch_once(
+                conn,
+                board=board,
+                spawn_fn=_fake_spawn_factory(spawns),
+                max_in_progress_per_profile=1,
+            ))
+
+    threads = [threading.Thread(target=tick, args=(board,)) for board in (None, "second")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(spawns) == 1
+    assert any(result.skipped_locked for result in results)
+
+
+def test_count_running_tasks_other_boards_fails_closed(
     kanban_home, monkeypatch,
 ):
-    """A broken board enumeration must not brick dispatch (returns 0)."""
+    """An incomplete host snapshot must not be treated as zero running work."""
     monkeypatch.setattr(
         kb, "list_boards",
         lambda **k: (_ for _ in ()).throw(RuntimeError("boom")),
     )
-    assert kbd.count_running_tasks_other_boards() == 0
+    assert kbd.count_running_tasks_other_boards() is None
+
+
+@pytest.mark.parametrize(
+    ("caps", "profile_snapshot"),
+    [
+        ({"max_in_progress": 2}, False),
+        ({"max_in_progress_per_profile": 1}, True),
+    ],
+)
+def test_cross_board_count_error_cancels_admission(
+    kanban_home, all_assignees_spawnable, monkeypatch, caps, profile_snapshot,
+):
+    """A failed board read cannot admit work under a host-wide cap."""
+    kb.create_board("second")
+    with kbc.connect(board="second") as other:
+        busy = kb.create_task(other, title="alpha-busy", assignee="alpha")
+        assert kb.claim_task(other, busy) is not None
+
+    spawns: list[str] = []
+    with kbc.connect() as conn:
+        ready = kb.create_task(conn, title="alpha-next", assignee="alpha")
+        real_connect = kbc.connect
+
+        def failing_connect(*, board=None):
+            if board == "second":
+                raise sqlite3.OperationalError("simulated board read failure")
+            return real_connect(board=board)
+
+        monkeypatch.setattr(kbc, "connect", failing_connect)
+        res = kbd.dispatch_once(
+            conn, spawn_fn=_fake_spawn_factory(spawns), **caps,
+        )
+
+        assert not spawns
+        assert res.skipped_locked
+        assert kb.get_task(conn, ready).status == "ready"
+        if profile_snapshot:
+            assert kbd.count_running_tasks_by_assignee_other_boards() is None
+        else:
+            assert kbd.count_running_tasks_other_boards() is None
 
 
 def test_max_spawn_stays_per_board(kanban_home, all_assignees_spawnable):
@@ -360,3 +446,62 @@ def test_review_budget_still_bounded_by_shared_cap(
 
     # Budget 2 total across both lanes, reservation notwithstanding.
     assert len(res.spawned) == 2
+
+
+def test_failed_review_spawn_returns_reserved_slot_to_ready_lane(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """A failed review launch must not strand its reserved host slot."""
+    import hermes_cli.config as cfgmod
+
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+
+    spawned: list[str] = []
+
+    def spawn(task, workspace, board=None):
+        if task.assignee == "reviewer":
+            raise RuntimeError("review launcher unavailable")
+        spawned.append(task.id)
+        return 42
+
+    with kbc.connect() as conn:
+        ready_ids = [
+            kb.create_task(conn, title=f"ready-{i}", assignee="alice")
+            for i in range(2)
+        ]
+        review_id = _park_in_review(conn, "review-fails", "reviewer")
+        res = kbd.dispatch_once(
+            conn, spawn_fn=spawn, max_in_progress=2, failure_limit=3,
+        )
+
+        assert set(spawned) == set(ready_ids)
+        assert len(res.spawned) == 2
+        assert kb.get_task(conn, review_id).status == "review"
+
+
+def test_per_profile_cap_counts_running_workers_on_other_boards(
+    kanban_home, all_assignees_spawnable,
+):
+    """One profile's cap is host-wide, just like max_in_progress."""
+    kb.create_board("second")
+    with kbc.connect(board="second") as other:
+        busy = kb.create_task(other, title="alpha-busy", assignee="alpha")
+        assert kb.claim_task(other, busy) is not None
+
+    spawns: list[str] = []
+    with kbc.connect() as conn:
+        alpha = kb.create_task(conn, title="alpha-next", assignee="alpha", priority=10)
+        beta = kb.create_task(conn, title="beta-next", assignee="beta", priority=5)
+        res = kbd.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn_factory(spawns),
+            max_in_progress=3,
+            max_in_progress_per_profile=1,
+        )
+
+        assert spawns == [beta]
+        assert kb.get_task(conn, alpha).status == "ready"
+        assert any(task_id == alpha for task_id, *_ in res.skipped_per_profile_capped)
