@@ -77,7 +77,11 @@ async def test_control_prompt_preserves_flood_retry_after_and_arms_chat_window()
     assert result.error == "flood_control:3600.0"
     assert result.retry_after == 3600.0
     assert result.retryable is False
-    assert adapter._send_flood_cooldown_remaining("123") > 3500.0
+    # The durable flood window is deliberately clamped to five minutes even
+    # when Telegram asks the caller to retry later; the original retry_after
+    # remains on the SendResult for ledger/redelivery scheduling.
+    remaining = adapter._send_flood_cooldown_remaining("123")
+    assert remaining is not None and 0 < remaining <= 300.0
     adapter._send_control_message.reset_mock()
     refused = await adapter._send_prompt(
         "send_clarify", "123", None,

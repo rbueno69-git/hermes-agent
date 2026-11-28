@@ -28,6 +28,10 @@ def _git_argv_tail(cmd):
         # Popen(args=None, executable=...) and shell-less spawns without argv: nothing to classify.
         return None
     if isinstance(cmd, (list, tuple)):
+        # Negative-path tests model an unavailable executable as ``[None, ...]``.
+        # Such argv cannot reach Git, so preserve the product's missing-executable path.
+        if any(token is None for token in cmd):
+            return None
         tokens = [os.fsdecode(t) for t in cmd]
     else:
         try:

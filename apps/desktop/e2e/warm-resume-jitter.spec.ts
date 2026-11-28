@@ -30,6 +30,8 @@
  * Prerequisite: `pnpm run build` must have been run so dist/ exists.
  */
 
+import type { Page } from '@playwright/test'
+
 import { writeEnvFile, writeMockProviderConfig } from '../../../tests-js/scripts/mock-provider-config'
 import { startMockServer } from '../../../tests-js/scripts/mock-server'
 
@@ -65,11 +67,13 @@ const RNG_SEED = 42
 /** Mulberry32 — tiny deterministic PRNG. */
 function mulberry32(seed: number): () => number {
   let a = seed
+
   return () => {
     a |= 0
     a = (a + 0x6d2b79f5) | 0
     let t = Math.imul(a ^ (a >>> 15), 1 | a)
     t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296
   }
 }
@@ -78,9 +82,11 @@ function mulberry32(seed: number): () => number {
 function gibberish(rng: () => number): string {
   const len = 30 + Math.floor(rng() * 20)
   let s = ''
+
   for (let i = 0; i < len; i++) {
     s += String.fromCharCode(97 + Math.floor(rng() * 26))
   }
+
   return s
 }
 
@@ -120,8 +126,9 @@ async function setupSeededMockBackend(): Promise<MockBackendFixture> {
   writeEnvFile(sandbox.hermesHome)
 
   // 3. Produce all 16 user/assistant pairs through the real TUI gateway,
-  // AIAgent, mock provider, and SessionDB persistence path before desktop starts.
+  // AIAgent, mock provider, and session-store persistence path before desktop starts.
   const builder = await RealSessionBuilder.start(sandbox.hermesHome)
+
   try {
     await builder.createSession({ title: SESSION_TITLE, turns: generateSessionTurns() })
   } finally {
@@ -169,17 +176,20 @@ test.afterAll(async () => {
  *   add/remove nodes.
  */
 async function installRenderCounter(
-  page: import('@playwright/test').Page,
+  page: Page,
   transcriptText?: string,
 ): Promise<void> {
   await page.evaluate(([visibleSelector, allSelector, expected]: [string, string, string | undefined]) => {
     const surfaces = [...document.querySelectorAll(expected ? allSelector : visibleSelector)]
+
     const surface = expected
       ? surfaces.find(candidate =>
           (candidate.querySelector('[data-slot="aui_thread-viewport"]')?.textContent ?? '').includes(expected),
         )
       : surfaces.at(-1)
+
     const viewport = surface?.querySelector('[data-slot="aui_thread-viewport"]')
+
     if (!viewport) {
       const diag = [...document.querySelectorAll(allSelector)].map(s => ({
         hidden: Boolean(s.closest('[data-pane-hidden]')),
@@ -190,14 +200,17 @@ async function installRenderCounter(
         tail: (s.querySelector('[data-slot="aui_thread-viewport"]')?.textContent ?? '').slice(-80),
         includesExpected: expected ? (s.querySelector('[data-slot="aui_thread-viewport"]')?.textContent ?? '').includes(expected) : null,
       }))
+
       throw new Error('Thread viewport not found before warm resume DIAG=' + JSON.stringify(diag) + ' expected=' + expected)
     }
 
     const state = { bursts: 0, mutations: 0, timeline: [] as number[], stopped: false, reconciles: 0 }
+
     const debugWindow = window as unknown as {
       __RENDER_COUNT__: typeof state
       __RENDER_VIEWPORT__: Element
     }
+
     debugWindow.__RENDER_COUNT__ = state
     debugWindow.__RENDER_VIEWPORT__ = viewport
 
@@ -206,6 +219,7 @@ async function installRenderCounter(
 
     const flush = () => {
       flushTimer = null
+
       if (currentBatch > 0 && !state.stopped) {
         state.bursts += 1
         state.timeline.push(currentBatch)
@@ -214,17 +228,21 @@ async function installRenderCounter(
     }
 
     const observer = new MutationObserver(records => {
-      if (state.stopped) return
+      if (state.stopped) {return}
       let batchAdded = 0
+
       for (const record of records) {
         state.mutations += 1
+
         if (record.type === 'childList' && record.addedNodes.length > 0) {
           batchAdded += 1
         }
       }
+
       if (batchAdded > 0) {
         currentBatch += batchAdded
-        if (flushTimer) clearTimeout(flushTimer)
+
+        if (flushTimer) {clearTimeout(flushTimer)}
         flushTimer = setTimeout(flush, 5)
       }
     })
@@ -246,17 +264,22 @@ async function installRenderCounter(
     const contentEl = viewport.querySelector('[data-slot="aui_thread-content"]') ?? viewport
     let lastFirstMsgText = ''
     let hasMessages = false
+
     const pollInterval = setInterval(() => {
       if (state.stopped) {
         clearInterval(pollInterval)
+
         return
       }
+
       const firstMsg = contentEl.querySelector('[data-role="message"], [data-message-id]')
       const firstMsgText = firstMsg?.textContent ?? ''
+
       if (firstMsgText && firstMsgText !== lastFirstMsgText) {
         if (hasMessages) {
           state.reconciles = (state.reconciles ?? 0) + 1
         }
+
         lastFirstMsgText = firstMsgText
         hasMessages = true
       }
@@ -266,7 +289,7 @@ async function installRenderCounter(
 
 /** Wait until the ACTIVE chat surface's transcript contains `text`. */
 async function waitForActiveTranscriptText(
-  page: import('@playwright/test').Page,
+  page: Page,
   text: string,
   timeout = 30_000,
 ): Promise<void> {
@@ -283,7 +306,7 @@ async function waitForActiveTranscriptText(
 }
 
 async function waitForActiveTranscriptWithoutText(
-  page: import('@playwright/test').Page,
+  page: Page,
   text: string,
 ): Promise<void> {
   await page.waitForFunction(
@@ -299,13 +322,13 @@ async function waitForActiveTranscriptWithoutText(
 }
 
 /** Stack an empty tab while leaving the current transcript mounted and warm. */
-async function openNewSessionTab(page: import('@playwright/test').Page, priorText: string): Promise<void> {
+async function openNewSessionTab(page: Page, priorText: string): Promise<void> {
   await page.locator('[data-slot="sidebar"] button[aria-label="New session"]').first().click()
   await waitForActiveTranscriptWithoutText(page, priorText)
 }
 
 /** Stop the render counter and return the recorded burst/reconcile counts. */
-async function readRenderCount(page: import('@playwright/test').Page): Promise<{
+async function readRenderCount(page: Page): Promise<{
   bursts: number
   mutations: number
   timeline: number[]
@@ -315,14 +338,16 @@ async function readRenderCount(page: import('@playwright/test').Page): Promise<{
     type RenderCount = { bursts: number; mutations: number; timeline: number[]; stopped: boolean; reconciles: number }
     const w = window as unknown as { __RENDER_COUNT__?: RenderCount }
     const rc = w.__RENDER_COUNT__
+
     if (rc) {
       rc.stopped = true
     }
+
     return rc ? { bursts: rc.bursts, mutations: rc.mutations, timeline: rc.timeline, reconciles: rc.reconciles } : null
   })
 }
 
-async function observedViewportIsActive(page: import('@playwright/test').Page): Promise<boolean> {
+async function observedViewportIsActive(page: Page): Promise<boolean> {
   return page.evaluate((surfaceSelector: string) => {
     const surfaces = document.querySelectorAll(surfaceSelector)
     const activeViewport = surfaces[surfaces.length - 1]?.querySelector('[data-slot="aui_thread-viewport"]')
@@ -346,6 +371,8 @@ function assertNoRepaint(result: { bursts: number; mutations: number; timeline: 
   ).toBe(0)
 }
 
+// Playwright requires object destructuring even when no built-in fixture is used.
+// eslint-disable-next-line no-empty-pattern
 test('tab reactivation preserves the mounted transcript without repainting', async ({}, testInfo) => {
   const page = fixture!.page
 
@@ -354,6 +381,7 @@ test('tab reactivation preserves the mounted transcript without repainting', asy
     .locator('[data-slot="sidebar"] button')
     .filter({ hasText: SESSION_TITLE })
     .first()
+
   await sessionRow.waitFor({ state: 'visible', timeout: 60_000 })
 
   // Step 1: Cold resume — click the session row to load it.

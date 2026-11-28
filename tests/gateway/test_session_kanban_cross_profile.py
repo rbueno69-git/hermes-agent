@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.gateway.fixtures.storage_handles import close_storage_handles, storage_handle
+
 
 def _claimed_named_task(tmp_path, monkeypatch, *, skills=None, assign_after_create=False):
     from hermes_cli import kanban_db as kb
@@ -68,8 +70,11 @@ def _connection(tmp_path, named_home, monkeypatch, *, receipt):
     async def resume(ref, params):
         calls.append(("resume", ref.session_id))
 
-    db = SimpleNamespace(get_session=lambda sid: None, db_path=str(named_home / "state.db"))
-    authority = SimpleNamespace(profile_id=str(named_home), db=db, submit=submit)
+    authority = SimpleNamespace(
+        profile_id=str(named_home),
+        persistence=storage_handle(named_home),
+        submit=submit,
+    )
     actor = SessionActor("owner", str(named_home), frozenset({"session:create"}), "transport")
     return SimpleNamespace(authority=authority, actor=actor, native_owner=True, resume=resume), calls
 
@@ -131,7 +136,7 @@ def test_default_task_reassigned_to_named_profile_uses_named_owner_store(tmp_pat
 
 
 def test_missing_named_profile_skills_fail_before_owner_admission(tmp_path, monkeypatch):
-    from hermes_state_runtime import RuntimeStoreError
+    from persistence.core.errors import AuthorityRefusal
     from hermes_cli.kanban_db_connect import connect
     from gateway.session_kanban import run_task
 
@@ -142,7 +147,7 @@ def test_missing_named_profile_skills_fail_before_owner_admission(tmp_path, monk
     connection, calls = _connection(tmp_path, named_home, monkeypatch, receipt=receipt)
     params = dict(board="owned", task_id=task_id, run_id=task.current_run_id, claim_lock=task.claim_lock)
 
-    with pytest.raises(RuntimeStoreError, match="kanban_skills_unavailable"):
+    with pytest.raises(AuthorityRefusal, match="kanban_skills_unavailable"):
         asyncio.run(run_task(connection, params))
 
     assert calls == []
